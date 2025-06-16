@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package dcsm;
+
+import "kem.proto"; // Используем относительный импорт, т.к. kem.proto в той же директории
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto"; // Для полей дат в KEMQuery
+
+service GlobalLongTermMemory {
+  // Сохраняет одну КЕП. Если ID в КЕП не указан, сервер его генерирует.
+  // Возвращает полную сохраненную КЕП, включая ID и временные метки.
+  rpc StoreKEM(StoreKEMRequest) returns (StoreKEMResponse);
+
+  // Извлекает КЕП из GLM на основе различных критериев с пагинацией.
+  rpc RetrieveKEMs(RetrieveKEMsRequest) returns (RetrieveKEMsResponse);
+
+  // Обновляет существующую КЕП. ID должен быть указан.
+  // Возвращает обновленную КЕП.
+  rpc UpdateKEM(UpdateKEMRequest) returns (KEM);
+
+  // Удаляет КЕП из GLM по ID.
+  rpc DeleteKEM(DeleteKEMRequest) returns (google.protobuf.Empty);
+}
+
+// ----- Сообщения для StoreKEM -----
+message StoreKEMRequest {
+  KEM kem = 1; // КЕП для сохранения. Поле 'id' в KEM может быть пустым.
+}
+
+message StoreKEMResponse {
+  KEM kem = 1; // Полный сохраненный объект КЕП, включая серверный ID и временные метки.
+}
+
+// ----- Сообщения для RetrieveKEMs -----
+message KEMQuery {
+  string text_query = 1; // Текстовый запрос для семантического поиска (если поддерживается)
+  repeated float embedding_query = 2; // Векторный запрос для семантического поиска
+  map<string, string> metadata_filters = 3; // Фильтры по полям метаданных (точное совпадение ключ-значение)
+  repeated string ids = 4; // Список ID для извлечения конкретных КЕП
+
+  // Фильтры по диапазонам дат
+  google.protobuf.Timestamp created_at_start = 5;
+  google.protobuf.Timestamp created_at_end = 6;
+  google.protobuf.Timestamp updated_at_start = 7;
+  google.protobuf.Timestamp updated_at_end = 8;
+  // Можно добавить другие типы фильтров: по числовым диапазонам в метаданных и т.д.
+}
+
+message RetrieveKEMsRequest {
+  KEMQuery query = 1; // Запрос для поиска КЕП
+  // int32 limit = 2; // Заменено на page_size для большей ясности с пагинацией
+  string page_token = 2; // Токен для получения следующей страницы результатов (опционально)
+  int32 page_size = 3;  // Максимальное количество КЕП на странице (0 или не указано - значение по умолчанию сервера)
+  // google.protobuf.FieldMask field_mask = 4; // Опционально: для указания, какие поля КЕП возвращать (проекция)
+}
+
+message RetrieveKEMsResponse {
+  repeated KEM kems = 1; // Список найденных КЕП для текущей страницы
+  string next_page_token = 2; // Токен для запроса следующей страницы (пустой, если это последняя страница)
+}
+
+// ----- Сообщения для UpdateKEM -----
+// UpdateKEMRequest остается таким же, как и раньше: ожидает kem_id и kem_data_update.
+// Сервер должен обновить только те поля, которые явно переданы в kem_data_update,
+// или использовать FieldMask, если мы его добавим. Пока предполагаем обновление полей из kem_data_update.
+message UpdateKEMRequest {
+  string kem_id = 1; // ID КЕП для обновления (обязателен)
+  KEM kem_data_update = 2; // Поля КЕП для обновления. ID в этом объекте игнорируется.
+                           // Сервер должен обновить временную метку updated_at.
+}
+// UpdateKEM возвращает полный обновленный KEM (согласно определению сервиса)
+
+// ----- Сообщения для DeleteKEM -----
+// DeleteKEMRequest остается таким же.
+message DeleteKEMRequest {
+  string kem_id = 1; // ID КЕП для удаления
+}

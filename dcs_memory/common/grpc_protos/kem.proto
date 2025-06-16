@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package dcsm;
+
+import "google/protobuf/timestamp.proto";
+
+message KEM {
+  string id = 1; // Уникальный идентификатор КЕП. Может быть пустым при создании, сервер сгенерирует.
+  string content_type = 2; // MIME-тип содержимого, например, "text/plain", "application/json"
+  bytes content = 3; // Основное содержимое КЕП (текст, сериализованные данные и т.д.)
+  repeated float embeddings = 4; // Векторные представления (эмбеддинги) содержимого
+  map<string, string> metadata = 5; // Гибкие метаданные КЕП
+  google.protobuf.Timestamp created_at = 6; // Устанавливается сервером при создании. При обновлении не меняется.
+  google.protobuf.Timestamp updated_at = 7; // Устанавливается сервером при создании и обновлении.
+}
