@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package dcsm;
+
+import "kem.proto"; // KEM будет результатом обработки и может быть частью ответа
+
+option go_package = "github.com/your_org/dcsm_protos/gen/go/kps;kps_service_pb";
+
+// Сервис Обработки Знаний (Knowledge Processor Service)
+service KnowledgeProcessorService {
+  // Обрабатывает сырые данные, генерирует эмбеддинги (если применимо),
+  // формирует КЕП и инициирует ее сохранение в GLM.
+  rpc ProcessRawData(ProcessRawDataRequest) returns (ProcessRawDataResponse);
+}
+
+message ProcessRawDataRequest {
+  string data_id = 1; // Опциональный уникальный ID для отслеживания исходных данных или для идемпотентности
+  string content_type = 2; // MIME-тип контента, например, "text/plain", "application/pdf", "text/markdown"
+  bytes raw_content = 3;    // Сырое содержимое данных
+  map<string, string> initial_metadata = 4; // Начальные метаданные, которые нужно ассоциировать с КЕП
+                                            // (например, источник URL, имя файла, теги от пользователя)
+  // Можно добавить поле для явного указания модели эмбеддингов, если KPS поддерживает несколько
+  // string embedding_model_id = 5;
+}
+
+message ProcessRawDataResponse {
+  string kem_id = 1;        // ID созданной и сохраненной КЕП в GLM
+  bool success = 2;         // Статус успешности всей операции
+  string status_message = 3; // Сообщение о статусе (например, "КЕП успешно создана и сохранена ID:xxx" или описание ошибки)
+  // KEM created_kem = 4;   // Пока не возвращаем полную КЕП, чтобы не дублировать данные.
+                            // Клиент может запросить ее из GLM по kem_id, если нужно.
+}
