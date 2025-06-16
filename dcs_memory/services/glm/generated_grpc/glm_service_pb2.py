@@ -24,9 +24,10 @@ _sym_db = _symbol_database.Default()
 
 import kem_pb2 as kem__pb2
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
+from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11glm_service.proto\x12\x04\x64\x63sm\x1a\tkem.proto\x1a\x1bgoogle/protobuf/empty.proto\"+\n\x10StoreKEMsRequest\x12\x17\n\x04kems\x18\x01 \x03(\x0b\x32\t.dcsm.KEM\"Z\n\x11StoreKEMsResponse\x12\x16\n\x0estored_kem_ids\x18\x01 \x03(\t\x12\x15\n\rsuccess_count\x18\x02 \x01(\x05\x12\x16\n\x0e\x65rror_messages\x18\x03 \x03(\t\"\xae\x01\n\x08KEMQuery\x12\x12\n\ntext_query\x18\x01 \x01(\t\x12\x17\n\x0f\x65mbedding_query\x18\x02 \x03(\x02\x12=\n\x10metadata_filters\x18\x03 \x03(\x0b\x32#.dcsm.KEMQuery.MetadataFiltersEntry\x1a\x36\n\x14MetadataFiltersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"C\n\x13RetrieveKEMsRequest\x12\x1d\n\x05query\x18\x01 \x01(\x0b\x32\x0e.dcsm.KEMQuery\x12\r\n\x05limit\x18\x02 \x01(\x05\"/\n\x14RetrieveKEMsResponse\x12\x17\n\x04kems\x18\x01 \x03(\x0b\x32\t.dcsm.KEM\"F\n\x10UpdateKEMRequest\x12\x0e\n\x06kem_id\x18\x01 \x01(\t\x12\"\n\x0fkem_data_update\x18\x02 \x01(\x0b\x32\t.dcsm.KEM\"\"\n\x10\x44\x65leteKEMRequest\x12\x0e\n\x06kem_id\x18\x01 \x01(\t2\x88\x02\n\x14GlobalLongTermMemory\x12<\n\tStoreKEMs\x12\x16.dcsm.StoreKEMsRequest\x1a\x17.dcsm.StoreKEMsResponse\x12\x45\n\x0cRetrieveKEMs\x12\x19.dcsm.RetrieveKEMsRequest\x1a\x1a.dcsm.RetrieveKEMsResponse\x12.\n\tUpdateKEM\x12\x16.dcsm.UpdateKEMRequest\x1a\t.dcsm.KEM\x12;\n\tDeleteKEM\x12\x16.dcsm.DeleteKEMRequest\x1a\x16.google.protobuf.Emptyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11glm_service.proto\x12\x04\x64\x63sm\x1a\tkem.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\")\n\x0fStoreKEMRequest\x12\x16\n\x03kem\x18\x01 \x01(\x0b\x32\t.dcsm.KEM\"*\n\x10StoreKEMResponse\x12\x16\n\x03kem\x18\x01 \x01(\x0b\x32\t.dcsm.KEM\"\x8f\x03\n\x08KEMQuery\x12\x12\n\ntext_query\x18\x01 \x01(\t\x12\x17\n\x0f\x65mbedding_query\x18\x02 \x03(\x02\x12=\n\x10metadata_filters\x18\x03 \x03(\x0b\x32#.dcsm.KEMQuery.MetadataFiltersEntry\x12\x0b\n\x03ids\x18\x04 \x03(\t\x12\x34\n\x10\x63reated_at_start\x18\x05 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12\x32\n\x0e\x63reated_at_end\x18\x06 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12\x34\n\x10updated_at_start\x18\x07 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12\x32\n\x0eupdated_at_end\x18\x08 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x1a\x36\n\x14MetadataFiltersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"[\n\x13RetrieveKEMsRequest\x12\x1d\n\x05query\x18\x01 \x01(\x0b\x32\x0e.dcsm.KEMQuery\x12\x12\n\npage_token\x18\x02 \x01(\t\x12\x11\n\tpage_size\x18\x03 \x01(\x05\"H\n\x14RetrieveKEMsResponse\x12\x17\n\x04kems\x18\x01 \x03(\x0b\x32\t.dcsm.KEM\x12\x17\n\x0fnext_page_token\x18\x02 \x01(\t\"F\n\x10UpdateKEMRequest\x12\x0e\n\x06kem_id\x18\x01 \x01(\t\x12\"\n\x0fkem_data_update\x18\x02 \x01(\x0b\x32\t.dcsm.KEM\"\"\n\x10\x44\x65leteKEMRequest\x12\x0e\n\x06kem_id\x18\x01 \x01(\t2\x85\x02\n\x14GlobalLongTermMemory\x12\x39\n\x08StoreKEM\x12\x15.dcsm.StoreKEMRequest\x1a\x16.dcsm.StoreKEMResponse\x12\x45\n\x0cRetrieveKEMs\x12\x19.dcsm.RetrieveKEMsRequest\x1a\x1a.dcsm.RetrieveKEMsResponse\x12.\n\tUpdateKEM\x12\x16.dcsm.UpdateKEMRequest\x1a\t.dcsm.KEM\x12;\n\tDeleteKEM\x12\x16.dcsm.DeleteKEMRequest\x1a\x16.google.protobuf.Emptyb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,22 +36,22 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_KEMQUERY_METADATAFILTERSENTRY']._loaded_options = None
   _globals['_KEMQUERY_METADATAFILTERSENTRY']._serialized_options = b'8\001'
-  _globals['_STOREKEMSREQUEST']._serialized_start=67
-  _globals['_STOREKEMSREQUEST']._serialized_end=110
-  _globals['_STOREKEMSRESPONSE']._serialized_start=112
-  _globals['_STOREKEMSRESPONSE']._serialized_end=202
-  _globals['_KEMQUERY']._serialized_start=205
-  _globals['_KEMQUERY']._serialized_end=379
-  _globals['_KEMQUERY_METADATAFILTERSENTRY']._serialized_start=325
-  _globals['_KEMQUERY_METADATAFILTERSENTRY']._serialized_end=379
-  _globals['_RETRIEVEKEMSREQUEST']._serialized_start=381
-  _globals['_RETRIEVEKEMSREQUEST']._serialized_end=448
-  _globals['_RETRIEVEKEMSRESPONSE']._serialized_start=450
-  _globals['_RETRIEVEKEMSRESPONSE']._serialized_end=497
-  _globals['_UPDATEKEMREQUEST']._serialized_start=499
-  _globals['_UPDATEKEMREQUEST']._serialized_end=569
-  _globals['_DELETEKEMREQUEST']._serialized_start=571
-  _globals['_DELETEKEMREQUEST']._serialized_end=605
-  _globals['_GLOBALLONGTERMMEMORY']._serialized_start=608
-  _globals['_GLOBALLONGTERMMEMORY']._serialized_end=872
+  _globals['_STOREKEMREQUEST']._serialized_start=100
+  _globals['_STOREKEMREQUEST']._serialized_end=141
+  _globals['_STOREKEMRESPONSE']._serialized_start=143
+  _globals['_STOREKEMRESPONSE']._serialized_end=185
+  _globals['_KEMQUERY']._serialized_start=188
+  _globals['_KEMQUERY']._serialized_end=587
+  _globals['_KEMQUERY_METADATAFILTERSENTRY']._serialized_start=533
+  _globals['_KEMQUERY_METADATAFILTERSENTRY']._serialized_end=587
+  _globals['_RETRIEVEKEMSREQUEST']._serialized_start=589
+  _globals['_RETRIEVEKEMSREQUEST']._serialized_end=680
+  _globals['_RETRIEVEKEMSRESPONSE']._serialized_start=682
+  _globals['_RETRIEVEKEMSRESPONSE']._serialized_end=754
+  _globals['_UPDATEKEMREQUEST']._serialized_start=756
+  _globals['_UPDATEKEMREQUEST']._serialized_end=826
+  _globals['_DELETEKEMREQUEST']._serialized_start=828
+  _globals['_DELETEKEMREQUEST']._serialized_end=862
+  _globals['_GLOBALLONGTERMMEMORY']._serialized_start=865
+  _globals['_GLOBALLONGTERMMEMORY']._serialized_end=1126
 # @@protoc_insertion_point(module_scope)

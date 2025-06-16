@@ -28,8 +28,7 @@ if _version_not_supported:
 
 
 class GlobalLongTermMemoryStub(object):
-    """Сервис для Глобальной/Долгосрочной Памяти (Global/Long-Term Memory Service)
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -37,10 +36,10 @@ class GlobalLongTermMemoryStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.StoreKEMs = channel.unary_unary(
-                '/dcsm.GlobalLongTermMemory/StoreKEMs',
-                request_serializer=glm__service__pb2.StoreKEMsRequest.SerializeToString,
-                response_deserializer=glm__service__pb2.StoreKEMsResponse.FromString,
+        self.StoreKEM = channel.unary_unary(
+                '/dcsm.GlobalLongTermMemory/StoreKEM',
+                request_serializer=glm__service__pb2.StoreKEMRequest.SerializeToString,
+                response_deserializer=glm__service__pb2.StoreKEMResponse.FromString,
                 _registered_method=True)
         self.RetrieveKEMs = channel.unary_unary(
                 '/dcsm.GlobalLongTermMemory/RetrieveKEMs',
@@ -60,35 +59,33 @@ class GlobalLongTermMemoryStub(object):
 
 
 class GlobalLongTermMemoryServicer(object):
-    """Сервис для Глобальной/Долгосрочной Памяти (Global/Long-Term Memory Service)
-    """
+    """Missing associated documentation comment in .proto file."""
 
-    def StoreKEMs(self, request, context):
-        """Сохраняет одну или несколько КЕП в GLM
-        Может использоваться как для создания новых, так и для перезаписи существующих (если ID совпадает)
+    def StoreKEM(self, request, context):
+        """Сохраняет одну КЕП. Если ID в КЕП не указан, сервер его генерирует.
+        Возвращает полную сохраненную КЕП, включая ID и временные метки.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def RetrieveKEMs(self, request, context):
-        """Извлекает КЕП из GLM на основе различных критериев
+        """Извлекает КЕП из GLM на основе различных критериев с пагинацией.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def UpdateKEM(self, request, context):
-        """Обновляет метаданные или другие поля существующей КЕП (частичное обновление)
-        Для полного обновления/перезаписи контента лучше использовать StoreKEMs
-        Возвращает обновленную КЕП
+        """Обновляет существующую КЕП. ID должен быть указан.
+        Возвращает обновленную КЕП.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def DeleteKEM(self, request, context):
-        """Удаляет КЕП из GLM по ID
+        """Удаляет КЕП из GLM по ID.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -97,10 +94,10 @@ class GlobalLongTermMemoryServicer(object):
 
 def add_GlobalLongTermMemoryServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'StoreKEMs': grpc.unary_unary_rpc_method_handler(
-                    servicer.StoreKEMs,
-                    request_deserializer=glm__service__pb2.StoreKEMsRequest.FromString,
-                    response_serializer=glm__service__pb2.StoreKEMsResponse.SerializeToString,
+            'StoreKEM': grpc.unary_unary_rpc_method_handler(
+                    servicer.StoreKEM,
+                    request_deserializer=glm__service__pb2.StoreKEMRequest.FromString,
+                    response_serializer=glm__service__pb2.StoreKEMResponse.SerializeToString,
             ),
             'RetrieveKEMs': grpc.unary_unary_rpc_method_handler(
                     servicer.RetrieveKEMs,
@@ -126,11 +123,10 @@ def add_GlobalLongTermMemoryServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class GlobalLongTermMemory(object):
-    """Сервис для Глобальной/Долгосрочной Памяти (Global/Long-Term Memory Service)
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def StoreKEMs(request,
+    def StoreKEM(request,
             target,
             options=(),
             channel_credentials=None,
@@ -143,9 +139,9 @@ class GlobalLongTermMemory(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dcsm.GlobalLongTermMemory/StoreKEMs',
-            glm__service__pb2.StoreKEMsRequest.SerializeToString,
-            glm__service__pb2.StoreKEMsResponse.FromString,
+            '/dcsm.GlobalLongTermMemory/StoreKEM',
+            glm__service__pb2.StoreKEMRequest.SerializeToString,
+            glm__service__pb2.StoreKEMResponse.FromString,
             options,
             channel_credentials,
             insecure,
