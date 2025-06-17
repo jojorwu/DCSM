@@ -3,89 +3,100 @@ syntax = "proto3";
 package dcsm;
 
 import "kem.proto";
-import "google/protobuf/empty.proto";
+import "glm_service.proto"; // Для KEMQuery, если мы его переиспользуем
+import "google/protobuf/timestamp.proto";
 
-// Сервис для Общей Рабочей Памяти / Шины Памяти (Shared Working Memory / Memory Bus Service)
-service SharedWorkingMemory {
-  // Публикует КЕП в SWM, делая ее доступной для других агентов.
-  // Может также инициировать асинхронное сохранение в GLM, если КЕП новая или значительно обновлена.
-  rpc PublishKEM(PublishKEMRequest) returns (PublishKEMResponse);
+option go_package = "github.com/your_org/dcsm_protos/gen/go/swm;swm_service_pb";
 
-  // Подписывается на поток КЕП, соответствующих определенным критериям (например, тема, запрос).
-  // Сервер будет стримить КЕП по мере их появления или обновления в SWM.
-  rpc SubscribeKEMs(SubscribeKEMsRequest) returns (stream KEM);
+// Сервис Общей Рабочей Памяти (Shared Working Memory Service)
+service SharedWorkingMemoryService {
+  // Публикует КЕП в SWM. Может также инициировать сохранение/обновление в GLM.
+  rpc PublishKEMToSWM(PublishKEMToSWMRequest) returns (PublishKEMToSWMResponse);
 
-  // Запрашивает активные КЕП из SWM на основе различных критериев.
-  // Это запрос "одного момента времени" к текущему состоянию SWM.
-  rpc QueryActiveKEMs(QueryActiveKEMsRequest) returns (QueryActiveKEMsResponse);
+  // Подписывается на события, происходящие в SWM (например, появление новых КЕП).
+  rpc SubscribeToSWMEvents(SubscribeToSWMEventsRequest) returns (stream SWMMemoryEvent);
 
-  // Запрашивает "подтягивание" КЕП из GLM в SWM, если они там еще не активны.
-  // Может использоваться агентом, если он ожидает, что определенные КЕП скоро понадобятся.
-  rpc RequestKEMLoadToSWM(RequestKEMLoadToSWMRequest) returns (RequestKEMLoadToSWMResponse);
+  // Запрашивает активные КЕП непосредственно из SWM (из ее кэша).
+  rpc QuerySWM(QuerySWMRequest) returns (QuerySWMResponse);
+
+  // Запрашивает загрузку КЕП из GLM в SWM (в кэш SWM).
+  rpc LoadKEMsFromGLM(LoadKEMsFromGLMRequest) returns (LoadKEMsFromGLMResponse);
 }
 
-// ----- Сообщения для PublishKEM -----
-message PublishKEMRequest {
-  KEM kem = 1; // КЕП для публикации
-  // Можно добавить флаги, например, persist_to_glm = true/false
+// --- Сообщения для PublishKEMToSWM ---
+message PublishKEMToSWMRequest {
+  KEM kem_to_publish = 1;
+  bool persist_to_glm_if_new_or_updated = 2; // Если true, SWM попытается сохранить/обновить КЕП в GLM
 }
 
-message PublishKEMResponse {
-  string kem_id = 1; // ID опубликованной КЕП
-  bool accepted = 2; // Принята ли КЕП шиной SWM
-  string message = 3; // Дополнительное сообщение (например, "KEM queued for GLM persistence")
+message PublishKEMToSWMResponse {
+  string kem_id = 1; // ID опубликованной КЕП (может быть сгенерирован GLM, если persist_to_glm=true и ID не было)
+  bool published_to_swm = 2; // Успешно ли опубликовано в кэше SWM
+  bool persistence_triggered_to_glm = 3; // Был ли инициирован вызов к GLM
+  string status_message = 4; // Дополнительное сообщение о статусе
 }
 
-// ----- Сообщения для SubscribeKEMs -----
+// --- Сообщения для SubscribeToSWMEvents ---
 message SubscriptionTopic {
   enum TopicType {
-    UNDEFINED = 0;
-    METADATA_KEY_VALUE = 1; // Подписка на КЕП с определенными метаданными (например, "topic":"project_alpha")
-    SEMANTIC_QUERY = 2;     // Подписка на КЕП, семантически близкие к запросу
+    UNDEFINED_TOPIC = 0;
+    KEM_LIFECYCLE_EVENTS = 1;     // Все обновления КЕП (создание, обновление, удаление/вытеснение из SWM)
+    // SYSTEM_EVENTS = 2;   // Общие системные события SWM (пока не используем)
   }
   TopicType type = 1;
-  string value = 2; // Значение для темы (например, "project_alpha" или текстовый запрос для семантического поиска)
-  map<string, string> metadata_filters = 3; // Дополнительные фильтры по метаданным
+  string filter_criteria = 2; // Критерии фильтрации для темы (например, "metadata.topic='project_x'" или "kem_id='id123'")
+                              // Формат критериев нужно будет определить (например, простой DSL или JSONPath).
+                              // Для KEM_LIFECYCLE_EVENTS это может быть фильтр по ID, типу контента, метаданным.
 }
 
-message SubscribeKEMsRequest {
-  repeated SubscriptionTopic topics = 1; // Список тем/запросов для подписки
-  // Можно добавить параметры, например, replay_past_kems = true/false
-}
-// Ответ для SubscribeKEMs - это поток KEM (stream KEM)
-
-// ----- Сообщения для QueryActiveKEMs -----
-// Используем KEMQuery из glm_service.proto, если он подходит, или определяем новый.
-// Для простоты предположим, что KEMQuery из GLM подходит и для SWM,
-// но SWM может иметь свои оптимизации и не поддерживать все типы запросов GLM.
-// Если нужно импортировать, то: import "protos/glm_service.proto";
-// и использовать dcsm.KEMQuery. На данном этапе оставим его более общим.
-
-message ActiveKEMQuery {
-  string text_query = 1;
-  repeated float embedding_query = 2;
-  map<string, string> metadata_filters = 3;
+message SubscribeToSWMEventsRequest {
+  string agent_id = 1; // Идентификатор агента-подписчика (для логирования и управления подписками)
+  repeated SubscriptionTopic topics = 2; // Список тем, на которые агент подписывается
 }
 
-message QueryActiveKEMsRequest {
-  ActiveKEMQuery query = 1;
-  int32 limit = 2;
+message SWMMemoryEvent {
+  enum EventType {
+    EVENT_TYPE_UNSPECIFIED = 0; // Используем UNSPECIFIED как значение по умолчанию согласно конвенции
+    KEM_PUBLISHED = 1; // Новая КЕП опубликована в SWM (пришла от другого агента или загружена из GLM)
+    KEM_UPDATED = 2;   // Существующая КЕП в SWM была обновлена (например, через PublishKEMToSWM с тем же ID)
+    KEM_EVICTED = 3; // КЕП была вытеснена из кэша SWM
+    // KEM_ACCESSED = 4; // Опционально: событие доступа к КЕП (может быть слишком много событий)
+  }
+  string event_id = 1; // Уникальный ID события
+  EventType event_type = 2;
+  KEM kem_payload = 3;        // КЕП, к которой относится событие.
+                               // Для KEM_EVICTED может содержать только kem_id.
+  google.protobuf.Timestamp event_time = 4; // Время события на сервере SWM
+  string source_agent_id = 5; // Опционально: ID агента, инициировавшего событие (например, при Publish)
+  string details = 6;   // Дополнительные детали о событии в текстовом формате
 }
 
-message QueryActiveKEMsResponse {
+// --- Сообщения для QuerySWM ---
+message QuerySWMRequest {
+  // Используем KEMQuery из GLM, т.к. он уже содержит много полезных полей для запроса.
+  // SWM будет пытаться выполнить этот запрос на своем внутреннем кэше.
+  // Не все поля KEMQuery могут быть эффективно поддержаны на уровне кэша SWM.
+  dcsm.KEMQuery query = 1; // Явно указываем пакет dcsm для KEMQuery из glm_service.proto
+  int32 page_size = 2;
+  string page_token = 3; // Может быть просто смещением (offset) или более сложным токеном
+}
+
+message QuerySWMResponse {
   repeated KEM kems = 1;
+  string next_page_token = 2;
 }
 
-// ----- Сообщения для RequestKEMLoadToSWM -----
-message RequestKEMLoadToSWMRequest {
-  // Запрос может быть по ID КЕП или по более общему запросу, как в GLM
-  repeated string kem_ids = 1; // Список ID КЕП для загрузки из GLM
-  ActiveKEMQuery query_if_ids_empty = 2; // Запрос, если kem_ids пуст, для поиска в GLM
-  int32 limit_for_query = 3; // Лимит для query_if_ids_empty
+// --- Сообщения для LoadKEMsFromGLM ---
+message LoadKEMsFromGLMRequest {
+  // Используем KEMQuery, чтобы указать GLM, какие КЕПы нужно извлечь и загрузить в SWM.
+  dcsm.KEMQuery query_for_glm = 1;
+  // int32 limit_override = 2; // Можно управлять через query_for_glm.page_size или здесь
+  // bool load_embeddings_if_missing = 3; // Опция для SWM, чтобы дозагрузить эмбеддинги из GLM, если их нет
 }
 
-message RequestKEMLoadToSWMResponse {
-  int32 requested_to_load_count = 1; // Сколько КЕП было запрошено к загрузке
-  int32 already_active_count = 2;    // Сколько из запрошенных уже были активны
-  string message = 3; // Дополнительная информация (например, "Load request queued")
+message LoadKEMsFromGLMResponse {
+  int32 kems_queried_in_glm_count = 1; // Сколько КЕП было запрошено у GLM (может отличаться от реально загруженных из-за ошибок или дубликатов)
+  int32 kems_loaded_to_swm_count = 2;    // Количество КЕП, реально добавленных/обновленных в кэше SWM
+  repeated string loaded_kem_ids = 3; // Список ID КЕП, которые были загружены/обновлены в SWM
+  string status_message = 4;
 }
