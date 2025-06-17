@@ -1,0 +1,5 @@
+grpcio
+grpcio-tools
+protobuf
+cachetools
+qdrant-client # Для клиента GLM, если он будет частью SDK или если SWM напрямую импортирует типы GLM, связанные с Qdrant.
