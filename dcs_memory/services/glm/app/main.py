@@ -42,7 +42,7 @@ _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
 # --- Конфигурация ---
 SQLITE_DB_PATH = os.path.join(app_dir, os.getenv("SQLITE_DB_FILENAME", "glm_metadata.sqlite3"))
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1") # Изменено с localhost на 127.0.0.1
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "glm_kems_demo_collection")
 DEFAULT_VECTOR_SIZE = int(os.getenv("DEFAULT_VECTOR_SIZE", 25))
@@ -86,8 +86,11 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     updated_at TEXT
                 )
                 ''')
+                # Добавляем индексы, если они еще не существуют
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_created_at ON kems (created_at);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_updated_at ON kems (updated_at);")
                 conn.commit()
-            logger.info("Таблица 'kems' в SQLite успешно инициализирована.")
+            logger.info("Таблица 'kems' и индексы в SQLite успешно инициализированы.")
         except Exception as e:
             logger.error(f"Ошибка инициализации SQLite: {e}")
 

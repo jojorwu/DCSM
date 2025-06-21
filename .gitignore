@@ -1,0 +1,19 @@
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Node.js dependencies
+node_modules/
+
+# Generated gRPC code (if you prefer not to commit it)
+# generated_grpc/
+# generated_grpc_code/
+
+# IDE and editor specific files
+.idea/
+.vscode/
+*.swp
+*~
