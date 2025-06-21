@@ -4,12 +4,22 @@ from .local_memory import LocalAgentMemory
 import typing
 
 class AgentSDK:
-    def __init__(self, glm_server_address: str = 'localhost:50051', lpa_max_size: int = 100):
+    def __init__(self,
+                 glm_server_address: str = 'localhost:50051',
+                 lpa_max_size: int = 100,
+                 lpa_indexed_keys: typing.List[str] = None): # Новый параметр
         print("AgentSDK: Инициализация...")
         self.glm_client = GLMClient(server_address=glm_server_address)
-        self.local_memory = LocalAgentMemory(max_size=lpa_max_size)
+        # Передаем indexed_keys в LocalAgentMemory
+        self.local_memory = LocalAgentMemory(max_size=lpa_max_size, indexed_keys=lpa_indexed_keys if lpa_indexed_keys else [])
         # self.swm_client = SWMClient(swm_server_address) # Для будущего расширения
-        print("AgentSDK: GLMClient и LocalAgentMemory инициализированы.")
+        print(f"AgentSDK: GLMClient и LocalAgentMemory (indexed_keys: {lpa_indexed_keys if lpa_indexed_keys else []}) инициализированы.")
+
+    def query_local_memory(self, metadata_filters: typing.Optional[dict] = None, ids: typing.Optional[list[str]] = None) -> list[dict]:
+        """ Запрашивает КЕП из локальной памяти (ЛПА) с возможностью фильтрации. """
+        # print(f"AgentSDK: Запрос query_local_memory с metadata_filters={metadata_filters}, ids={ids}")
+        # Предполагаем, что LocalAgentMemory теперь имеет метод query
+        return self.local_memory.query(metadata_filters=metadata_filters, ids=ids)
 
     def get_kem(self, kem_id: str, force_remote: bool = False) -> typing.Optional[dict]:
         print("AgentSDK: Запрос get_kem для ID '{}', force_remote={}".format(kem_id, force_remote))
