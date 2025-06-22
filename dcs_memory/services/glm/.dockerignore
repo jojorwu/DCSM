@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+*.db
+*.sqlite3
+# Если есть специфичные для IDE файлы внутри сервиса
+.vscode/
+.idea/
+# Локальные артефакты сборки или тестирования, если они создаются в директории сервиса
+# (например, если generate_grpc_code.sh создает что-то временное)
+# temp_generated_grpc/ # Если такое используется локально
+# qdrant_storage/ # Если случайно создается внутри директории сервиса
+# Dockerfile # Сам Dockerfile не должен быть в образе
+# .dockerignore # И этот файл тоже

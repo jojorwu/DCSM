@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+# Если есть специфичные для IDE файлы внутри сервиса
+.vscode/
+.idea/
+# Dockerfile # Сам Dockerfile не должен быть в образе
+# .dockerignore # И этот файл тоже
+# Тестовые файлы не нужны в образе
+test_*.py
+tests/
