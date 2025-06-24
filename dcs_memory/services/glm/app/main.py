@@ -428,6 +428,99 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             logger.error(msg, exc_info=True)
             context.abort(grpc.StatusCode.INTERNAL, msg); return empty_pb2.Empty()
 
+    def BatchStoreKEMs(self, request, context):
+        logger.info(f"BatchStoreKEMs: Получено {len(request.kems)} КЕП для сохранения.")
+        successfully_stored_kems_list = []
+        failed_kem_references_list = []
+        # overall_error_occurred = False # Флаг для общей ошибки
+
+        for idx, kem_in in enumerate(request.kems):
+            # Используем логику, очень похожую на StoreKEM, для каждой КЕП
+            # Оборачиваем каждую КЕП в "под-запрос" для StoreKEM, чтобы переиспользовать его логику
+            # или дублируем основную логику здесь.
+            # Для простоты и избежания рекурсивных вызовов или слишком сложной реструктуризации,
+            # частично дублируем логику сохранения одной КЕП.
+
+            current_kem_processed = kem_pb2.KEM() # Создаем новый экземпляр для результата
+            current_kem_processed.CopyFrom(kem_in)
+
+            kem_id = current_kem_processed.id if current_kem_processed.id else str(uuid.uuid4())
+            current_kem_processed.id = kem_id # Убедимся, что ID установлен
+
+            current_time_proto = Timestamp()
+            current_time_proto.GetCurrentTime()
+            final_created_at_proto = Timestamp()
+            is_new_kem = True
+
+            try:
+                with self._get_sqlite_conn() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT created_at FROM kems WHERE id = ?", (kem_id,))
+                    existing_row = cursor.fetchone()
+                    if existing_row:
+                        is_new_kem = False
+                        final_created_at_proto.FromJsonString(existing_row[0] + "Z")
+
+                    if is_new_kem:
+                        if current_kem_processed.HasField("created_at"):
+                            final_created_at_proto.CopyFrom(current_kem_processed.created_at)
+                        else:
+                            final_created_at_proto.CopyFrom(current_time_proto)
+
+                    current_kem_processed.created_at.CopyFrom(final_created_at_proto)
+                    current_kem_processed.updated_at.CopyFrom(current_time_proto)
+
+                    cursor.execute('''
+                    INSERT OR REPLACE INTO kems (id, content_type, content, metadata, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (current_kem_processed.id, current_kem_processed.content_type, current_kem_processed.content,
+                          json.dumps(dict(current_kem_processed.metadata)),
+                          current_kem_processed.created_at.ToDatetime().isoformat(),
+                          current_kem_processed.updated_at.ToDatetime().isoformat()))
+                    conn.commit()
+                # logger.debug(f"BatchStoreKEMs: КЕП ID '{kem_id}' сохранена в SQLite.")
+            except Exception as e:
+                logger.error(f"BatchStoreKEMs: Ошибка SQLite для КЕП ID '{kem_id}' (или индекс {idx}): {e}", exc_info=True)
+                failed_kem_references_list.append(kem_in.id if kem_in.id else f"req_idx_{idx}")
+                # overall_error_occurred = True
+                continue # Переходим к следующей КЕП
+
+            if self.qdrant_client and current_kem_processed.embeddings:
+                if len(current_kem_processed.embeddings) != DEFAULT_VECTOR_SIZE:
+                    logger.error(f"BatchStoreKEMs: Размерность эмбеддингов ({len(current_kem_processed.embeddings)}) для КЕП ID '{kem_id}' не совпадает с конфигурацией ({DEFAULT_VECTOR_SIZE}).")
+                    failed_kem_references_list.append(kem_id)
+                    # overall_error_occurred = True
+                    # Нужно решить, удалять ли уже сохраненные метаданные из SQLite, если эмбеддинги неверны.
+                    # Пока что оставляем в SQLite, но помечаем как ошибку.
+                    continue
+                try:
+                    self.qdrant_client.upsert(
+                        collection_name=QDRANT_COLLECTION,
+                        points=[PointStruct(id=kem_id, vector=list(current_kem_processed.embeddings), payload={"kem_id_ref": kem_id})]
+                    )
+                    # logger.debug(f"BatchStoreKEMs: Эмбеддинги для КЕП ID '{kem_id}' сохранены в Qdrant.")
+                except Exception as e:
+                    logger.error(f"BatchStoreKEMs: Ошибка Qdrant для КЕП ID '{kem_id}': {e}", exc_info=True)
+                    failed_kem_references_list.append(kem_id)
+                    # overall_error_occurred = True
+                    # Аналогично, оставляем в SQLite, но помечаем как ошибку.
+                    continue
+
+            successfully_stored_kems_list.append(current_kem_processed)
+
+        logger.info(f"BatchStoreKEMs: Успешно сохранено {len(successfully_stored_kems_list)} КЕП, не удалось сохранить {len(failed_kem_references_list)}.")
+
+        response = glm_service_pb2.BatchStoreKEMsResponse(
+            successfully_stored_kems=successfully_stored_kems_list,
+            failed_kem_references=failed_kem_references_list
+        )
+        # if overall_error_occurred or failed_kem_references_list:
+        #    response.overall_error_message = f"Не удалось сохранить {len(failed_kem_references_list)} КЕП. См. failed_kem_references."
+        # elif not request.kems:
+        #    response.overall_error_message = "Получен пустой список КЕП для сохранения."
+
+        return response
+
 def serve():
     logger.info(f"Конфигурация GLM: Qdrant={QDRANT_HOST}:{QDRANT_PORT} ({QDRANT_COLLECTION}), SQLite={SQLITE_DB_PATH}, gRPC Адрес={GRPC_LISTEN_ADDRESS}")
     try:

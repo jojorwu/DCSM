@@ -46,35 +46,49 @@ class GLMClient:
         return ParseDict(kem_data_copy, kem_pb2.KEM(), ignore_unknown_fields=True)
 
     def _kem_proto_to_dict(self, kem_proto: kem_pb2.KEM) -> dict:
-        # Конвертируем content bytes в строку, если это возможно (предполагаем UTF-8)
-        # Это для удобства, но может быть не всегда желаемым поведением.
-        kem_dict = MessageToDict(kem_proto, preserving_proto_field_name=True, including_default_value_fields=False)
-        if 'content' in kem_dict and isinstance(kem_dict['content'], bytes):
+        # Параметр including_default_value_fields может отсутствовать в старых версиях protobuf. Убираем его для совместимости.
+        kem_dict = MessageToDict(kem_proto, preserving_proto_field_name=True)
+        if 'content' in kem_dict and isinstance(kem_dict['content'], str): # MessageToDict кодирует bytes в base64 строки
             try:
-                kem_dict['content'] = kem_dict['content'].decode('utf-8')
-            except UnicodeDecodeError:
-                # Если не UTF-8, оставляем как есть (base64 строка от MessageToDict) или можно придумать другую логику
+                # Попытаемся декодировать, если это была строка, закодированная в base64, а потом в строку.
+                # Но проще если сервер возвращает bytes, и мы здесь декодируем.
+                # Если kem_proto.content это bytes, MessageToDict его преобразует в base64 строку.
+                # Чтобы получить оригинальные bytes, нужно было бы работать с kem_proto.content напрямую.
+                # Для простоты, если это строка, пытаемся ее декодировать из utf-8, если нет - оставляем.
+                # Это поведение нужно будет уточнить в зависимости от того, как реально используется content.
+                # Если content всегда текст, то декодирование полезно. Если бинарные данные - нет.
+                # kem_dict['content'] = base64.b64decode(kem_dict['content']).decode('utf-8')
+                pass # Оставляем как есть, если это base64 строка или уже декодировано как-то
+            except Exception:
                 pass
+        # Для Timestamp полей, MessageToDict возвращает строки в формате RFC 3339 UTC Z.
+        # Например: "2023-10-27T10:30:00Z". Это удобно для преобразования в datetime объекты.
         return kem_dict
 
-    def store_kems(self, kems_data: list[dict]) -> tuple[list[str] | None, int | None, list[str] | None]:
+    def batch_store_kems(self, kems_data: list[dict]) -> tuple[list[dict] | None, list[str] | None, str | None]:
+        """Сохраняет пакет КЕП и возвращает список успешно сохраненных КЕП (как dict) и ошибки."""
         self._ensure_connected()
         try:
             proto_kems = [self._kem_dict_to_proto(data) for data in kems_data]
-            request = glm_service_pb2.StoreKEMsRequest(kems=proto_kems)
-            response = self.stub.StoreKEMs(request, timeout=10) # Добавлен таймаут
-            return list(response.stored_kem_ids), response.success_count, list(response.error_messages)
+            # Используем новые имена сообщений из glm_service.proto
+            request = glm_service_pb2.BatchStoreKEMsRequest(kems=proto_kems)
+            response = self.stub.BatchStoreKEMs(request, timeout=20) # Увеличенный таймаут для пакетной операции
+
+            successfully_stored_kems_as_dicts = [self._kem_proto_to_dict(k) for k in response.successfully_stored_kems]
+
+            return successfully_stored_kems_as_dicts, list(response.failed_kem_references), response.overall_error_message
         except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове StoreKEMs: {e.code()} - {e.details()}")
-            return None, 0, [e.details()]
+            print(f"gRPC ошибка при вызове BatchStoreKEMs: {e.code()} - {e.details()}")
+            return None, None, str(e.details())
         except Exception as e:
-            print(f"Ошибка при подготовке запроса StoreKEMs: {e}")
+            print(f"Ошибка при подготовке запроса BatchStoreKEMs: {e}")
             import traceback
             traceback.print_exc()
-            return None, 0, [str(e)]
+            return None, None, str(e)
 
     def retrieve_kems(self, text_query: str = None, embedding_query: list[float] = None,
-                      metadata_filters: dict = None, limit: int = 10) -> list[dict] | None:
+                      metadata_filters: dict = None, ids_filter: list[str] = None, # Добавлен ids_filter
+                      page_size: int = 10, page_token: str = None) -> tuple[list[dict] | None, str | None]: # Возвращает также next_page_token
         self._ensure_connected()
         try:
             query_proto = glm_service_pb2.KEMQuery()
@@ -85,10 +99,13 @@ class GLMClient:
             if metadata_filters:
                 for key, value in metadata_filters.items():
                     query_proto.metadata_filters[key] = str(value)
+            if ids_filter: # Используем поле ids из KEMQuery
+                query_proto.ids.extend(ids_filter)
 
-            request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, limit=limit)
-            response = self.stub.RetrieveKEMs(request, timeout=10) # Добавлен таймаут
-            return [self._kem_proto_to_dict(kem) for kem in response.kems]
+            request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, page_size=page_size, page_token=page_token if page_token else "")
+            response = self.stub.RetrieveKEMs(request, timeout=10)
+            kems_as_dicts = [self._kem_proto_to_dict(kem) for kem in response.kems]
+            return kems_as_dicts, response.next_page_token
         except grpc.RpcError as e:
             print(f"gRPC ошибка при вызове RetrieveKEMs: {e.code()} - {e.details()}")
             return None

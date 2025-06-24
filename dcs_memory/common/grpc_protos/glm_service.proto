@@ -20,6 +20,9 @@ service GlobalLongTermMemory {
 
   // Удаляет КЕП из GLM по ID.
   rpc DeleteKEM(DeleteKEMRequest) returns (google.protobuf.Empty);
+
+  // Пакетное сохранение КЕП
+  rpc BatchStoreKEMs(BatchStoreKEMsRequest) returns (BatchStoreKEMsResponse);
 }
 
 // ----- Сообщения для StoreKEM -----
@@ -74,4 +77,19 @@ message UpdateKEMRequest {
 // DeleteKEMRequest остается таким же.
 message DeleteKEMRequest {
   string kem_id = 1; // ID КЕП для удаления
+}
+
+// ----- Сообщения для BatchStoreKEMs -----
+message BatchStoreKEMsRequest {
+  repeated KEM kems = 1;
+}
+
+message BatchStoreKEMsResponse {
+  repeated KEM successfully_stored_kems = 1;
+  // Список ID или индексов КЕП из запроса, которые не удалось сохранить.
+  // Если ID был сгенерирован сервером, то индекс является единственным способом сослаться.
+  // Для простоты можно возвращать только общее сообщение об ошибке, если что-то пошло не так.
+  // Либо, если КЕП в запросе обязаны иметь ID (даже клиентский), можно возвращать failed_kem_ids.
+  repeated string failed_kem_references = 2; // Может быть ID (если был в запросе) или индекс "req_idx_0", "req_idx_1"
+  string overall_error_message = 3;
 }

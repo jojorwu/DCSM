@@ -32,58 +32,41 @@ class AgentSDK:
         print("AgentSDK: КЕП ID '{}' не найдена в ЛПА или запрошен принудительный удаленный вызов. Обращение к GLM...".format(kem_id))
         # GLMClient.retrieve_kems ожидает фильтры, для получения по ID можно использовать metadata_filters
         # или добавить специальный метод get_kem_by_id в GLMClient, если GLM сервис его поддерживает.
-        # Пока используем retrieve_kems с фильтром по ID.
-        # Предполагаем, что ID КЕП уникален и retrieve_kems вернет список из 0 или 1 элемента.
-        remote_kem_list = self.glm_client.retrieve_kems(metadata_filters={'id': kem_id}, limit=1)
+        # Используем ids_filter для получения КЕП по ID.
+        # GLMClient.retrieve_kems теперь возвращает (list[dict] | None, str | None)
+        remote_kems_tuple = self.glm_client.retrieve_kems(ids_filter=[kem_id], page_size=1)
 
-        if remote_kem_list and len(remote_kem_list) > 0:
-            remote_kem = remote_kem_list[0]
-            # Дополнительная проверка, что ID действительно совпадает (на случай неточной фильтрации на сервере)
-            if remote_kem.get('id') == kem_id:
-                print("AgentSDK: КЕП ID '{}' получена от GLM. Кэширование в ЛПА.".format(kem_id))
+        kems_list_candidate = None
+        if remote_kems_tuple and remote_kems_tuple[0] is not None:
+            kems_list_candidate = remote_kems_tuple[0]
+
+        if isinstance(kems_list_candidate, list) and len(kems_list_candidate) > 0:
+            remote_kem = kems_list_candidate[0]
+            if isinstance(remote_kem, dict) and remote_kem.get('id') == kem_id:
                 self.local_memory.put(kem_id, remote_kem)
                 return remote_kem
-            else:
-                # Это маловероятно, если сервер правильно обрабатывает фильтр по 'id'
-                print("AgentSDK: Получена КЕП от GLM, но ID не совпадает ({} != {}). КЕП не возвращена и не кэширована.".format(remote_kem.get('id'), kem_id))
-                return None
-        else:
-            print("AgentSDK: КЕП ID '{}' не найдена в GLM.".format(kem_id))
-            return None
 
-    def store_kems(self, kems_data: list[dict]) -> tuple[typing.Optional[list[str]], typing.Optional[int], typing.Optional[list[str]]]:
+        # Если мы здесь, значит, КЕП не найдена или ответ некорректен
+        # print(f"AgentSDK: КЕП ID '{kem_id}' не найдена в GLM или получен некорректный ответ от GLM (ожидался список КЕП).") # Этот print уже был, но закомментирован
+        return None
+
+    def store_kems(self, kems_data: list[dict]) -> tuple[list[dict] | None, list[str] | None, str | None]:
+        """Сохраняет пакет КЕП в GLM и обновляет ЛПА актуальными данными с сервера."""
         print("AgentSDK: Запрос store_kems для {} КЕП.".format(len(kems_data)))
-        stored_ids, success_count, errors = self.glm_client.store_kems(kems_data)
+        # glm_client.batch_store_kems возвращает (successfully_stored_kems_as_dicts, failed_kem_references, overall_error_message)
+        stored_kems_dicts, failed_refs, error_msg = self.glm_client.batch_store_kems(kems_data)
 
-        if success_count and success_count > 0 and stored_ids:
-            # Создадим карту исходных КЕП по их ID для легкого доступа
-            # Убедимся, что у всех КЕП в kems_data есть 'id', или они не смогут быть замаплены
-            sent_kems_map = {}
-            for kem_d in kems_data:
-                kem_d_id = kem_d.get('id')
-                if kem_d_id:
-                    sent_kems_map[kem_d_id] = kem_d
-                else:
-                    # Если ID не было, сервер должен был его сгенерировать.
-                    # В этом случае мы не можем просто замапить по ID из kems_data.
-                    # Для простоты, текущая реализация store_kems в GLMClient предполагает,
-                    # что ID предоставляются клиентом или сервер их как-то возвращает/связывает.
-                    # Ответ StoreKEMsResponse содержит stored_kem_ids.
-                    # Если ID генерируются сервером, нам нужен способ сопоставить их с исходными данными.
-                    # Пока предполагаем, что ID были в kems_data.
-                    print("AgentSDK: Предупреждение - КЕП без ID в исходных данных store_kems: {}".format(kem_d))
+        if stored_kems_dicts:
+            print(f"AgentSDK: Успешно сохранено/обновлено {len(stored_kems_dicts)} КЕП в GLM. Обновление ЛПА.")
+            for kem_dict in stored_kems_dicts:
+                if kem_dict and 'id' in kem_dict: # Убедимся, что есть ID
+                    self.local_memory.put(kem_dict['id'], kem_dict)
+            # Возвращаем список сохраненных КЕП (dict), список ссылок на неудавшиеся и общее сообщение об ошибке
+            return stored_kems_dicts, failed_refs, error_msg
+        else:
+            print(f"AgentSDK: Не удалось сохранить КЕПы в GLM. Ошибка: {error_msg}")
+            return None, failed_refs, error_msg
 
-
-            for kem_id in stored_ids:
-                if kem_id in sent_kems_map:
-                    self.local_memory.put(kem_id, sent_kems_map[kem_id])
-                    print("AgentSDK: КЕП ID '{}' (сохраненная в GLM) обновлена в ЛПА.".format(kem_id))
-                else:
-                    # Это может случиться, если ID был сгенерирован сервером и не совпадает с предложенным клиентом,
-                    # или если ID не было в исходных данных.
-                    print("AgentSDK: Предупреждение - КЕП ID '{}' сохранена в GLM, но не найдена в исходных данных для обновления ЛПА по этому ID.".format(kem_id))
-
-        return stored_ids, success_count, errors
 
     def update_kem(self, kem_id: str, kem_data_update: dict) -> typing.Optional[dict]:
         print("AgentSDK: Запрос update_kem для ID '{}'.".format(kem_id))

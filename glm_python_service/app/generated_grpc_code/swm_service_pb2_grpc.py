@@ -3,7 +3,6 @@
 import grpc
 import warnings
 
-import kem_pb2 as kem__pb2
 import swm_service_pb2 as swm__service__pb2
 
 GRPC_GENERATED_VERSION = '1.73.0'
@@ -26,8 +25,8 @@ if _version_not_supported:
     )
 
 
-class SharedWorkingMemoryStub(object):
-    """Сервис для Общей Рабочей Памяти / Шины Памяти (Shared Working Memory / Memory Bus Service)
+class SharedWorkingMemoryServiceStub(object):
+    """Сервис Общей Рабочей Памяти (Shared Working Memory Service)
     """
 
     def __init__(self, channel):
@@ -36,101 +35,97 @@ class SharedWorkingMemoryStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.PublishKEM = channel.unary_unary(
-                '/dcsm.SharedWorkingMemory/PublishKEM',
-                request_serializer=swm__service__pb2.PublishKEMRequest.SerializeToString,
-                response_deserializer=swm__service__pb2.PublishKEMResponse.FromString,
+        self.PublishKEMToSWM = channel.unary_unary(
+                '/dcsm.SharedWorkingMemoryService/PublishKEMToSWM',
+                request_serializer=swm__service__pb2.PublishKEMToSWMRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.PublishKEMToSWMResponse.FromString,
                 _registered_method=True)
-        self.SubscribeKEMs = channel.unary_stream(
-                '/dcsm.SharedWorkingMemory/SubscribeKEMs',
-                request_serializer=swm__service__pb2.SubscribeKEMsRequest.SerializeToString,
-                response_deserializer=kem__pb2.KEM.FromString,
+        self.SubscribeToSWMEvents = channel.unary_stream(
+                '/dcsm.SharedWorkingMemoryService/SubscribeToSWMEvents',
+                request_serializer=swm__service__pb2.SubscribeToSWMEventsRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.SWMMemoryEvent.FromString,
                 _registered_method=True)
-        self.QueryActiveKEMs = channel.unary_unary(
-                '/dcsm.SharedWorkingMemory/QueryActiveKEMs',
-                request_serializer=swm__service__pb2.QueryActiveKEMsRequest.SerializeToString,
-                response_deserializer=swm__service__pb2.QueryActiveKEMsResponse.FromString,
+        self.QuerySWM = channel.unary_unary(
+                '/dcsm.SharedWorkingMemoryService/QuerySWM',
+                request_serializer=swm__service__pb2.QuerySWMRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.QuerySWMResponse.FromString,
                 _registered_method=True)
-        self.RequestKEMLoadToSWM = channel.unary_unary(
-                '/dcsm.SharedWorkingMemory/RequestKEMLoadToSWM',
-                request_serializer=swm__service__pb2.RequestKEMLoadToSWMRequest.SerializeToString,
-                response_deserializer=swm__service__pb2.RequestKEMLoadToSWMResponse.FromString,
+        self.LoadKEMsFromGLM = channel.unary_unary(
+                '/dcsm.SharedWorkingMemoryService/LoadKEMsFromGLM',
+                request_serializer=swm__service__pb2.LoadKEMsFromGLMRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.LoadKEMsFromGLMResponse.FromString,
                 _registered_method=True)
 
 
-class SharedWorkingMemoryServicer(object):
-    """Сервис для Общей Рабочей Памяти / Шины Памяти (Shared Working Memory / Memory Bus Service)
+class SharedWorkingMemoryServiceServicer(object):
+    """Сервис Общей Рабочей Памяти (Shared Working Memory Service)
     """
 
-    def PublishKEM(self, request, context):
-        """Публикует КЕП в SWM, делая ее доступной для других агентов.
-        Может также инициировать асинхронное сохранение в GLM, если КЕП новая или значительно обновлена.
+    def PublishKEMToSWM(self, request, context):
+        """Публикует КЕП в SWM. Может также инициировать сохранение/обновление в GLM.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SubscribeKEMs(self, request, context):
-        """Подписывается на поток КЕП, соответствующих определенным критериям (например, тема, запрос).
-        Сервер будет стримить КЕП по мере их появления или обновления в SWM.
+    def SubscribeToSWMEvents(self, request, context):
+        """Подписывается на события, происходящие в SWM (например, появление новых КЕП).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def QueryActiveKEMs(self, request, context):
-        """Запрашивает активные КЕП из SWM на основе различных критериев.
-        Это запрос "одного момента времени" к текущему состоянию SWM.
+    def QuerySWM(self, request, context):
+        """Запрашивает активные КЕП непосредственно из SWM (из ее кэша).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def RequestKEMLoadToSWM(self, request, context):
-        """Запрашивает "подтягивание" КЕП из GLM в SWM, если они там еще не активны.
-        Может использоваться агентом, если он ожидает, что определенные КЕП скоро понадобятся.
+    def LoadKEMsFromGLM(self, request, context):
+        """Запрашивает загрузку КЕП из GLM в SWM (в кэш SWM).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
 
-def add_SharedWorkingMemoryServicer_to_server(servicer, server):
+def add_SharedWorkingMemoryServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'PublishKEM': grpc.unary_unary_rpc_method_handler(
-                    servicer.PublishKEM,
-                    request_deserializer=swm__service__pb2.PublishKEMRequest.FromString,
-                    response_serializer=swm__service__pb2.PublishKEMResponse.SerializeToString,
+            'PublishKEMToSWM': grpc.unary_unary_rpc_method_handler(
+                    servicer.PublishKEMToSWM,
+                    request_deserializer=swm__service__pb2.PublishKEMToSWMRequest.FromString,
+                    response_serializer=swm__service__pb2.PublishKEMToSWMResponse.SerializeToString,
             ),
-            'SubscribeKEMs': grpc.unary_stream_rpc_method_handler(
-                    servicer.SubscribeKEMs,
-                    request_deserializer=swm__service__pb2.SubscribeKEMsRequest.FromString,
-                    response_serializer=kem__pb2.KEM.SerializeToString,
+            'SubscribeToSWMEvents': grpc.unary_stream_rpc_method_handler(
+                    servicer.SubscribeToSWMEvents,
+                    request_deserializer=swm__service__pb2.SubscribeToSWMEventsRequest.FromString,
+                    response_serializer=swm__service__pb2.SWMMemoryEvent.SerializeToString,
             ),
-            'QueryActiveKEMs': grpc.unary_unary_rpc_method_handler(
-                    servicer.QueryActiveKEMs,
-                    request_deserializer=swm__service__pb2.QueryActiveKEMsRequest.FromString,
-                    response_serializer=swm__service__pb2.QueryActiveKEMsResponse.SerializeToString,
+            'QuerySWM': grpc.unary_unary_rpc_method_handler(
+                    servicer.QuerySWM,
+                    request_deserializer=swm__service__pb2.QuerySWMRequest.FromString,
+                    response_serializer=swm__service__pb2.QuerySWMResponse.SerializeToString,
             ),
-            'RequestKEMLoadToSWM': grpc.unary_unary_rpc_method_handler(
-                    servicer.RequestKEMLoadToSWM,
-                    request_deserializer=swm__service__pb2.RequestKEMLoadToSWMRequest.FromString,
-                    response_serializer=swm__service__pb2.RequestKEMLoadToSWMResponse.SerializeToString,
+            'LoadKEMsFromGLM': grpc.unary_unary_rpc_method_handler(
+                    servicer.LoadKEMsFromGLM,
+                    request_deserializer=swm__service__pb2.LoadKEMsFromGLMRequest.FromString,
+                    response_serializer=swm__service__pb2.LoadKEMsFromGLMResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'dcsm.SharedWorkingMemory', rpc_method_handlers)
+            'dcsm.SharedWorkingMemoryService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('dcsm.SharedWorkingMemory', rpc_method_handlers)
+    server.add_registered_method_handlers('dcsm.SharedWorkingMemoryService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class SharedWorkingMemory(object):
-    """Сервис для Общей Рабочей Памяти / Шины Памяти (Shared Working Memory / Memory Bus Service)
+class SharedWorkingMemoryService(object):
+    """Сервис Общей Рабочей Памяти (Shared Working Memory Service)
     """
 
     @staticmethod
-    def PublishKEM(request,
+    def PublishKEMToSWM(request,
             target,
             options=(),
             channel_credentials=None,
@@ -143,9 +138,9 @@ class SharedWorkingMemory(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dcsm.SharedWorkingMemory/PublishKEM',
-            swm__service__pb2.PublishKEMRequest.SerializeToString,
-            swm__service__pb2.PublishKEMResponse.FromString,
+            '/dcsm.SharedWorkingMemoryService/PublishKEMToSWM',
+            swm__service__pb2.PublishKEMToSWMRequest.SerializeToString,
+            swm__service__pb2.PublishKEMToSWMResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -157,7 +152,7 @@ class SharedWorkingMemory(object):
             _registered_method=True)
 
     @staticmethod
-    def SubscribeKEMs(request,
+    def SubscribeToSWMEvents(request,
             target,
             options=(),
             channel_credentials=None,
@@ -170,9 +165,9 @@ class SharedWorkingMemory(object):
         return grpc.experimental.unary_stream(
             request,
             target,
-            '/dcsm.SharedWorkingMemory/SubscribeKEMs',
-            swm__service__pb2.SubscribeKEMsRequest.SerializeToString,
-            kem__pb2.KEM.FromString,
+            '/dcsm.SharedWorkingMemoryService/SubscribeToSWMEvents',
+            swm__service__pb2.SubscribeToSWMEventsRequest.SerializeToString,
+            swm__service__pb2.SWMMemoryEvent.FromString,
             options,
             channel_credentials,
             insecure,
@@ -184,7 +179,7 @@ class SharedWorkingMemory(object):
             _registered_method=True)
 
     @staticmethod
-    def QueryActiveKEMs(request,
+    def QuerySWM(request,
             target,
             options=(),
             channel_credentials=None,
@@ -197,9 +192,9 @@ class SharedWorkingMemory(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dcsm.SharedWorkingMemory/QueryActiveKEMs',
-            swm__service__pb2.QueryActiveKEMsRequest.SerializeToString,
-            swm__service__pb2.QueryActiveKEMsResponse.FromString,
+            '/dcsm.SharedWorkingMemoryService/QuerySWM',
+            swm__service__pb2.QuerySWMRequest.SerializeToString,
+            swm__service__pb2.QuerySWMResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -211,7 +206,7 @@ class SharedWorkingMemory(object):
             _registered_method=True)
 
     @staticmethod
-    def RequestKEMLoadToSWM(request,
+    def LoadKEMsFromGLM(request,
             target,
             options=(),
             channel_credentials=None,
@@ -224,9 +219,9 @@ class SharedWorkingMemory(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dcsm.SharedWorkingMemory/RequestKEMLoadToSWM',
-            swm__service__pb2.RequestKEMLoadToSWMRequest.SerializeToString,
-            swm__service__pb2.RequestKEMLoadToSWMResponse.FromString,
+            '/dcsm.SharedWorkingMemoryService/LoadKEMsFromGLM',
+            swm__service__pb2.LoadKEMsFromGLMRequest.SerializeToString,
+            swm__service__pb2.LoadKEMsFromGLMResponse.FromString,
             options,
             channel_credentials,
             insecure,

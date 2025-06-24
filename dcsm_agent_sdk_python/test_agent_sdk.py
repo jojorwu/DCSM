@@ -120,31 +120,42 @@ class TestLocalAgentMemoryWithIndexedCache(unittest.TestCase):
 
 
 class TestGLMClientRetrieve(unittest.TestCase):
-    # Этот тест удален/закомментирован, так как функциональность ids_filter была отменена
-    # из-за несоответствия proto.
-    # @patch('dcsm_agent_sdk_python.glm_client.grpc')
-    # def test_retrieve_kems_with_ids_filter(self, mock_grpc):
-    #     mock_stub = MagicMock()
-    #     mock_channel = MagicMock()
-    #     mock_grpc.insecure_channel.return_value = mock_channel
-    #     with patch('dcsm_agent_sdk_python.generated_grpc_code.glm_service_pb2_grpc.GlobalLongTermMemoryStub', return_value=mock_stub):
-    #         client = GLMClient()
-    #         client.connect()
-    #         mock_response = MagicMock()
-    #         mock_kem_proto1 = MagicMock()
-    #         mock_kem_proto1.id = "id1"
-    #         mock_response.kems = [mock_kem_proto1]
-    #         mock_stub.RetrieveKEMs.return_value = mock_response
-    #         with patch.object(client, '_kem_proto_to_dict', side_effect=lambda x: {"id": x.id, "content": "MockContent"} if hasattr(x, 'id') else {}):
-    #             client.retrieve_kems(ids_filter=["id1", "id2"], limit=5) # ids_filter здесь вызовет ошибку, если его нет в сигнатуре
-    #         self.assertTrue(mock_stub.RetrieveKEMs.called)
-    #         args, kwargs = mock_stub.RetrieveKEMs.call_args
-    #         called_request = args[0]
-    #         # Эти проверки не пройдут, если KEMQuery не имеет поля ids
-    #         # self.assertIn("id1", called_request.query.ids)
-    #         # self.assertIn("id2", called_request.query.ids)
-    #         self.assertEqual(called_request.page_size, 5) # page_size есть в RetrieveKEMsRequest
-    pass # Класс оставляем, но тест удаляем
+    @patch('dcsm_agent_sdk_python.glm_client.grpc')
+    def test_retrieve_kems_with_ids_filter(self, mock_grpc):
+        mock_stub = MagicMock()
+        mock_channel = MagicMock()
+        mock_grpc.insecure_channel.return_value = mock_channel
+
+        # Мокаем GlobalLongTermMemoryStub из правильного сгенерированного модуля
+        with patch('dcsm_agent_sdk_python.generated_grpc_code.glm_service_pb2_grpc.GlobalLongTermMemoryStub', return_value=mock_stub) as MockStubConst:
+            client = GLMClient()
+            client.connect()
+
+            mock_response_from_server = MagicMock()
+            # Предположим, сервер вернул один KEM
+            mock_kem_proto = MagicMock() # Это должен быть объект типа kem_pb2.KEM
+            # Чтобы _kem_proto_to_dict работал, нам нужен объект с полями или мокнуть _kem_proto_to_dict
+            # Проще мокнуть _kem_proto_to_dict или создать реальный kem_pb2.KEM, если это просто.
+            # Для этого теста важнее проверить, что stub.RetrieveKEMs вызывается с правильным запросом.
+
+            mock_response_from_server.kems = [mock_kem_proto] # Список из одного мок-КЕМа
+            mock_response_from_server.next_page_token = "next_token_test"
+            mock_stub.RetrieveKEMs.return_value = mock_response_from_server
+
+            # Мы не будем проверять результат _kem_proto_to_dict здесь, а только вызов RetrieveKEMs
+            # Поэтому нет нужды мокать _kem_proto_to_dict
+            kems, next_token = client.retrieve_kems(ids_filter=["id1", "id2"], page_size=5, page_token="prev_token")
+
+            self.assertTrue(mock_stub.RetrieveKEMs.called)
+            args, kwargs = mock_stub.RetrieveKEMs.call_args
+            called_request = args[0] # это RetrieveKEMsRequest
+
+            self.assertIn("id1", called_request.query.ids)
+            self.assertIn("id2", called_request.query.ids)
+            self.assertEqual(called_request.page_size, 5)
+            self.assertEqual(called_request.page_token, "prev_token")
+            self.assertIsNotNone(kems) # Проверяем, что kems не None
+            self.assertEqual(next_token, "next_token_test")
 
 
 class TestAgentSDK(unittest.TestCase):
@@ -157,7 +168,17 @@ class TestAgentSDK(unittest.TestCase):
         self.MockLocalAgentMemory = self.mock_local_memory_patch.start()
 
         self.mock_glm_instance = self.MockGLMClient.return_value
+        self.mock_glm_instance = self.MockGLMClient.return_value
         self.mock_lpa_instance = self.MockLocalAgentMemory.return_value
+
+    # _create_mock_retrieve_kems_side_effect больше не нужен, так как мокируем return_value напрямую
+    # def _create_mock_retrieve_kems_side_effect(self, kem_to_return: typing.Optional[dict]):
+    #     """Хелпер для создания side_effect функции для retrieve_kems."""
+    #     def mock_func(*args, **kwargs):
+    #         if kem_to_return and kwargs.get('ids_filter') == [kem_to_return['id']]:
+    #             return ([kem_to_return.copy()], None)
+    #         return ([], None)
+    #     return mock_func
 
     def tearDown(self):
         self.mock_glm_client_patch.stop()
@@ -176,29 +197,39 @@ class TestAgentSDK(unittest.TestCase):
     def test_store_kems_no_refresh_lpa(self):
         sdk = AgentSDK()
         kems_to_store = [create_kem_dict("id1", {"type": "A"})]
-        self.mock_glm_instance.store_kems.return_value = (["id1"], 1, [])
+        # AgentSDK.store_kems теперь вызывает glm_client.batch_store_kems.
+        # Мок должен соответствовать возвращаемому значению batch_store_kems:
+        # (list_of_successfully_stored_kems_dicts, list_of_failed_references, error_message_str)
+        # Для этого теста (старая логика без явного refresh), предположим, что сервер вернул
+        # словари, идентичные отправленным, если ID совпадают.
+        self.mock_glm_instance.batch_store_kems.return_value = ([kems_to_store[0]], [], None)
 
-        sdk.store_kems(kems_to_store) # Убран аргумент refresh_lpa_after_store
+        sdk.store_kems(kems_to_store)
 
-        self.mock_glm_instance.store_kems.assert_called_once_with(kems_to_store)
-        self.mock_glm_instance.retrieve_kems.assert_not_called() # retrieve_kems не должен вызываться
+        self.mock_glm_instance.batch_store_kems.assert_called_once_with(kems_to_store)
+        # retrieve_kems не должен вызываться, так как refresh_lpa_after_store удален и его логика встроена
+        self.mock_glm_instance.retrieve_kems.assert_not_called()
         self.mock_lpa_instance.put.assert_called_once_with("id1", kems_to_store[0])
 
-    # Тест test_store_kems_with_refresh_lpa удален, так как функциональность refresh_lpa_after_store
-    # была отменена из-за отсутствия поля ids в KEMQuery текущей версии proto SDK.
-    # def test_store_kems_with_refresh_lpa(self):
-    #     sdk = AgentSDK()
-    #     kems_to_store = [create_kem_dict("id1", {"type": "A"})]
-    #     self.mock_glm_instance.store_kems.return_value = (["id1"], 1, [])
-    #     retrieved_kem_from_server = create_kem_dict("id1", {"type": "A", "server_field": True})
-    #     self.mock_glm_instance.retrieve_kems.return_value = [retrieved_kem_from_server]
-    #     sdk.store_kems(kems_to_store, refresh_lpa_after_store=True)
-    #     self.mock_glm_instance.store_kems.assert_called_once_with(kems_to_store)
-    #     # Проверка вызова retrieve_kems должна соответствовать актуальной сигнатуре (без ids_filter)
-    #     # Например, если бы он пытался получить каждый ID отдельно через metadata_filters:
-    #     # self.mock_glm_instance.retrieve_kems.assert_called_once_with(metadata_filters={'id': 'id1'}, limit=1)
-    #     # Но так как этого нет, а ids_filter убран, этот тест требует пересмотра или удаления.
-    #     self.mock_lpa_instance.put.assert_called_once_with("id1", retrieved_kem_from_server)
+    # Тест test_store_kems_with_refresh_lpa удален/заменен на test_store_kems_updates_lpa_with_server_data
+    def test_store_kems_updates_lpa_with_server_data(self):
+        sdk = AgentSDK()
+        kems_to_store = [create_kem_dict("id1", {"type": "A", "version": 1})]
+
+        # Мок ответа от glm_client.batch_store_kems
+        # (successfully_stored_kems_as_dicts, failed_kem_references, overall_error_message)
+        kem_from_server_dict = create_kem_dict("id1", {"type": "A", "version": 1, "server_field": True}) # Сервер мог добавить поля
+        self.mock_glm_instance.batch_store_kems.return_value = ([kem_from_server_dict], [], None)
+
+        # Вызываем store_kems (параметр refresh_lpa_after_store удален, теперь это поведение по умолчанию)
+        stored_kems, _, _ = sdk.store_kems(kems_to_store)
+
+        self.mock_glm_instance.batch_store_kems.assert_called_once_with(kems_to_store)
+        self.assertIsNotNone(stored_kems)
+        self.assertEqual(len(stored_kems), 1)
+        self.assertEqual(stored_kems[0]['id'], "id1")
+        # Проверяем, что ЛПА обновлена данными, возвращенными сервером
+        self.mock_lpa_instance.put.assert_called_once_with("id1", kem_from_server_dict)
 
 
     def test_get_kem_from_lpa(self):
@@ -214,28 +245,32 @@ class TestAgentSDK(unittest.TestCase):
     def test_get_kem_from_glm_when_not_in_lpa(self):
         sdk = AgentSDK()
         self.mock_lpa_instance.get.return_value = None # Не найдено в ЛПА
-        kem_from_glm = create_kem_dict("id1", {"source": "glm"})
-        self.mock_glm_instance.retrieve_kems.return_value = [kem_from_glm] # GLM возвращает список
+        kem_from_glm_dict = create_kem_dict("id1", {"source": "glm"})
+        # GLMClient.retrieve_kems теперь возвращает кортеж (list_of_kems, next_page_token)
+        self.mock_glm_instance.retrieve_kems.return_value = ([kem_from_glm_dict], "mock_token_1")
 
         result = sdk.get_kem("id1")
-        self.assertEqual(result, kem_from_glm)
+        self.assertEqual(result, kem_from_glm_dict)
         self.mock_lpa_instance.get.assert_called_once_with("id1")
-        self.mock_glm_instance.retrieve_kems.assert_called_once_with(metadata_filters={'id': 'id1'}, limit=1)
-        self.mock_lpa_instance.put.assert_called_once_with("id1", kem_from_glm)
+        # Проверяем, что retrieve_kems вызывается с ids_filter
+        self.mock_glm_instance.retrieve_kems.assert_called_once_with(ids_filter=['id1'], page_size=1)
+        self.mock_lpa_instance.put.assert_called_once_with("id1", kem_from_glm_dict) # Исправлено здесь
 
     def test_get_kem_force_remote(self):
         sdk = AgentSDK()
-        # Даже если есть в ЛПА, force_remote должен проигнорировать
         kem_in_lpa = create_kem_dict("id1", {"source": "lpa"})
         self.mock_lpa_instance.get.return_value = kem_in_lpa
 
         kem_from_glm = create_kem_dict("id1", {"source": "glm_forced"})
-        self.mock_glm_instance.retrieve_kems.return_value = [kem_from_glm]
+        # GLMClient.retrieve_kems теперь возвращает кортеж (list_of_kems, next_page_token)
+        self.mock_glm_instance.retrieve_kems.return_value = ([kem_from_glm], None)
+
 
         result = sdk.get_kem("id1", force_remote=True)
         self.assertEqual(result, kem_from_glm)
-        self.mock_lpa_instance.get.assert_not_called() # Не должен был вызываться get из ЛПА
-        self.mock_glm_instance.retrieve_kems.assert_called_once_with(metadata_filters={'id': 'id1'}, limit=1)
+        self.mock_lpa_instance.get.assert_not_called()
+        # Проверяем, что retrieve_kems вызывается с ids_filter
+        self.mock_glm_instance.retrieve_kems.assert_called_once_with(ids_filter=['id1'], page_size=1)
         self.mock_lpa_instance.put.assert_called_once_with("id1", kem_from_glm)
 
 

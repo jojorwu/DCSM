@@ -23,44 +23,40 @@ _sym_db = _symbol_database.Default()
 
 
 import kem_pb2 as kem__pb2
-from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
+import glm_service_pb2 as glm__service__pb2
+from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11swm_service.proto\x12\x04\x64\x63sm\x1a\tkem.proto\x1a\x1bgoogle/protobuf/empty.proto\"+\n\x11PublishKEMRequest\x12\x16\n\x03kem\x18\x01 \x01(\x0b\x32\t.dcsm.KEM\"G\n\x12PublishKEMResponse\x12\x0e\n\x06kem_id\x18\x01 \x01(\t\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x9b\x02\n\x11SubscriptionTopic\x12/\n\x04type\x18\x01 \x01(\x0e\x32!.dcsm.SubscriptionTopic.TopicType\x12\r\n\x05value\x18\x02 \x01(\t\x12\x46\n\x10metadata_filters\x18\x03 \x03(\x0b\x32,.dcsm.SubscriptionTopic.MetadataFiltersEntry\x1a\x36\n\x14MetadataFiltersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"F\n\tTopicType\x12\r\n\tUNDEFINED\x10\x00\x12\x16\n\x12METADATA_KEY_VALUE\x10\x01\x12\x12\n\x0eSEMANTIC_QUERY\x10\x02\"?\n\x14SubscribeKEMsRequest\x12\'\n\x06topics\x18\x01 \x03(\x0b\x32\x17.dcsm.SubscriptionTopic\"\xba\x01\n\x0e\x41\x63tiveKEMQuery\x12\x12\n\ntext_query\x18\x01 \x01(\t\x12\x17\n\x0f\x65mbedding_query\x18\x02 \x03(\x02\x12\x43\n\x10metadata_filters\x18\x03 \x03(\x0b\x32).dcsm.ActiveKEMQuery.MetadataFiltersEntry\x1a\x36\n\x14MetadataFiltersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"L\n\x16QueryActiveKEMsRequest\x12#\n\x05query\x18\x01 \x01(\x0b\x32\x14.dcsm.ActiveKEMQuery\x12\r\n\x05limit\x18\x02 \x01(\x05\"2\n\x17QueryActiveKEMsResponse\x12\x17\n\x04kems\x18\x01 \x03(\x0b\x32\t.dcsm.KEM\"x\n\x1aRequestKEMLoadToSWMRequest\x12\x0f\n\x07kem_ids\x18\x01 \x03(\t\x12\x30\n\x12query_if_ids_empty\x18\x02 \x01(\x0b\x32\x14.dcsm.ActiveKEMQuery\x12\x17\n\x0flimit_for_query\x18\x03 \x01(\x05\"m\n\x1bRequestKEMLoadToSWMResponse\x12\x1f\n\x17requested_to_load_count\x18\x01 \x01(\x05\x12\x1c\n\x14\x61lready_active_count\x18\x02 \x01(\x05\x12\x0f\n\x07message\x18\x03 \x01(\t2\xbc\x02\n\x13SharedWorkingMemory\x12?\n\nPublishKEM\x12\x17.dcsm.PublishKEMRequest\x1a\x18.dcsm.PublishKEMResponse\x12\x38\n\rSubscribeKEMs\x12\x1a.dcsm.SubscribeKEMsRequest\x1a\t.dcsm.KEM0\x01\x12N\n\x0fQueryActiveKEMs\x12\x1c.dcsm.QueryActiveKEMsRequest\x1a\x1d.dcsm.QueryActiveKEMsResponse\x12Z\n\x13RequestKEMLoadToSWM\x12 .dcsm.RequestKEMLoadToSWMRequest\x1a!.dcsm.RequestKEMLoadToSWMResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11swm_service.proto\x12\x04\x64\x63sm\x1a\tkem.proto\x1a\x11glm_service.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"e\n\x16PublishKEMToSWMRequest\x12!\n\x0ekem_to_publish\x18\x01 \x01(\x0b\x32\t.dcsm.KEM\x12(\n persist_to_glm_if_new_or_updated\x18\x02 \x01(\x08\"\x81\x01\n\x17PublishKEMToSWMResponse\x12\x0e\n\x06kem_id\x18\x01 \x01(\t\x12\x18\n\x10published_to_swm\x18\x02 \x01(\x08\x12$\n\x1cpersistence_triggered_to_glm\x18\x03 \x01(\x08\x12\x16\n\x0estatus_message\x18\x04 \x01(\t\"\x99\x01\n\x11SubscriptionTopic\x12/\n\x04type\x18\x01 \x01(\x0e\x32!.dcsm.SubscriptionTopic.TopicType\x12\x17\n\x0f\x66ilter_criteria\x18\x02 \x01(\t\":\n\tTopicType\x12\x13\n\x0fUNDEFINED_TOPIC\x10\x00\x12\x18\n\x14KEM_LIFECYCLE_EVENTS\x10\x01\"X\n\x1bSubscribeToSWMEventsRequest\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\'\n\x06topics\x18\x02 \x03(\x0b\x32\x17.dcsm.SubscriptionTopic\"\xae\x02\n\x0eSWMMemoryEvent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x32\n\nevent_type\x18\x02 \x01(\x0e\x32\x1e.dcsm.SWMMemoryEvent.EventType\x12\x1e\n\x0bkem_payload\x18\x03 \x01(\x0b\x32\t.dcsm.KEM\x12.\n\nevent_time\x18\x04 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12\x17\n\x0fsource_agent_id\x18\x05 \x01(\t\x12\x0f\n\x07\x64\x65tails\x18\x06 \x01(\t\"\\\n\tEventType\x12\x1a\n\x16\x45VENT_TYPE_UNSPECIFIED\x10\x00\x12\x11\n\rKEM_PUBLISHED\x10\x01\x12\x0f\n\x0bKEM_UPDATED\x10\x02\x12\x0f\n\x0bKEM_EVICTED\x10\x03\"W\n\x0fQuerySWMRequest\x12\x1d\n\x05query\x18\x01 \x01(\x0b\x32\x0e.dcsm.KEMQuery\x12\x11\n\tpage_size\x18\x02 \x01(\x05\x12\x12\n\npage_token\x18\x03 \x01(\t\"D\n\x10QuerySWMResponse\x12\x17\n\x04kems\x18\x01 \x03(\x0b\x32\t.dcsm.KEM\x12\x17\n\x0fnext_page_token\x18\x02 \x01(\t\"?\n\x16LoadKEMsFromGLMRequest\x12%\n\rquery_for_glm\x18\x01 \x01(\x0b\x32\x0e.dcsm.KEMQuery\"\x8e\x01\n\x17LoadKEMsFromGLMResponse\x12!\n\x19kems_queried_in_glm_count\x18\x01 \x01(\x05\x12 \n\x18kems_loaded_to_swm_count\x18\x02 \x01(\x05\x12\x16\n\x0eloaded_kem_ids\x18\x03 \x03(\t\x12\x16\n\x0estatus_message\x18\x04 \x01(\t2\xca\x02\n\x1aSharedWorkingMemoryService\x12N\n\x0fPublishKEMToSWM\x12\x1c.dcsm.PublishKEMToSWMRequest\x1a\x1d.dcsm.PublishKEMToSWMResponse\x12Q\n\x14SubscribeToSWMEvents\x12!.dcsm.SubscribeToSWMEventsRequest\x1a\x14.dcsm.SWMMemoryEvent0\x01\x12\x39\n\x08QuerySWM\x12\x15.dcsm.QuerySWMRequest\x1a\x16.dcsm.QuerySWMResponse\x12N\n\x0fLoadKEMsFromGLM\x12\x1c.dcsm.LoadKEMsFromGLMRequest\x1a\x1d.dcsm.LoadKEMsFromGLMResponseB;Z9github.com/your_org/dcsm_protos/gen/go/swm;swm_service_pbb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'swm_service_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
-  DESCRIPTOR._loaded_options = None
-  _globals['_SUBSCRIPTIONTOPIC_METADATAFILTERSENTRY']._loaded_options = None
-  _globals['_SUBSCRIPTIONTOPIC_METADATAFILTERSENTRY']._serialized_options = b'8\001'
-  _globals['_ACTIVEKEMQUERY_METADATAFILTERSENTRY']._loaded_options = None
-  _globals['_ACTIVEKEMQUERY_METADATAFILTERSENTRY']._serialized_options = b'8\001'
-  _globals['_PUBLISHKEMREQUEST']._serialized_start=67
-  _globals['_PUBLISHKEMREQUEST']._serialized_end=110
-  _globals['_PUBLISHKEMRESPONSE']._serialized_start=112
-  _globals['_PUBLISHKEMRESPONSE']._serialized_end=183
-  _globals['_SUBSCRIPTIONTOPIC']._serialized_start=186
-  _globals['_SUBSCRIPTIONTOPIC']._serialized_end=469
-  _globals['_SUBSCRIPTIONTOPIC_METADATAFILTERSENTRY']._serialized_start=343
-  _globals['_SUBSCRIPTIONTOPIC_METADATAFILTERSENTRY']._serialized_end=397
-  _globals['_SUBSCRIPTIONTOPIC_TOPICTYPE']._serialized_start=399
-  _globals['_SUBSCRIPTIONTOPIC_TOPICTYPE']._serialized_end=469
-  _globals['_SUBSCRIBEKEMSREQUEST']._serialized_start=471
-  _globals['_SUBSCRIBEKEMSREQUEST']._serialized_end=534
-  _globals['_ACTIVEKEMQUERY']._serialized_start=537
-  _globals['_ACTIVEKEMQUERY']._serialized_end=723
-  _globals['_ACTIVEKEMQUERY_METADATAFILTERSENTRY']._serialized_start=343
-  _globals['_ACTIVEKEMQUERY_METADATAFILTERSENTRY']._serialized_end=397
-  _globals['_QUERYACTIVEKEMSREQUEST']._serialized_start=725
-  _globals['_QUERYACTIVEKEMSREQUEST']._serialized_end=801
-  _globals['_QUERYACTIVEKEMSRESPONSE']._serialized_start=803
-  _globals['_QUERYACTIVEKEMSRESPONSE']._serialized_end=853
-  _globals['_REQUESTKEMLOADTOSWMREQUEST']._serialized_start=855
-  _globals['_REQUESTKEMLOADTOSWMREQUEST']._serialized_end=975
-  _globals['_REQUESTKEMLOADTOSWMRESPONSE']._serialized_start=977
-  _globals['_REQUESTKEMLOADTOSWMRESPONSE']._serialized_end=1086
-  _globals['_SHAREDWORKINGMEMORY']._serialized_start=1089
-  _globals['_SHAREDWORKINGMEMORY']._serialized_end=1405
+  _globals['DESCRIPTOR']._loaded_options = None
+  _globals['DESCRIPTOR']._serialized_options = b'Z9github.com/your_org/dcsm_protos/gen/go/swm;swm_service_pb'
+  _globals['_PUBLISHKEMTOSWMREQUEST']._serialized_start=90
+  _globals['_PUBLISHKEMTOSWMREQUEST']._serialized_end=191
+  _globals['_PUBLISHKEMTOSWMRESPONSE']._serialized_start=194
+  _globals['_PUBLISHKEMTOSWMRESPONSE']._serialized_end=323
+  _globals['_SUBSCRIPTIONTOPIC']._serialized_start=326
+  _globals['_SUBSCRIPTIONTOPIC']._serialized_end=479
+  _globals['_SUBSCRIPTIONTOPIC_TOPICTYPE']._serialized_start=421
+  _globals['_SUBSCRIPTIONTOPIC_TOPICTYPE']._serialized_end=479
+  _globals['_SUBSCRIBETOSWMEVENTSREQUEST']._serialized_start=481
+  _globals['_SUBSCRIBETOSWMEVENTSREQUEST']._serialized_end=569
+  _globals['_SWMMEMORYEVENT']._serialized_start=572
+  _globals['_SWMMEMORYEVENT']._serialized_end=874
+  _globals['_SWMMEMORYEVENT_EVENTTYPE']._serialized_start=782
+  _globals['_SWMMEMORYEVENT_EVENTTYPE']._serialized_end=874
+  _globals['_QUERYSWMREQUEST']._serialized_start=876
+  _globals['_QUERYSWMREQUEST']._serialized_end=963
+  _globals['_QUERYSWMRESPONSE']._serialized_start=965
+  _globals['_QUERYSWMRESPONSE']._serialized_end=1033
+  _globals['_LOADKEMSFROMGLMREQUEST']._serialized_start=1035
+  _globals['_LOADKEMSFROMGLMREQUEST']._serialized_end=1098
+  _globals['_LOADKEMSFROMGLMRESPONSE']._serialized_start=1101
+  _globals['_LOADKEMSFROMGLMRESPONSE']._serialized_end=1243
+  _globals['_SHAREDWORKINGMEMORYSERVICE']._serialized_start=1246
+  _globals['_SHAREDWORKINGMEMORYSERVICE']._serialized_end=1576
 # @@protoc_insertion_point(module_scope)
