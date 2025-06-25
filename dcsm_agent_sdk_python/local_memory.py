@@ -6,12 +6,13 @@ print("LocalAgentMemory.py loading...") # Для отладки
 
 # --- Копия IndexedLRUCache из SWM, адаптированная для словарей ---
 class IndexedLRUCache(Cache):
-    def __init__(self, maxsize, indexed_keys: typing.List[str]):
+    def __init__(self, maxsize, indexed_keys: typing.List[str], on_evict_callback: typing.Optional[typing.Callable[[dict], None]] = None): # kem_data здесь dict
         super().__init__(maxsize)
         self._lru = LRUCache(maxsize=maxsize)
-        self._indexed_keys = set(indexed_keys if indexed_keys else []) # Убедимся, что это set
+        self._indexed_keys = set(indexed_keys if indexed_keys else [])
         self._metadata_indexes: typing.Dict[str, typing.Dict[str, typing.Set[str]]] = {key: {} for key in self._indexed_keys}
         self._lock = threading.Lock()
+        self._on_evict_callback = on_evict_callback # Тип KEM здесь dict
 
     def _add_to_metadata_indexes(self, kem_data: dict):
         if not kem_data or not kem_data.get('id'): return
@@ -50,9 +51,17 @@ class IndexedLRUCache(Cache):
                 old_kem_data = self._lru[kem_id]
                 self._remove_from_metadata_indexes(old_kem_data)
             elif len(self._lru) >= self._lru.maxsize:
-                _evicted_id, evicted_kem_data = self._lru.popitem() # LRUCache.popitem() без last=False
+                _evicted_id, evicted_kem_data = self._lru.popitem()
                 if evicted_kem_data:
                     self._remove_from_metadata_indexes(evicted_kem_data)
+                    if self._on_evict_callback:
+                        try:
+                            self._on_evict_callback(evicted_kem_data)
+                        except Exception as e_cb:
+                            # В SDK можно просто залогировать или проигнорировать ошибку колбэка,
+                            # так как это менее критично, чем на сервере SWM.
+                            # print(f"Error in LPA on_evict_callback for KEM ID '{_evicted_id}': {e_cb}")
+                            pass # Пока просто пропускаем
 
             self._lru[kem_id] = kem_data
             self._add_to_metadata_indexes(kem_data)
