@@ -5,11 +5,17 @@ import sys
 import os
 import uuid
 import logging
-from sentence_transformers import SentenceTransformer # Добавлена зависимость
+from sentence_transformers import SentenceTransformer
+
+# Импортируем конфигурацию
+from .config import KPSConfig
+
+# Глобальный экземпляр конфигурации
+config = KPSConfig()
 
 # --- Настройка логирования ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=config.get_log_level_int(),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
@@ -133,9 +139,9 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     embeddings = embeddings_np[0].tolist()
                     logger.info("Эмбеддинги сгенерированы моделью (размерность: {}).".format(len(embeddings)))
 
-                    if len(embeddings) != KPS_DEFAULT_VECTOR_SIZE:
-                        msg = (f"Критическая ошибка: Модель '{SENTENCE_TRANSFORMER_MODEL_CONFIG}' вернула эмбеддинг размерности {len(embeddings)}, "
-                               f"но KPS_DEFAULT_VECTOR_SIZE равна {KPS_DEFAULT_VECTOR_SIZE}.")
+                    if len(embeddings) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
+                        msg = (f"Критическая ошибка: Модель '{self.config.SENTENCE_TRANSFORMER_MODEL}' вернула эмбеддинг размерности {len(embeddings)}, "
+                               f"но DEFAULT_VECTOR_SIZE из конфигурации равна {self.config.DEFAULT_VECTOR_SIZE}.")
                         logger.error(msg)
                         context.abort(grpc.StatusCode.INTERNAL, "Ошибка конфигурации размерности эмбеддингов.")
                         return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
@@ -160,7 +166,6 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             store_kem_request = glm_service_pb2.StoreKEMRequest(kem=kem_to_store)
 
             try:
-                # Используем новый метод с retry
                 store_kem_response = self._glm_store_kem_with_retry(store_kem_request, timeout=10)
                 if store_kem_response and store_kem_response.kem and store_kem_response.kem.id:
                     kem_id_from_glm = store_kem_response.kem.id
@@ -174,11 +179,21 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     msg = "Ошибка: GLM.StoreKEM не вернул ожидаемый ответ или ID КЕП."
                     logger.error(msg)
                     return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
-            except grpc.RpcError as e:
-                logger.error("KPS: gRPC ошибка при вызове GLM.StoreKEM: code={}, details={}".format(e.code(), e.details()))
-                return kps_service_pb2.ProcessRawDataResponse(success=False, status_message="Ошибка взаимодействия с GLM: {}".format(e.details()))
+            # Ошибки grpc.RpcError теперь обрабатываются декоратором _glm_store_kem_with_retry
+            # и будут проброшены, если все попытки неудачны.
+            # Этот try-блок ловит ошибки, которые могут возникнуть ПОСЛЕ успешного вызова _glm_store_kem_with_retry
+            # или если _glm_store_kem_with_retry вернул None (хотя он должен пробрасывать ошибку).
+            # Корректнее будет, если ProcessRawData также будет обернут в try-except для RpcError,
+            # которые могут быть проброшены из _glm_store_kem_with_retry.
+            except grpc.RpcError as e_glm: # Ловим RpcError, проброшенный из _glm_store_kem_with_retry
+                logger.error(f"KPS: gRPC ошибка от GLM после retry: code={e_glm.code()}, details={e_glm.details()}")
+                return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=f"Ошибка взаимодействия с GLM: {e_glm.details()}")
+            except Exception as e_other_after_glm: # Другие ошибки после вызова GLM
+                 logger.error(f"KPS: Ошибка после вызова GLM в ProcessRawData: {e_other_after_glm}", exc_info=True)
+                 context.abort(grpc.StatusCode.INTERNAL, f"Внутренняя ошибка KPS после вызова GLM: {e_other_after_glm}")
+                 return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=f"Внутренняя ошибка KPS: {e_other_after_glm}")
 
-        except Exception as e:
+        except Exception as e: # Общий try-except для всего метода ProcessRawData
             logger.error("KPS: Непредвиденная ошибка в ProcessRawData: {}".format(e), exc_info=True)
             context.abort(grpc.StatusCode.INTERNAL, "Внутренняя ошибка KPS при обработке данных.")
             return kps_service_pb2.ProcessRawDataResponse(success=False, status_message="Внутренняя ошибка KPS.")
@@ -189,7 +204,8 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             logger.info("Канал GLM клиента в KPS закрыт.")
 
 def serve():
-    logger.info(f"Конфигурация KPS: GLM Адрес={GLM_SERVICE_ADDRESS_CONFIG}, KPS Адрес={KPS_GRPC_LISTEN_ADDRESS_CONFIG}, Модель={SENTENCE_TRANSFORMER_MODEL_CONFIG}, Размер вектора={KPS_DEFAULT_VECTOR_SIZE}")
+    # Используем глобальный объект config
+    logger.info(f"Конфигурация KPS: GLM Адрес={config.GLM_SERVICE_ADDRESS}, KPS Адрес={config.GRPC_LISTEN_ADDRESS}, Модель={config.SENTENCE_TRANSFORMER_MODEL}, Размер вектора={config.DEFAULT_VECTOR_SIZE}")
 
     servicer_instance = KnowledgeProcessorServiceImpl()
 
@@ -203,10 +219,10 @@ def serve():
     kps_service_pb2_grpc.add_KnowledgeProcessorServiceServicer_to_server(
         servicer_instance, server
     )
-    server.add_insecure_port(KPS_GRPC_LISTEN_ADDRESS_CONFIG)
-    logger.info(f"Запуск KPS (Knowledge Processor Service) на {KPS_GRPC_LISTEN_ADDRESS_CONFIG}...")
+    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS) # Используем config
+    logger.info(f"Запуск KPS (Knowledge Processor Service) на {config.GRPC_LISTEN_ADDRESS}...")
     server.start()
-    logger.info(f"KPS запущен и ожидает соединений на {KPS_GRPC_LISTEN_ADDRESS_CONFIG}.")
+    logger.info(f"KPS запущен и ожидает соединений на {config.GRPC_LISTEN_ADDRESS}.")
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:

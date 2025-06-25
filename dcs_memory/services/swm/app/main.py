@@ -12,9 +12,17 @@ from cachetools import LRUCache, Cache
 from google.protobuf.timestamp_pb2 import Timestamp
 import typing # Добавлено для typing.Optional и typing.List
 
+import typing # Добавлено для typing.Optional и typing.List
+
+# Импортируем конфигурацию
+from .config import SWMConfig
+
+# Глобальный экземпляр конфигурации
+config = SWMConfig()
+
 # --- Настройка логирования ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=config.get_log_level_int(), # Используем из BaseServiceConfig через SWMConfig
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
@@ -186,14 +194,15 @@ class IndexedLRUCache(Cache): # Наследуемся от Cache для type hi
 
 class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemoryServiceServicer):
     def __init__(self):
-        logger.info(f"Инициализация SharedWorkingMemoryServiceImpl... Размер кэша: {SWM_INTERNAL_CACHE_MAX_SIZE}, Индексируемые ключи метаданных: {SWM_INDEXED_METADATA_KEYS_CONFIG}")
+        self.config = config # Сохраняем ссылку на глобальный config
+        logger.info(f"Инициализация SharedWorkingMemoryServiceImpl... Размер кэша: {self.config.CACHE_MAX_SIZE}, Индексируемые ключи: {self.config.INDEXED_METADATA_KEYS}")
         self.glm_channel = None
         self.glm_stub = None
 
-        # Параметры Retry для вызовов к GLM
-        self.retry_max_attempts = SWM_GLM_RETRY_MAX_ATTEMPTS
-        self.retry_initial_delay_s = SWM_GLM_RETRY_INITIAL_DELAY_S
-        self.retry_backoff_factor = SWM_GLM_RETRY_BACKOFF_FACTOR
+        # Параметры Retry для вызовов к GLM из конфигурации
+        self.retry_max_attempts = self.config.GLM_RETRY_MAX_ATTEMPTS
+        self.retry_initial_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
+        self.retry_backoff_factor = self.config.GLM_RETRY_BACKOFF_FACTOR
 
         # Pub/Sub атрибуты
         self.subscribers: typing.Dict[str, SubscriberInfo] = {}
@@ -201,15 +210,15 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
         # Используем новый IndexedLRUCache с колбэком на вытеснение
         self.swm_cache = IndexedLRUCache(
-            maxsize=SWM_INTERNAL_CACHE_MAX_SIZE,
-            indexed_keys=SWM_INDEXED_METADATA_KEYS_CONFIG,
+            maxsize=self.config.CACHE_MAX_SIZE,
+            indexed_keys=self.config.INDEXED_METADATA_KEYS, # Используем распарсенный список из config
             on_evict_callback=self._handle_kem_eviction
         )
 
         try:
-            self.glm_channel = grpc.insecure_channel(GLM_SERVICE_ADDRESS_CONFIG)
+            self.glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS) # Используем config
             self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
-            logger.info(f"GLM клиент для SWM инициализирован, целевой адрес: {GLM_SERVICE_ADDRESS_CONFIG}")
+            logger.info(f"GLM клиент для SWM инициализирован, целевой адрес: {self.config.GLM_SERVICE_ADDRESS}")
         except Exception as e:
             logger.error(f"Ошибка при инициализации GLM клиента в SWM: {e}")
 
@@ -436,7 +445,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
             return swm_service_pb2.QuerySWMResponse()
 
-        page_size = request.page_size if request.page_size > 0 else DEFAULT_SWM_PAGE_SIZE
+        page_size = request.page_size if request.page_size > 0 else self.config.DEFAULT_PAGE_SIZE # Используем self.config
         offset = 0
         if request.page_token:
             try: offset = int(request.page_token)
@@ -657,10 +666,10 @@ def serve():
     swm_service_pb2_grpc.add_SharedWorkingMemoryServiceServicer_to_server(
         SharedWorkingMemoryServiceImpl(), server
     )
-    server.add_insecure_port(SWM_GRPC_LISTEN_ADDRESS_CONFIG)
-    logger.info(f"Запуск SWM (Shared Working Memory Service) на {SWM_GRPC_LISTEN_ADDRESS_CONFIG}...")
+    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS) # Используем config
+    logger.info(f"Запуск SWM (Shared Working Memory Service) на {config.GRPC_LISTEN_ADDRESS}...")
     server.start()
-    logger.info(f"SWM запущен и ожидает соединений на {SWM_GRPC_LISTEN_ADDRESS_CONFIG}.")
+    logger.info(f"SWM запущен и ожидает соединений на {config.GRPC_LISTEN_ADDRESS}.")
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:

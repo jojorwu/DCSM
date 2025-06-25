@@ -13,22 +13,34 @@ from google.protobuf.json_format import ParseDict # MessageToDict не испо�
 import typing
 import logging # Добавлен модуль логирования
 
+# Импортируем конфигурацию
+from .config import GLMConfig
+
+# --- Начало блока для корректного импорта сгенерированного кода ---
+# app_dir определяется здесь для SQLITE_DB_PATH
+current_script_path = os.path.abspath(__file__)
+app_dir = os.path.dirname(current_script_path) # /app/dcs_memory/services/glm/app
+# --- Конец определения app_dir ---
+
+# Глобальный экземпляр конфигурации
+# Он будет инициализирован один раз при загрузке модуля main.py
+# Pydantic автоматически прочитает переменные окружения (с префиксом GLM_) и .env файлы
+config = GLMConfig()
+
 # --- Настройка логирования ---
+# Используем уровень логирования из конфигурации
 logging.basicConfig(
-    level=logging.INFO,
+    level=config.get_log_level_int(), # Используем метод из BaseServiceConfig
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout) # Вывод логов в stdout
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 # --- Конец настройки логирования ---
 
-# --- Начало блока для корректного импорта сгенерированного кода ---
-current_script_path = os.path.abspath(__file__)
-app_dir = os.path.dirname(current_script_path)
-service_root_dir = os.path.dirname(app_dir)
 
+service_root_dir = os.path.dirname(app_dir) # /app/dcs_memory/services/glm
 if service_root_dir not in sys.path:
     sys.path.insert(0, service_root_dir)
 
@@ -40,25 +52,29 @@ from google.protobuf import empty_pb2
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
-# --- Конфигурация ---
-SQLITE_DB_PATH = os.path.join(app_dir, os.getenv("SQLITE_DB_FILENAME", "glm_metadata.sqlite3"))
-QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "glm_kems_demo_collection")
-DEFAULT_VECTOR_SIZE = int(os.getenv("DEFAULT_VECTOR_SIZE", 25))
-DEFAULT_PAGE_SIZE = int(os.getenv("DEFAULT_PAGE_SIZE", 10))
-GRPC_LISTEN_ADDRESS = os.getenv("GRPC_LISTEN_ADDRESS", "[::]:50051")
-# --- Конец конфигурации ---
+# --- Старые переменные конфигурации удалены, теперь используется объект config ---
+# SQLITE_DB_PATH будет config.DB_FILENAME (но нужно учесть app_dir)
+# QDRANT_HOST будет config.QDRANT_HOST
+# QDRANT_PORT будет config.QDRANT_PORT
+# QDRANT_COLLECTION будет config.QDRANT_COLLECTION
+# DEFAULT_VECTOR_SIZE будет config.DEFAULT_VECTOR_SIZE
+# DEFAULT_PAGE_SIZE будет config.DEFAULT_PAGE_SIZE
+# GRPC_LISTEN_ADDRESS будет config.GRPC_LISTEN_ADDRESS
 
 
 class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemoryServicer):
     def __init__(self):
         logger.info("Инициализация GlobalLongTermMemoryServicerImpl...")
         self.qdrant_client = None
+        self.config = config # Сохраняем ссылку на глобальный config или передаем его
+
+        # Формируем полный путь к БД SQLite
+        self.sqlite_db_path = os.path.join(app_dir, self.config.DB_FILENAME)
+
         try:
-            self.qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=10)
+            self.qdrant_client = QdrantClient(host=self.config.QDRANT_HOST, port=self.config.QDRANT_PORT, timeout=10)
             self.qdrant_client.get_collections()
-            logger.info(f"Qdrant клиент успешно подключен к {QDRANT_HOST}:{QDRANT_PORT}")
+            logger.info(f"Qdrant клиент успешно подключен к {self.config.QDRANT_HOST}:{self.config.QDRANT_PORT}")
             self._ensure_qdrant_collection()
         except Exception as e:
             logger.error(f"КРИТИЧЕСКАЯ ОШИБКА при инициализации Qdrant клиента: {e}. Сервис может работать некорректно.")
@@ -68,10 +84,10 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         logger.info("Сервисер GLM инициализирован.")
 
     def _get_sqlite_conn(self):
-        return sqlite3.connect(SQLITE_DB_PATH, timeout=10)
+        return sqlite3.connect(self.sqlite_db_path, timeout=10) # Используем self.sqlite_db_path
 
     def _init_sqlite(self):
-        logger.info(f"Инициализация SQLite БД по пути: {SQLITE_DB_PATH}")
+        logger.info(f"Инициализация SQLite БД по пути: {self.sqlite_db_path}")
         try:
             with self._get_sqlite_conn() as conn:
                 cursor = conn.cursor()
@@ -98,25 +114,42 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             return
         try:
             try:
-                self.qdrant_client.get_collection(QDRANT_COLLECTION)
-            except Exception: # Более общее исключение для "не найдено" или других проблем Qdrant
-                logger.info(f"Коллекция '{QDRANT_COLLECTION}' не найдена или ошибка доступа. Создание новой коллекции...")
-                self.qdrant_client.recreate_collection(
-                    collection_name=QDRANT_COLLECTION,
-                    vectors_config=models.VectorParams(size=DEFAULT_VECTOR_SIZE, distance=models.Distance.COSINE)
-                )
-                logger.info(f"Коллекция '{QDRANT_COLLECTION}' успешно создана.")
-            else:
-                 collection_info = self.qdrant_client.get_collection(QDRANT_COLLECTION)
-                 logger.info(f"Коллекция '{QDRANT_COLLECTION}' уже существует.")
-                 current_vector_size = collection_info.config.params.vectors.size
-                 current_distance = collection_info.config.params.vectors.distance
-                 if current_vector_size != DEFAULT_VECTOR_SIZE or current_distance != models.Distance.COSINE:
-                      logger.warning(f"Конфигурация существующей коллекции '{QDRANT_COLLECTION}' не совпадает с ожидаемой.")
-                 else:
-                     logger.info(f"Конфигурация коллекции '{QDRANT_COLLECTION}' соответствует.")
-        except Exception as e:
-            logger.error(f"Ошибка при проверке/создании коллекции Qdrant '{QDRANT_COLLECTION}': {e}")
+                collection_info = self.qdrant_client.get_collection(self.config.QDRANT_COLLECTION)
+                logger.info(f"Коллекция '{self.config.QDRANT_COLLECTION}' уже существует.")
+                # Проверяем существующую конфигурацию, если коллекция есть
+                if hasattr(collection_info.config.params.vectors, 'size'): # Для стандартных векторов
+                    current_vector_size = collection_info.config.params.vectors.size
+                    current_distance = collection_info.config.params.vectors.distance
+                elif isinstance(collection_info.config.params.vectors, dict): # Для именованных векторов
+                    # Предполагаем, что есть вектор по умолчанию или единственный вектор
+                    # Это потребует более сложной логики, если имен много.
+                    # Пока что, если это dict, ищем ключ 'size' и 'distance' или пропускаем проверку.
+                    # Для простоты, если это dict, предполагаем, что конфигурация проверяется вручную.
+                    logger.info("Проверка конфигурации для именованных векторов пока не реализована детально.")
+                    current_vector_size = self.config.DEFAULT_VECTOR_SIZE # Предполагаем совпадение
+                    current_distance = models.Distance.COSINE        # Предполагаем совпадение
+                else: # Неизвестный формат конфигурации векторов
+                     logger.warning(f"Не удалось определить конфигурацию векторов для коллекции '{self.config.QDRANT_COLLECTION}'. Пропуск проверки.")
+                     current_vector_size = self.config.DEFAULT_VECTOR_SIZE
+                     current_distance = models.Distance.COSINE
+
+                if current_vector_size != self.config.DEFAULT_VECTOR_SIZE or current_distance != models.Distance.COSINE:
+                     logger.warning(f"Конфигурация существующей коллекции '{self.config.QDRANT_COLLECTION}' не совпадает с ожидаемой (размер: {current_vector_size} vs {self.config.DEFAULT_VECTOR_SIZE}, дистанция: {current_distance}).")
+                else:
+                    logger.info(f"Конфигурация коллекции '{self.config.QDRANT_COLLECTION}' соответствует.")
+            except Exception as e_get_collection: # Явно ловим ошибку получения коллекции (например, если ее нет)
+                if "not found" in str(e_get_collection).lower() or (hasattr(e_get_collection, 'status_code') and e_get_collection.status_code == 404):
+                    logger.info(f"Коллекция '{self.config.QDRANT_COLLECTION}' не найдена. Создание новой коллекции...")
+                    self.qdrant_client.recreate_collection(
+                        collection_name=self.config.QDRANT_COLLECTION,
+                        vectors_config=models.VectorParams(size=self.config.DEFAULT_VECTOR_SIZE, distance=models.Distance.COSINE)
+                    )
+                    logger.info(f"Коллекция '{self.config.QDRANT_COLLECTION}' успешно создана.")
+                else:
+                    # Другая ошибка при get_collection
+                    logger.error(f"Ошибка при получении информации о коллекции Qdrant '{self.config.QDRANT_COLLECTION}': {e_get_collection}")
+        except Exception as e: # Общая ошибка на случай проблем с recreate_collection и т.д.
+            logger.error(f"Ошибка при проверке/создании коллекции Qdrant '{self.config.QDRANT_COLLECTION}': {e}")
 
     def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
         # ... (остается без изменений) ...
@@ -189,13 +222,13 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             logger.error(msg, exc_info=True)
             context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
         if self.qdrant_client and kem.embeddings:
-            if len(kem.embeddings) != DEFAULT_VECTOR_SIZE:
-                msg = "Размерность эмбеддингов ({}) не совпадает с конфигурацией ({}).".format(len(kem.embeddings), DEFAULT_VECTOR_SIZE)
+            if len(kem.embeddings) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
+                msg = "Размерность эмбеддингов ({}) не совпадает с конфигурацией ({}).".format(len(kem.embeddings), self.config.DEFAULT_VECTOR_SIZE)
                 logger.error(msg)
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg); return glm_service_pb2.StoreKEMResponse()
             try:
                 self.qdrant_client.upsert(
-                    collection_name=QDRANT_COLLECTION,
+                    collection_name=self.config.QDRANT_COLLECTION, # Используем self.config
                     points=[PointStruct(id=kem_id, vector=list(kem.embeddings), payload={"kem_id_ref": kem_id})]
                 )
                 logger.info("Эмбеддинги для КЕП ID '{}' сохранены/обновлены в Qdrant.".format(kem_id))
@@ -207,9 +240,8 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         return glm_service_pb2.StoreKEMResponse(kem=kem)
 
     def RetrieveKEMs(self, request, context):
-        # ... (остается без изменений) ...
         query = request.query
-        page_size = request.page_size if request.page_size > 0 else DEFAULT_PAGE_SIZE
+        page_size = request.page_size if request.page_size > 0 else self.config.DEFAULT_PAGE_SIZE # Используем self.config
         offset = 0
         if request.page_token:
             try: offset = int(request.page_token)
@@ -221,11 +253,11 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         if query.embedding_query:
             if not self.qdrant_client:
                 context.abort(grpc.StatusCode.INTERNAL, "Qdrant сервис недоступен."); return glm_service_pb2.RetrieveKEMsResponse()
-            if len(query.embedding_query) != DEFAULT_VECTOR_SIZE:
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Неверная размерность вектора: {len(query.embedding_query)}"); return glm_service_pb2.RetrieveKEMsResponse()
+            if len(query.embedding_query) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Неверная размерность вектора: {len(query.embedding_query)}, ожидалось {self.config.DEFAULT_VECTOR_SIZE}"); return glm_service_pb2.RetrieveKEMsResponse()
             try:
                 qdrant_filter_obj = None # TODO: Implement Qdrant filter
-                search_result = self.qdrant_client.search(collection_name=QDRANT_COLLECTION, query_vector=list(query.embedding_query), query_filter=qdrant_filter_obj, limit=page_size, offset=offset, with_vectors=True)
+                search_result = self.qdrant_client.search(collection_name=self.config.QDRANT_COLLECTION, query_vector=list(query.embedding_query), query_filter=qdrant_filter_obj, limit=page_size, offset=offset, with_vectors=True) # Используем self.config
                 qdrant_ids_to_filter = [hit.id for hit in search_result]
                 for hit in search_result: embeddings_from_qdrant[hit.id] = list(hit.vector) if hit.vector else []
                 if not qdrant_ids_to_filter: return glm_service_pb2.RetrieveKEMsResponse(kems=[], next_page_token="")
@@ -263,7 +295,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     ids_from_sqlite = [row['id'] for row in rows]
                     if ids_from_sqlite and self.qdrant_client:
                         try:
-                            q_points = self.qdrant_client.retrieve(QDRANT_COLLECTION, ids=ids_from_sqlite, with_vectors=True)
+                            q_points = self.qdrant_client.retrieve(self.config.QDRANT_COLLECTION, ids=ids_from_sqlite, with_vectors=True) # Используем self.config
                             for p in q_points:
                                 if p.vector: embeddings_from_qdrant[p.id] = list(p.vector)
                         except Exception as e_qd_retrieve: logger.warning(f"Не удалось получить эмбеддинги: {e_qd_retrieve}")
@@ -300,11 +332,11 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 conn.commit()
                 final_embeddings = list(kem_data_update.embeddings)
                 if self.qdrant_client and final_embeddings:
-                    if len(final_embeddings) != DEFAULT_VECTOR_SIZE:
-                        context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Неверная размерность эмбеддингов"); return kem_pb2.KEM()
-                    self.qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=[PointStruct(id=kem_id, vector=final_embeddings)])
+                    if len(final_embeddings) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
+                        context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Неверная размерность эмбеддингов: {len(final_embeddings)}, ожидалось {self.config.DEFAULT_VECTOR_SIZE}"); return kem_pb2.KEM()
+                    self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION, points=[PointStruct(id=kem_id, vector=final_embeddings)]) # Используем self.config
                 elif not final_embeddings and self.qdrant_client:
-                    points_resp = self.qdrant_client.get_points(QDRANT_COLLECTION, ids=[kem_id], with_vectors=True)
+                    points_resp = self.qdrant_client.get_points(self.config.QDRANT_COLLECTION, ids=[kem_id], with_vectors=True) # Используем self.config
                     if points_resp.points and points_resp.points[0].vector: final_embeddings = list(points_resp.points[0].vector)
                 current_kem_dict['created_at'] = original_created_at_iso
                 current_kem_dict['embeddings'] = final_embeddings
@@ -325,7 +357,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 if cursor.rowcount == 0: logger.warning(f"КЕП ID '{kem_id}' не найдена в SQLite для удаления.")
                 else: logger.info(f"КЕП ID '{kem_id}' удалена из SQLite.")
             if self.qdrant_client:
-                try: self.qdrant_client.delete_points(QDRANT_COLLECTION, points_selector=models.PointIdsList(points=[kem_id]))
+                try: self.qdrant_client.delete_points(self.config.QDRANT_COLLECTION, points_selector=models.PointIdsList(points=[kem_id])) # Используем self.config
                 except Exception as e_qd_del: logger.warning(f"Ошибка при удалении из Qdrant ID '{kem_id}': {e_qd_del}")
             return empty_pb2.Empty()
         except Exception as e:
@@ -388,13 +420,13 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 if not self.qdrant_client:
                     logger.error(f"BatchStoreKEMs: Qdrant клиент не доступен, не удается сохранить эмбеддинги для КЕП ID '{kem_id}'.")
                     qdrant_persisted_this_kem = False
-                elif len(current_kem_processed.embeddings) != DEFAULT_VECTOR_SIZE:
-                    logger.error(f"BatchStoreKEMs: Неверная размерность эмбеддингов ({len(current_kem_processed.embeddings)}) для КЕП ID '{kem_id}'. Ожидалось {DEFAULT_VECTOR_SIZE}.")
+                elif len(current_kem_processed.embeddings) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
+                    logger.error(f"BatchStoreKEMs: Неверная размерность эмбеддингов ({len(current_kem_processed.embeddings)}) для КЕП ID '{kem_id}'. Ожидалось {self.config.DEFAULT_VECTOR_SIZE}.")
                     qdrant_persisted_this_kem = False
                 else:
                     try:
                         self.qdrant_client.upsert(
-                            collection_name=QDRANT_COLLECTION,
+                            collection_name=self.config.QDRANT_COLLECTION, # Используем self.config
                             points=[PointStruct(id=kem_id, vector=list(current_kem_processed.embeddings), payload={"kem_id_ref": kem_id})]
                         )
                     except Exception as e_qdrant:
@@ -434,11 +466,12 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         return response
 
 def serve():
-    logger.info(f"Конфигурация GLM: Qdrant={QDRANT_HOST}:{QDRANT_PORT} ({QDRANT_COLLECTION}), SQLite={SQLITE_DB_PATH}, gRPC Адрес={GRPC_LISTEN_ADDRESS}")
+    # Используем глобальный объект config
+    logger.info(f"Конфигурация GLM: Qdrant={config.QDRANT_HOST}:{config.QDRANT_PORT} ({config.QDRANT_COLLECTION}), SQLite={os.path.join(app_dir, config.DB_FILENAME)}, gRPC Адрес={config.GRPC_LISTEN_ADDRESS}, LogLevel={config.LOG_LEVEL}")
     try:
-        client_test = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=2)
+        client_test = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT, timeout=2)
         client_test.get_collections()
-        logger.info(f"Qdrant доступен на {QDRANT_HOST}:{QDRANT_PORT}.")
+        logger.info(f"Qdrant доступен на {config.QDRANT_HOST}:{config.QDRANT_PORT}.")
     except Exception as e:
         logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: Qdrant недоступен. {e}. Сервер НЕ ЗАПУЩЕН.")
         return
@@ -451,8 +484,8 @@ def serve():
         return
 
     glm_service_pb2_grpc.add_GlobalLongTermMemoryServicer_to_server(servicer_instance, server)
-    server.add_insecure_port(GRPC_LISTEN_ADDRESS)
-    logger.info(f"Запуск GLM сервера на {GRPC_LISTEN_ADDRESS}...")
+    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS) # Используем config
+    logger.info(f"Запуск GLM сервера на {config.GRPC_LISTEN_ADDRESS}...")
     server.start(); logger.info(f"GLM сервер запущен."); server.wait_for_termination()
     logger.info("GLM сервер остановлен.")
 
