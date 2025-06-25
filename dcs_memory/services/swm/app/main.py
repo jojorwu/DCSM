@@ -7,6 +7,7 @@ import uuid
 import logging
 import threading
 import queue # Для очередей событий подписчиков
+from dataclasses import dataclass, field # Для SubscriberInfo
 from cachetools import LRUCache, Cache
 from google.protobuf.timestamp_pb2 import Timestamp
 import typing # Добавлено для typing.Optional и typing.List
@@ -34,17 +35,40 @@ from generated_grpc import glm_service_pb2 # Нужен для KEMQuery
 from generated_grpc import glm_service_pb2_grpc # Нужен для GLM клиента
 from generated_grpc import swm_service_pb2
 from generated_grpc import swm_service_pb2_grpc
+# generated_grpc/__init__.py должен теперь сам обрабатывать свои внутренние пути
+from generated_grpc import kem_pb2
+from generated_grpc import glm_service_pb2 # Нужен для KEMQuery
+from generated_grpc import glm_service_pb2_grpc # Нужен для GLM клиента
+from generated_grpc import swm_service_pb2
+from generated_grpc import swm_service_pb2_grpc
+# Импортируем retry декоратор
+from dcs_memory.common.grpc_utils import retry_grpc_call # <--- Новый импорт
 # --- Конец блока для корректного импорта ---
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
 # --- Конфигурация ---
 GLM_SERVICE_ADDRESS_CONFIG = os.getenv("GLM_SERVICE_ADDRESS", "localhost:50051")
+# Параметры Retry для GLM клиента внутри SWM
+SWM_GLM_RETRY_MAX_ATTEMPTS = int(os.getenv("SWM_GLM_RETRY_MAX_ATTEMPTS", 3))
+SWM_GLM_RETRY_INITIAL_DELAY_S = float(os.getenv("SWM_GLM_RETRY_INITIAL_DELAY_S", 1.0))
+SWM_GLM_RETRY_BACKOFF_FACTOR = float(os.getenv("SWM_GLM_RETRY_BACKOFF_FACTOR", 2.0))
+
+SWM_GRPC_LISTEN_ADDRESS_CONFIG = os.getenv("SWM_GRPC_LISTEN_ADDRESS", "[::]:50053")
 SWM_GRPC_LISTEN_ADDRESS_CONFIG = os.getenv("SWM_GRPC_LISTEN_ADDRESS", "[::]:50053")
 SWM_INTERNAL_CACHE_MAX_SIZE = int(os.getenv("SWM_CACHE_MAX_SIZE", 200))
 DEFAULT_SWM_PAGE_SIZE = int(os.getenv("DEFAULT_SWM_PAGE_SIZE", 20)) # Отдельный дефолт для SWM
 SWM_INDEXED_METADATA_KEYS_CONFIG = [key.strip() for key in os.getenv("SWM_INDEXED_METADATA_KEYS", "").split(',') if key.strip()]
 # --- Конец конфигурации ---
+
+@dataclass
+class SubscriberInfo:
+    event_queue: queue.Queue
+    # Список фильтров для этого подписчика. Каждый фильтр - это SubscriptionTopic.
+    # Если список пуст, подписчик получает все события.
+    # Если список не пуст, событие должно соответствовать хотя бы одному фильтру.
+    topics: typing.List[swm_service_pb2.SubscriptionTopic] = field(default_factory=list)
+
 
 # Класс IndexedLRUCache должен быть определен до его использования
 class IndexedLRUCache(Cache): # Наследуемся от Cache для type hinting, но реализуем свой интерфейс поверх LRUCache
@@ -166,9 +190,13 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         self.glm_channel = None
         self.glm_stub = None
 
+        # Параметры Retry для вызовов к GLM
+        self.retry_max_attempts = SWM_GLM_RETRY_MAX_ATTEMPTS
+        self.retry_initial_delay_s = SWM_GLM_RETRY_INITIAL_DELAY_S
+        self.retry_backoff_factor = SWM_GLM_RETRY_BACKOFF_FACTOR
+
         # Pub/Sub атрибуты
-        # Ключ - subscriber_id, Значение - queue.Queue для этого подписчика
-        self.subscribers: typing.Dict[str, queue.Queue] = {}
+        self.subscribers: typing.Dict[str, SubscriberInfo] = {}
         self.subscribers_lock = threading.Lock()
 
         # Используем новый IndexedLRUCache с колбэком на вытеснение
@@ -184,6 +212,24 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             logger.info(f"GLM клиент для SWM инициализирован, целевой адрес: {GLM_SERVICE_ADDRESS_CONFIG}")
         except Exception as e:
             logger.error(f"Ошибка при инициализации GLM клиента в SWM: {e}")
+
+    @retry_grpc_call
+    def _glm_retrieve_kems_with_retry(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int = 20) -> glm_service_pb2.RetrieveKEMsResponse:
+        if not self.glm_stub:
+            # Эта ситуация должна быть обработана до вызова, но на всякий случай
+            logger.error("SWM._glm_retrieve_kems_with_retry: GLM stub не инициализирован.")
+            # Поднимаем RpcError, чтобы retry-декоратор мог его поймать, если это временная проблема инициализации.
+            # Или возвращаем пустой ответ / специфическую ошибку.
+            # Для простоты, если stub None, это фатальная ошибка конфигурации SWM.
+            raise grpc.RpcError("GLM stub not available in SWM") # Или SystemError
+        return self.glm_stub.RetrieveKEMs(request, timeout=timeout)
+
+    @retry_grpc_call
+    def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
+        if not self.glm_stub:
+            logger.error("SWM._glm_store_kem_with_retry: GLM stub не инициализирован.")
+            raise grpc.RpcError("GLM stub not available in SWM")
+        return self.glm_stub.StoreKEM(request, timeout=timeout)
 
     def _handle_kem_eviction(self, evicted_kem: kem_pb2.KEM):
         """Колбэк, вызываемый IndexedLRUCache при вытеснении элемента."""
@@ -254,27 +300,75 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             details=f"Event {swm_service_pb2.SWMMemoryEvent.EventType.Name(event_type)} for KEM ID {kem.id}"
         )
 
-        subscribers_to_notify: typing.List[queue.Queue] = []
+        # Этот метод теперь будет класть события в очереди подписчиков
+        # с учетом фильтров
+        if not kem or not kem.id:
+            logger.warning("_notify_subscribers вызван с невалидной КЕП.")
+            return
+
+        logger.info(f"Формирование события {swm_service_pb2.SWMMemoryEvent.EventType.Name(event_type)} для КЕП ID '{kem.id}'")
+
+        event_time_proto = Timestamp(); event_time_proto.GetCurrentTime()
+        event_to_dispatch = swm_service_pb2.SWMMemoryEvent(
+            event_id=str(uuid.uuid4()),
+            event_type=event_type,
+            kem_payload=kem,
+            event_time=event_time_proto,
+            source_agent_id=source_agent_id,
+            details=f"Event {swm_service_pb2.SWMMemoryEvent.EventType.Name(event_type)} for KEM ID {kem.id}"
+        )
+
+        subscribers_copy: typing.Dict[str, SubscriberInfo] = {}
         with self.subscribers_lock:
             if not self.subscribers:
-                return # Нет активных подписчиков
-            # Собираем очереди тех, кого нужно уведомить (пока всех)
-            subscribers_to_notify = list(self.subscribers.values())
+                return
+            subscribers_copy = dict(self.subscribers) # Копируем для безопасной итерации
 
-        if not subscribers_to_notify:
+        if not subscribers_copy:
             logger.debug("Нет подписчиков для уведомления.")
             return
 
-        logger.debug(f"Рассылка события {event.event_id} для {len(subscribers_to_notify)} подписчиков.")
-        for q in subscribers_to_notify:
-            try:
-                q.put_nowait(event) # Используем nowait, чтобы не блокировать этот поток.
-                                    # Если очередь подписчика переполнена (если она ограничена), это вызовет queue.Full.
-                                    # Это означает, что подписчик не успевает обрабатывать события.
-            except queue.Full:
-                logger.warning(f"Очередь подписчика переполнена для события {event.event_id}. Событие может быть потеряно для этого подписчика.")
-            except Exception as e: # Общая защита
-                logger.error(f"Неожиданная ошибка при добавлении события в очередь подписчика: {e}", exc_info=True)
+        logger.debug(f"Проверка и рассылка события {event_to_dispatch.event_id} для {len(subscribers_copy)} подписчиков.")
+
+        for sub_id, sub_info in subscribers_copy.items():
+            should_send = False
+            if not sub_info.topics: # Если нет фильтров, отправляем всегда
+                should_send = True
+            else:
+                for topic in sub_info.topics:
+                    # Простая фильтрация: "key=value" или "id=value" (для kem_payload.id)
+                    # TopicType пока не используется для фильтрации здесь, только filter_criteria
+                    criteria = topic.filter_criteria.strip()
+                    if not criteria: # Пустой критерий в топике - тоже отправляем
+                        should_send = True; break
+
+                    if '=' not in criteria:
+                        logger.warning(f"Неверный формат filter_criteria '{criteria}' для подписчика {sub_id}. Пропуск фильтра.")
+                        should_send = True; break # Или не отправлять? Пока отправляем, если фильтр не понят.
+
+                    filter_key, filter_value = criteria.split("=", 1)
+                    filter_key = filter_key.strip()
+                    filter_value = filter_value.strip()
+
+                    if filter_key == "kem_id":
+                        if event_to_dispatch.kem_payload.id == filter_value:
+                            should_send = True; break
+                    elif filter_key.startswith("metadata."):
+                        meta_actual_key = filter_key.split("metadata.", 1)[1]
+                        if meta_actual_key in event_to_dispatch.kem_payload.metadata and \
+                           event_to_dispatch.kem_payload.metadata[meta_actual_key] == filter_value:
+                            should_send = True; break
+                    else: # Неизвестный ключ фильтрации - пока считаем, что это повод отправить
+                        logger.warning(f"Неизвестный ключ фильтрации '{filter_key}' для подписчика {sub_id}. Событие будет отправлено.")
+                        should_send = True; break
+
+            if should_send:
+                try:
+                    sub_info.event_queue.put_nowait(event_to_dispatch)
+                except queue.Full:
+                    logger.warning(f"Очередь подписчика {sub_id} переполнена для события {event_to_dispatch.event_id}. Событие потеряно.")
+                except Exception as e:
+                    logger.error(f"Неожиданная ошибка при добавлении события в очередь подписчика {sub_id}: {e}", exc_info=True)
 
     # --- Реализация RPC методов ---
 
@@ -299,8 +393,9 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         kems_from_glm_for_stats = 0
 
         try:
-            logger.info("SWM: Запрос к GLM.RetrieveKEMs: {}".format(glm_retrieve_request))
-            glm_response = self.glm_stub.RetrieveKEMs(glm_retrieve_request, timeout=20)
+            logger.info("SWM: Запрос к GLM.RetrieveKEMs (с retry): {}".format(glm_retrieve_request))
+            # Используем новый метод с retry
+            glm_response = self._glm_retrieve_kems_with_retry(glm_retrieve_request, timeout=20)
 
             if glm_response and glm_response.kems:
                 kems_from_glm_for_stats = len(glm_response.kems)
@@ -484,10 +579,11 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                 logger.error(msg_glm); status_msg += " " + msg_glm
             else:
                 try:
-                    logger.info("SWM: Инициирование сохранения КЕП ID '{}' в GLM...".format(kem_id_final))
+                    logger.info("SWM: Инициирование сохранения КЕП ID '{}' в GLM (с retry)...".format(kem_id_final))
                     # Передаем КЕП как есть, GLM разберется с created_at/updated_at при сохранении
                     glm_store_req = glm_service_pb2.StoreKEMRequest(kem=kem_to_publish)
-                    glm_store_resp = self.glm_stub.StoreKEM(glm_store_req, timeout=10)
+                    # Используем новый метод с retry
+                    glm_store_resp = self._glm_store_kem_with_retry(glm_store_req, timeout=10)
                     if glm_store_resp and glm_store_resp.kem and glm_store_resp.kem.id:
                         # Обновляем КЕП в SWM на ту, что вернул GLM, для консистентности ID и временных меток GLM
                         self._put_kem_to_cache(glm_store_resp.kem)
@@ -510,55 +606,46 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         agent_id = request.agent_id
         logger.info(f"SWM: Новый подписчик {agent_id} на темы: {request.topics}")
 
-        # TODO: Реализовать полноценную систему подписки с фильтрацией по topics
-        # и очередями для каждого подписчика.
-
         subscriber_id = agent_id if agent_id else str(uuid.uuid4())
-        event_queue = queue.Queue(maxsize=100) # Ограничим размер очереди, чтобы избежать утечек памяти
+        # Очередь для событий этого подписчика
+        event_q = queue.Queue(maxsize=100) # Ограничиваем размер очереди
+
+        # Сохраняем информацию о подписчике, включая его фильтры (topics)
+        subscriber_info = SubscriberInfo(event_queue=event_q, topics=list(request.topics))
 
         with self.subscribers_lock:
             if subscriber_id in self.subscribers:
-                # Можно либо отклонять, либо разрешать несколько подписок от одного agent_id,
-                # но тогда subscriber_id должен быть уникальным для каждой подписки.
-                # Пока что, если agent_id уже есть, будем считать это ошибкой или переподпиской.
-                # Для простоты, новый подписчик с тем же ID заменит старого.
-                logger.warning(f"Подписчик с ID '{subscriber_id}' уже существует. Старая подписка будет заменена.")
-            self.subscribers[subscriber_id] = event_queue
-            logger.info(f"SWM: Новый подписчик '{subscriber_id}' зарегистрирован. Всего подписчиков: {len(self.subscribers)}")
+                logger.warning(f"Подписчик с ID '{subscriber_id}' уже существует. Старая подписка будет заменена новой.")
+            self.subscribers[subscriber_id] = subscriber_info
+            logger.info(f"SWM: Новый подписчик '{subscriber_id}' зарегистрирован с {len(subscriber_info.topics)} топиками/фильтрами. Всего подписчиков: {len(self.subscribers)}")
 
         try:
-            # Можно отправить начальное "подтверждение подписки" событие
-            # welcome_event = swm_service_pb2.SWMMemoryEvent(...)
-            # yield welcome_event
-
             while context.is_active():
                 try:
-                    event_to_send = event_queue.get(timeout=1.0) # Таймаут, чтобы периодически проверять context.is_active()
+                    event_to_send = event_q.get(timeout=1.0) # Таймаут для проверки context.is_active()
                     yield event_to_send
-                    # event_queue.task_done() # Если бы это была JoinableQueue
                 except queue.Empty:
-                    # Таймаут, просто продолжаем цикл, чтобы проверить context.is_active()
                     continue
-                except grpc.RpcError as rpc_error: # Например, если клиент отсоединился
+                except grpc.RpcError as rpc_error:
                     logger.info(f"SWM: RPC ошибка для подписчика '{subscriber_id}': {rpc_error.code()} - {rpc_error.details()}. Завершение стрима.")
                     break
-                except Exception as e: # Другие неожиданные ошибки
+                except Exception as e:
                     logger.error(f"SWM: Ошибка в стриме для подписчика '{subscriber_id}': {e}", exc_info=True)
-                    context.abort(grpc.StatusCode.INTERNAL, f"Ошибка стрима событий: {e}")
-                    break
+                    # Не прерываем стрим для других ошибок, если это не ошибка gRPC, но логируем
+                    # Если ошибка критическая, можно вызвать context.abort()
+                    # context.abort(grpc.StatusCode.INTERNAL, f"Ошибка стрима событий: {e}")
+                    break # Пока что прерываем при любой ошибке в цикле отправки
         finally:
             with self.subscribers_lock:
-                removed_q = self.subscribers.pop(subscriber_id, None)
-                if removed_q:
+                removed_info = self.subscribers.pop(subscriber_id, None)
+                if removed_info:
                     logger.info(f"SWM: Подписчик '{subscriber_id}' удален. Осталось подписчиков: {len(self.subscribers)}")
+                    # Очищаем его очередь
+                    while not removed_info.event_queue.empty():
+                        try: removed_info.event_queue.get_nowait()
+                        except queue.Empty: break
                 else:
                     logger.warning(f"SWM: Попытка удалить несуществующего подписчика '{subscriber_id}'.")
-            # Очистить очередь, если она не пуста, чтобы освободить ресурсы (если события сложные)
-            if removed_q:
-                while not removed_q.empty():
-                    try: removed_q.get_nowait()
-                    except queue.Empty: break
-
 
     def __del__(self):
         if self.glm_channel:

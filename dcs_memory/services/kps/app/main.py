@@ -35,12 +35,21 @@ from generated_grpc import glm_service_pb2 # For GLM client
 from generated_grpc import glm_service_pb2_grpc # For GLM client
 from generated_grpc import kps_service_pb2 # For KPS server
 from generated_grpc import kps_service_pb2_grpc # For KPS server
+from generated_grpc import kps_service_pb2 # For KPS server
+from generated_grpc import kps_service_pb2_grpc # For KPS server
+# Импортируем retry декоратор
+from dcs_memory.common.grpc_utils import retry_grpc_call # <--- Новый импорт
 # --- Конец блока для корректного импорта ---
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
 # --- Конфигурация ---
 GLM_SERVICE_ADDRESS_CONFIG = os.getenv("GLM_SERVICE_ADDRESS", "localhost:50051")
+# Параметры Retry для GLM клиента внутри KPS
+KPS_GLM_RETRY_MAX_ATTEMPTS = int(os.getenv("KPS_GLM_RETRY_MAX_ATTEMPTS", 3))
+KPS_GLM_RETRY_INITIAL_DELAY_S = float(os.getenv("KPS_GLM_RETRY_INITIAL_DELAY_S", 1.0))
+KPS_GLM_RETRY_BACKOFF_FACTOR = float(os.getenv("KPS_GLM_RETRY_BACKOFF_FACTOR", 2.0))
+
 KPS_GRPC_LISTEN_ADDRESS_CONFIG = os.getenv("KPS_GRPC_LISTEN_ADDRESS", "[::]:50052")
 SENTENCE_TRANSFORMER_MODEL_CONFIG = os.getenv("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2")
 KPS_DEFAULT_VECTOR_SIZE = int(os.getenv("DEFAULT_VECTOR_SIZE", 384))
@@ -52,6 +61,11 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
         self.glm_channel = None
         self.glm_stub = None
         self.embedding_model = None
+
+        # Параметры Retry для вызовов к GLM
+        self.retry_max_attempts = KPS_GLM_RETRY_MAX_ATTEMPTS
+        self.retry_initial_delay_s = KPS_GLM_RETRY_INITIAL_DELAY_S
+        self.retry_backoff_factor = KPS_GLM_RETRY_BACKOFF_FACTOR
 
         try:
             logger.info(f"Загрузка модели sentence-transformer: {SENTENCE_TRANSFORMER_MODEL_CONFIG}...")
@@ -78,6 +92,14 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             logger.info(f"GLM клиент для KPS инициализирован, целевой адрес: {GLM_SERVICE_ADDRESS_CONFIG}")
         except Exception as e:
             logger.error(f"Ошибка при инициализации GLM клиента в KPS: {e}")
+
+    @retry_grpc_call
+    def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
+        if not self.glm_stub:
+            logger.error("KPS._glm_store_kem_with_retry: GLM stub не инициализирован.")
+            # Это должно быть обработано как фатальная ошибка конфигурации
+            raise grpc.RpcError("GLM stub not available in KPS")
+        return self.glm_stub.StoreKEM(request, timeout=timeout)
 
     def ProcessRawData(self, request: kps_service_pb2.ProcessRawDataRequest, context):
         logger.info("KPS: ProcessRawData вызван для data_id='{}', content_type='{}'".format(request.data_id, request.content_type))
@@ -134,11 +156,12 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             if request.data_id:
                 kem_to_store.metadata["source_data_id"] = request.data_id
 
-            logger.info("KPS: Вызов GLM.StoreKEM...")
+            logger.info("KPS: Вызов GLM.StoreKEM (с retry)...")
             store_kem_request = glm_service_pb2.StoreKEMRequest(kem=kem_to_store)
 
             try:
-                store_kem_response = self.glm_stub.StoreKEM(store_kem_request, timeout=10)
+                # Используем новый метод с retry
+                store_kem_response = self._glm_store_kem_with_retry(store_kem_request, timeout=10)
                 if store_kem_response and store_kem_response.kem and store_kem_response.kem.id:
                     kem_id_from_glm = store_kem_response.kem.id
                     logger.info("KPS: КЕП успешно сохранена в GLM с ID: {}".format(kem_id_from_glm))

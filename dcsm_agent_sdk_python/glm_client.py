@@ -11,14 +11,37 @@ from .generated_grpc_code import glm_service_pb2
 from .generated_grpc_code import glm_service_pb2_grpc
 from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf import empty_pb2 # Для DeleteKEM
+import time # Для задержек в retry
+import random # Для джиттера в retry
+from functools import wraps # Для создания декоратора
+
+from google.protobuf.json_format import MessageToDict, ParseDict
+from google.protobuf import empty_pb2 # Для DeleteKEM
+# Импорты для retry-декоратора теперь из общего модуля
+# import time
+# import random
+# from functools import wraps
+from dcs_memory.common.grpc_utils import retry_grpc_call # <--- Новый импорт
+
+# Коды ошибок и JITTER_FRACTION теперь в grpc_utils.py
+
+# Нужно добавить logger для GLMClient
+import logging
+logger = logging.getLogger(__name__)
+
 
 class GLMClient:
-    def __init__(self, server_address='localhost:50051'):
+    def __init__(self, server_address='localhost:50051',
+                 retry_max_attempts=3,
+                 retry_initial_delay_s=1.0,
+                 retry_backoff_factor=2.0):
         self.server_address = server_address
         self.channel = None
         self.stub = None
-        # Отложенное создание канала и заглушки до первого вызова или явного connect()
-        # self.connect() # Можно вызвать здесь или сделать отдельный метод connect()
+        self.retry_max_attempts = retry_max_attempts
+        self.retry_initial_delay_s = retry_initial_delay_s
+        self.retry_backoff_factor = retry_backoff_factor
+        # self.connect()
 
     def connect(self):
         if not self.channel:
@@ -65,80 +88,50 @@ class GLMClient:
         # Например: "2023-10-27T10:30:00Z". Это удобно для преобразования в datetime объекты.
         return kem_dict
 
+    @retry_grpc_call # Используем новое имя декоратора
     def batch_store_kems(self, kems_data: list[dict]) -> tuple[list[dict] | None, list[str] | None, str | None]:
         """Сохраняет пакет КЕП и возвращает список успешно сохраненных КЕП (как dict) и ошибки."""
         self._ensure_connected()
-        try:
-            proto_kems = [self._kem_dict_to_proto(data) for data in kems_data]
-            # Используем новые имена сообщений из glm_service.proto
-            request = glm_service_pb2.BatchStoreKEMsRequest(kems=proto_kems)
-            response = self.stub.BatchStoreKEMs(request, timeout=20) # Увеличенный таймаут для пакетной операции
+        proto_kems = [self._kem_dict_to_proto(data) for data in kems_data]
+        request = glm_service_pb2.BatchStoreKEMsRequest(kems=proto_kems)
+        response = self.stub.BatchStoreKEMs(request, timeout=20)
+        successfully_stored_kems_as_dicts = [self._kem_proto_to_dict(k) for k in response.successfully_stored_kems]
+        return successfully_stored_kems_as_dicts, list(response.failed_kem_references), response.overall_error_message
 
-            successfully_stored_kems_as_dicts = [self._kem_proto_to_dict(k) for k in response.successfully_stored_kems]
-
-            return successfully_stored_kems_as_dicts, list(response.failed_kem_references), response.overall_error_message
-        except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове BatchStoreKEMs: {e.code()} - {e.details()}")
-            return None, None, str(e.details())
-        except Exception as e:
-            print(f"Ошибка при подготовке запроса BatchStoreKEMs: {e}")
-            import traceback
-            traceback.print_exc()
-            return None, None, str(e)
-
+    @retry_grpc_call
     def retrieve_kems(self, text_query: str = None, embedding_query: list[float] = None,
-                      metadata_filters: dict = None, ids_filter: list[str] = None, # Добавлен ids_filter
-                      page_size: int = 10, page_token: str = None) -> tuple[list[dict] | None, str | None]: # Возвращает также next_page_token
+                      metadata_filters: dict = None, ids_filter: list[str] = None,
+                      page_size: int = 10, page_token: str = None) -> tuple[list[dict] | None, str | None]:
         self._ensure_connected()
-        try:
-            query_proto = glm_service_pb2.KEMQuery()
-            if text_query:
-                query_proto.text_query = text_query
-            if embedding_query:
-                query_proto.embedding_query.extend(embedding_query)
-            if metadata_filters:
-                for key, value in metadata_filters.items():
-                    query_proto.metadata_filters[key] = str(value)
-            if ids_filter: # Используем поле ids из KEMQuery
-                query_proto.ids.extend(ids_filter)
+        query_proto = glm_service_pb2.KEMQuery()
+        if text_query:
+            query_proto.text_query = text_query
+        if embedding_query:
+            query_proto.embedding_query.extend(embedding_query)
+        if metadata_filters:
+            for key, value in metadata_filters.items():
+                query_proto.metadata_filters[key] = str(value)
+        if ids_filter:
+            query_proto.ids.extend(ids_filter)
+        request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, page_size=page_size, page_token=page_token if page_token else "")
+        response = self.stub.RetrieveKEMs(request, timeout=10)
+        kems_as_dicts = [self._kem_proto_to_dict(kem) for kem in response.kems]
+        return kems_as_dicts, response.next_page_token
 
-            request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, page_size=page_size, page_token=page_token if page_token else "")
-            response = self.stub.RetrieveKEMs(request, timeout=10)
-            kems_as_dicts = [self._kem_proto_to_dict(kem) for kem in response.kems]
-            return kems_as_dicts, response.next_page_token
-        except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове RetrieveKEMs: {e.code()} - {e.details()}")
-            return None
-        except Exception as e:
-            print(f"Ошибка при подготовке запроса RetrieveKEMs: {e}")
-            return None
-
+    @retry_grpc_call
     def update_kem(self, kem_id: str, kem_data_update: dict) -> dict | None:
         self._ensure_connected()
-        try:
-            kem_proto_update = self._kem_dict_to_proto(kem_data_update)
-            request = glm_service_pb2.UpdateKEMRequest(kem_id=kem_id, kem_data_update=kem_proto_update)
-            response_kem_proto = self.stub.UpdateKEM(request, timeout=10) # Добавлен таймаут
-            return self._kem_proto_to_dict(response_kem_proto)
-        except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове UpdateKEM: {e.code()} - {e.details()}")
-            return None
-        except Exception as e:
-            print(f"Ошибка при подготовке запроса UpdateKEM: {e}")
-            return None
+        kem_proto_update = self._kem_dict_to_proto(kem_data_update)
+        request = glm_service_pb2.UpdateKEMRequest(kem_id=kem_id, kem_data_update=kem_proto_update)
+        response_kem_proto = self.stub.UpdateKEM(request, timeout=10)
+        return self._kem_proto_to_dict(response_kem_proto)
 
+    @retry_grpc_call
     def delete_kem(self, kem_id: str) -> bool:
         self._ensure_connected()
-        try:
-            request = glm_service_pb2.DeleteKEMRequest(kem_id=kem_id)
-            self.stub.DeleteKEM(request, timeout=10) # Добавлен таймаут
-            return True
-        except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове DeleteKEM: {e.code()} - {e.details()}")
-            return False
-        except Exception as e:
-            print(f"Ошибка при подготовке запроса DeleteKEM: {e}")
-            return False
+        request = glm_service_pb2.DeleteKEMRequest(kem_id=kem_id)
+        self.stub.DeleteKEM(request, timeout=10)
+        return True
 
     def close(self):
         if self.channel:

@@ -190,6 +190,110 @@ class TestSWMPubSub(unittest.TestCase):
         self.assertEqual(len(evicted_kems_via_callback), 1)
         self.assertEqual(evicted_kems_via_callback[0].id, "kem_ev_1")
 
+    def _subscribe_and_collect_events(self, agent_id: str, topics: list = None, event_limit: int = 1) -> list:
+        """Хелпер для подписки и сбора событий в отдельном потоке."""
+        mock_context = MagicMock()
+        mock_context.is_active.return_value = True
+
+        sub_topics = []
+        if topics:
+            for crit in topics:
+                sub_topics.append(swm_service_pb2.SubscriptionTopic(filter_criteria=crit))
+
+        request = swm_service_pb2.SubscribeToSWMEventsRequest(agent_id=agent_id, topics=sub_topics)
+
+        events_received = []
+
+        # Используем threading.Event для сигнализации о завершении сбора нужного количества событий
+        # или таймаута, чтобы основной поток не ждал вечно, если события не приходят.
+        # Для простоты тестов, мы будем останавливать mock_context.is_active.
+        # Но в реальном тесте лучше использовать threading.Event или очередь с таймаутом.
+
+        def event_collector():
+            try:
+                for event in self.swm_service.SubscribeToSWMEvents(request, mock_context):
+                    events_received.append(event)
+                    if len(events_received) >= event_limit:
+                        mock_context.is_active.return_value = False # Сигнализируем о завершении
+            except Exception as e:
+                # Логируем ошибки из потока, чтобы они были видны
+                print(f"Ошибка в потоке event_collector ({agent_id}): {e}")
+
+
+        collector_thread = threading.Thread(target=event_collector)
+        collector_thread.start()
+        time.sleep(0.05) # Небольшая пауза, чтобы подписчик успел зарегистрироваться
+        return events_received, collector_thread, mock_context
+
+
+    def test_filter_by_kem_id(self):
+        topics = ["kem_id=target_kem"]
+        events, thread, context = self._subscribe_and_collect_events("agent_filter_id", topics)
+
+        kem1 = create_kem_proto_for_test("target_kem")
+        kem2 = create_kem_proto_for_test("other_kem")
+
+        self.swm_service._notify_subscribers(kem1, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+        self.swm_service._notify_subscribers(kem2, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+
+        time.sleep(0.1) # Даем время на обработку событий
+        context.is_active.return_value = False # Принудительно останавливаем, если event_limit не достигнут
+        thread.join(timeout=1.0)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kem_payload.id, "target_kem")
+
+    def test_filter_by_metadata(self):
+        topics = ["metadata.type=doc"]
+        events, thread, context = self._subscribe_and_collect_events("agent_filter_meta", topics, event_limit=2)
+
+        kem1 = create_kem_proto_for_test("kem_doc_1"); kem1.metadata["type"] = "doc"
+        kem2 = create_kem_proto_for_test("kem_msg_1"); kem2.metadata["type"] = "msg"
+        kem3 = create_kem_proto_for_test("kem_doc_2"); kem3.metadata["type"] = "doc"
+
+        self.swm_service._notify_subscribers(kem1, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+        self.swm_service._notify_subscribers(kem2, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+        self.swm_service._notify_subscribers(kem3, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+
+        time.sleep(0.1)
+        context.is_active.return_value = False
+        thread.join(timeout=1.0)
+
+        self.assertEqual(len(events), 2)
+        event_ids = {e.kem_payload.id for e in events}
+        self.assertEqual(event_ids, {"kem_doc_1", "kem_doc_2"})
+
+    def test_no_filters_receives_all(self):
+        events, thread, context = self._subscribe_and_collect_events("agent_no_filter", topics=[], event_limit=2)
+
+        kem1 = create_kem_proto_for_test("kem_all_1")
+        kem2 = create_kem_proto_for_test("kem_all_2")
+
+        self.swm_service._notify_subscribers(kem1, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+        self.swm_service._notify_subscribers(kem2, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+
+        thread.join(timeout=1.0) # Должен завершиться по event_limit
+
+        self.assertEqual(len(events), 2)
+
+    def test_multiple_filters_or_logic(self):
+        topics = ["kem_id=id1", "metadata.status=important"]
+        events, thread, context = self._subscribe_and_collect_events("agent_multi_filter", topics, event_limit=2)
+
+        kem_id1 = create_kem_proto_for_test("id1")
+        kem_important = create_kem_proto_for_test("id_other"); kem_important.metadata["status"] = "important"
+        kem_irrelevant = create_kem_proto_for_test("id_irrelevant")
+
+        self.swm_service._notify_subscribers(kem_id1, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+        self.swm_service._notify_subscribers(kem_important, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+        self.swm_service._notify_subscribers(kem_irrelevant, swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
+
+        thread.join(timeout=1.0) # Должен получить 2 события
+
+        self.assertEqual(len(events), 2)
+        event_ids = {e.kem_payload.id for e in events}
+        self.assertEqual(event_ids, {"id1", "id_other"})
+
 
 if __name__ == '__main__':
     unittest.main()
