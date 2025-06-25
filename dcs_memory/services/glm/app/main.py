@@ -479,45 +479,69 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                           current_kem_processed.updated_at.ToDatetime().isoformat()))
                     conn.commit()
                 # logger.debug(f"BatchStoreKEMs: КЕП ID '{kem_id}' сохранена в SQLite.")
-            except Exception as e:
-                logger.error(f"BatchStoreKEMs: Ошибка SQLite для КЕП ID '{kem_id}' (или индекс {idx}): {e}", exc_info=True)
+            except Exception as e_sqlite:
+                logger.error(f"BatchStoreKEMs: Ошибка SQLite для КЕП ID '{kem_id}' (или индекс {idx}): {e_sqlite}", exc_info=True)
                 failed_kem_references_list.append(kem_in.id if kem_in.id else f"req_idx_{idx}")
-                # overall_error_occurred = True
                 continue # Переходим к следующей КЕП
 
-            if self.qdrant_client and current_kem_processed.embeddings:
+            # Если мы здесь, значит, SQLite операция (INSERT OR REPLACE) прошла успешно
+            sqlite_persisted_this_kem = True
+            qdrant_persisted_this_kem = True # По умолчанию True (например, если нет эмбеддингов или Qdrant клиент не доступен)
+
+            if self.qdrant_client and current_kem_processed.embeddings and len(current_kem_processed.embeddings) > 0 : # Добавлена проверка на непустые эмбеддинги
                 if len(current_kem_processed.embeddings) != DEFAULT_VECTOR_SIZE:
-                    logger.error(f"BatchStoreKEMs: Размерность эмбеддингов ({len(current_kem_processed.embeddings)}) для КЕП ID '{kem_id}' не совпадает с конфигурацией ({DEFAULT_VECTOR_SIZE}).")
-                    failed_kem_references_list.append(kem_id)
-                    # overall_error_occurred = True
-                    # Нужно решить, удалять ли уже сохраненные метаданные из SQLite, если эмбеддинги неверны.
-                    # Пока что оставляем в SQLite, но помечаем как ошибку.
-                    continue
+                    logger.error(f"BatchStoreKEMs: Неверная размерность эмбеддингов ({len(current_kem_processed.embeddings)}) для КЕП ID '{kem_id}'. Ожидалось {DEFAULT_VECTOR_SIZE}.")
+                    qdrant_persisted_this_kem = False
+                    # Добавляем в failed, так как КЕП не полностью сохранена (проблема с эмбеддингами)
+                    if kem_id not in failed_kem_references_list: failed_kem_references_list.append(kem_id)
+                else:
+                    try:
+                        self.qdrant_client.upsert(
+                            collection_name=QDRANT_COLLECTION,
+                            points=[PointStruct(id=kem_id, vector=list(current_kem_processed.embeddings), payload={"kem_id_ref": kem_id})]
+                        )
+                        # logger.debug(f"BatchStoreKEMs: Эмбеддинги для КЕП ID '{kem_id}' сохранены в Qdrant.")
+                    except Exception as e_qdrant:
+                        logger.error(f"BatchStoreKEMs: Ошибка Qdrant для КЕП ID '{kem_id}': {e_qdrant}", exc_info=True)
+                        qdrant_persisted_this_kem = False
+                        if kem_id not in failed_kem_references_list: failed_kem_references_list.append(kem_id)
+
+            elif not self.qdrant_client and current_kem_processed.embeddings and len(current_kem_processed.embeddings) > 0:
+                # Есть эмбеддинги, но Qdrant клиент не доступен
+                logger.error(f"BatchStoreKEMs: Qdrant клиент не доступен, не удается сохранить эмбеддинги для КЕП ID '{kem_id}'.")
+                qdrant_persisted_this_kem = False
+                if kem_id not in failed_kem_references_list: failed_kem_references_list.append(kem_id)
+
+            # Если была ошибка с Qdrant (или эмбеддингами) после успешной записи в SQLite, удаляем из SQLite
+            if sqlite_persisted_this_kem and not qdrant_persisted_this_kem:
                 try:
-                    self.qdrant_client.upsert(
-                        collection_name=QDRANT_COLLECTION,
-                        points=[PointStruct(id=kem_id, vector=list(current_kem_processed.embeddings), payload={"kem_id_ref": kem_id})]
-                    )
-                    # logger.debug(f"BatchStoreKEMs: Эмбеддинги для КЕП ID '{kem_id}' сохранены в Qdrant.")
-                except Exception as e:
-                    logger.error(f"BatchStoreKEMs: Ошибка Qdrant для КЕП ID '{kem_id}': {e}", exc_info=True)
-                    failed_kem_references_list.append(kem_id)
-                    # overall_error_occurred = True
-                    # Аналогично, оставляем в SQLite, но помечаем как ошибку.
-                    continue
+                    with self._get_sqlite_conn() as conn_cleanup:
+                        cursor_cleanup = conn_cleanup.cursor()
+                        cursor_cleanup.execute("DELETE FROM kems WHERE id = ?", (kem_id,))
+                        conn_cleanup.commit()
+                        logger.info(f"BatchStoreKEMs: Запись для КЕП ID '{kem_id}' удалена из SQLite из-за ошибки/отсутствия Qdrant при наличии эмбеддингов.")
+                        sqlite_persisted_this_kem = False # Теперь она не сохранена и в SQLite
+                except Exception as e_cleanup:
+                    logger.critical(f"BatchStoreKEMs: КРИТИЧЕСКАЯ ОШИБКА при попытке удалить КЕП ID '{kem_id}' из SQLite: {e_cleanup}")
+                    # В этом крайне редком случае КЕП остается в SQLite, но имеет проблемы с эмбеддингами.
+                    # failed_kem_references_list уже содержит этот kem_id.
 
-            successfully_stored_kems_list.append(current_kem_processed)
+            if sqlite_persisted_this_kem and qdrant_persisted_this_kem:
+                successfully_stored_kems_list.append(current_kem_processed)
+            # Если какая-либо из операций не удалась, kem_id уже должен быть в failed_kem_references_list,
+            # и КЕП не будет добавлена в successfully_stored_kems_list.
 
-        logger.info(f"BatchStoreKEMs: Успешно сохранено {len(successfully_stored_kems_list)} КЕП, не удалось сохранить {len(failed_kem_references_list)}.")
+        logger.info(f"BatchStoreKEMs: Успешно обработано {len(successfully_stored_kems_list)} КЕП, не удалось обработать {len(set(failed_kem_references_list))} КЕП.")
 
         response = glm_service_pb2.BatchStoreKEMsResponse(
             successfully_stored_kems=successfully_stored_kems_list,
-            failed_kem_references=failed_kem_references_list
+            failed_kem_references=list(set(failed_kem_references_list)) # Убираем дубликаты
         )
-        # if overall_error_occurred or failed_kem_references_list:
-        #    response.overall_error_message = f"Не удалось сохранить {len(failed_kem_references_list)} КЕП. См. failed_kem_references."
-        # elif not request.kems:
-        #    response.overall_error_message = "Получен пустой список КЕП для сохранения."
+
+        if response.failed_kem_references:
+            response.overall_error_message = f"Не удалось полностью сохранить {len(response.failed_kem_references)} КЕП из пакета."
+        elif not request.kems:
+            response.overall_error_message = "Получен пустой список КЕП для сохранения."
 
         return response
 
