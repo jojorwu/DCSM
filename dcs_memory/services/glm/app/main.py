@@ -84,13 +84,49 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         logger.info("Сервисер GLM инициализирован.")
 
     def _get_sqlite_conn(self):
-        return sqlite3.connect(self.sqlite_db_path, timeout=10) # Используем self.sqlite_db_path
+        conn = sqlite3.connect(self.sqlite_db_path, timeout=10)
+        # Установка PRAGMA-настроек для каждого нового соединения
+        try:
+            cursor = conn.cursor()
+            # WAL mode для лучшего параллелизма и производительности
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            # Synchronous NORMAL для ускорения записи (с небольшим риском при сбое питания)
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            # Включение внешних ключей (хорошая практика, даже если сейчас не используются)
+            cursor.execute("PRAGMA foreign_keys=ON;")
+            # Установка таймаута для операций, ожидающих снятия блокировки
+            cursor.execute("PRAGMA busy_timeout = 7500;") # 7.5 секунд
+
+            # Логирование установленных значений PRAGMA для проверки (опционально, но полезно для отладки)
+            # if logger.isEnabledFor(logging.DEBUG): # Проверяем уровень логирования перед выполнением доп. запросов
+            #     journal_mode = cursor.execute("PRAGMA journal_mode;").fetchone()
+            #     synchronous_mode = cursor.execute("PRAGMA synchronous;").fetchone()
+            #     foreign_keys_mode = cursor.execute("PRAGMA foreign_keys;").fetchone()
+            #     busy_timeout = cursor.execute("PRAGMA busy_timeout;").fetchone()
+            #     logger.debug(f"SQLite PRAGMA: journal_mode={journal_mode}, synchronous={synchronous_mode}, foreign_keys={foreign_keys_mode}, busy_timeout={busy_timeout}")
+
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при установке PRAGMA-настроек SQLite: {e}", exc_info=True)
+            # Если PRAGMA не установились, соединение все равно может быть рабочим,
+            # но без оптимизаций. Решаем, нужно ли здесь прерывать или просто логировать.
+            # Пока просто логируем.
+        return conn
 
     def _init_sqlite(self):
         logger.info(f"Инициализация SQLite БД по пути: {self.sqlite_db_path}")
         try:
+            # Получаем соединение уже с PRAGMA-настройками
             with self._get_sqlite_conn() as conn:
                 cursor = conn.cursor()
+                # Проверяем и логируем PRAGMA при инициализации
+                # Это поможет убедиться, что они применяются с самого начала
+                if logger.isEnabledFor(logging.INFO): # Логируем на INFO уровне при инициализации
+                    jm = cursor.execute("PRAGMA journal_mode;").fetchone()
+                    sm = cursor.execute("PRAGMA synchronous;").fetchone()
+                    fk = cursor.execute("PRAGMA foreign_keys;").fetchone()
+                    bt = cursor.execute("PRAGMA busy_timeout;").fetchone()
+                    logger.info(f"SQLite PRAGMA при инициализации: journal_mode={jm}, synchronous={sm}, foreign_keys={fk}, busy_timeout={bt}")
+
                 cursor.execute('''
                 CREATE TABLE IF NOT EXISTS kems (
                     id TEXT PRIMARY KEY,
@@ -227,11 +263,26 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 logger.error(msg)
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg); return glm_service_pb2.StoreKEMResponse()
             try:
+                # --- НАЧАЛО ИЗМЕНЕНИЯ ---
+                qdrant_payload = {"kem_id_ref": kem_id}
+                if kem.metadata:
+                    for k, v_pb in kem.metadata.items():
+                        # Преобразуем Protobuf Value в Python значение, если это необходимо,
+                        # но KEM.metadata это map<string, string>, так что v_pb это уже строка.
+                        qdrant_payload[f"md_{k}"] = v_pb # Префикс "md_" для полей метаданных
+
+                if kem.HasField("created_at"):
+                    qdrant_payload["created_at_ts"] = kem.created_at.seconds
+                if kem.HasField("updated_at"):
+                    qdrant_payload["updated_at_ts"] = kem.updated_at.seconds
+                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
                 self.qdrant_client.upsert(
                     collection_name=self.config.QDRANT_COLLECTION, # Используем self.config
-                    points=[PointStruct(id=kem_id, vector=list(kem.embeddings), payload={"kem_id_ref": kem_id})]
+                    points=[PointStruct(id=kem_id, vector=list(kem.embeddings),
+                                        payload=qdrant_payload)] # Используем новый payload
                 )
-                logger.info("Эмбеддинги для КЕП ID '{}' сохранены/обновлены в Qdrant.".format(kem_id))
+                logger.info("Эмбеддинги и payload для КЕП ID '{}' сохранены/обновлены в Qdrant.".format(kem_id))
             except Exception as e:
                 msg = "Ошибка Qdrant (StoreKEM) для ID '{}': {}".format(kem_id, e)
                 logger.error(msg, exc_info=True)
@@ -250,14 +301,47 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         found_kems_proto = []
         next_offset_str = ""
         embeddings_from_qdrant = {}
+
+        # Вспомогательная функция для построения фильтра Qdrant
+        # Помещена здесь для локальности, может быть вынесена на уровень класса или модуля
+        def _build_qdrant_filter_local(kem_query: glm_service_pb2.KEMQuery) -> models.Filter:
+            q_conditions = []
+            if kem_query.ids:
+                q_conditions.append(models.FieldCondition(key="kem_id_ref", match=models.MatchAny(any=list(kem_query.ids))))
+
+            if kem_query.metadata_filters:
+                for k, v in kem_query.metadata_filters.items():
+                    q_conditions.append(models.FieldCondition(key=f"md_{k}", match=models.MatchValue(value=v)))
+
+            def add_ts_range_condition(field_name, ts_start, ts_end):
+                gte_val, lte_val = None, None
+                if ts_start and (ts_start.seconds > 0 or ts_start.nanos > 0): gte_val = ts_start.seconds
+                if ts_end and (ts_end.seconds > 0 or ts_end.nanos > 0): lte_val = ts_end.seconds
+                if gte_val is not None or lte_val is not None:
+                    q_conditions.append(models.FieldCondition(key=field_name, range=models.Range(gte=gte_val, lte=lte_val)))
+
+            add_ts_range_condition("created_at_ts", kem_query.created_at_start, kem_query.created_at_end)
+            add_ts_range_condition("updated_at_ts", kem_query.updated_at_start, kem_query.updated_at_end)
+
+            return models.Filter(must=q_conditions) if q_conditions else None
+
         if query.embedding_query:
             if not self.qdrant_client:
                 context.abort(grpc.StatusCode.INTERNAL, "Qdrant сервис недоступен."); return glm_service_pb2.RetrieveKEMsResponse()
             if len(query.embedding_query) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Неверная размерность вектора: {len(query.embedding_query)}, ожидалось {self.config.DEFAULT_VECTOR_SIZE}"); return glm_service_pb2.RetrieveKEMsResponse()
             try:
-                qdrant_filter_obj = None # TODO: Implement Qdrant filter
-                search_result = self.qdrant_client.search(collection_name=self.config.QDRANT_COLLECTION, query_vector=list(query.embedding_query), query_filter=qdrant_filter_obj, limit=page_size, offset=offset, with_vectors=True) # Используем self.config
+                qdrant_filter_obj = _build_qdrant_filter_local(query) # Используем локальную функцию
+                logger.debug(f"RetrieveKEMs: Qdrant filter object: {qdrant_filter_obj}")
+
+                search_result = self.qdrant_client.search(
+                    collection_name=self.config.QDRANT_COLLECTION,
+                    query_vector=list(query.embedding_query),
+                    query_filter=qdrant_filter_obj,
+                    limit=page_size,
+                    offset=offset,
+                    with_vectors=True
+                ) # Используем self.config
                 qdrant_ids_to_filter = [hit.id for hit in search_result]
                 for hit in search_result: embeddings_from_qdrant[hit.id] = list(hit.vector) if hit.vector else []
                 if not qdrant_ids_to_filter: return glm_service_pb2.RetrieveKEMsResponse(kems=[], next_page_token="")
@@ -330,14 +414,58 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 cursor.execute("UPDATE kems SET content_type = ?, content = ?, metadata = ?, updated_at = ? WHERE id = ?",
                                (current_kem_dict['content_type'], current_kem_dict['content'], json.dumps(current_kem_dict['metadata']), current_kem_dict['updated_at'], kem_id))
                 conn.commit()
+
                 final_embeddings = list(kem_data_update.embeddings)
-                if self.qdrant_client and final_embeddings:
-                    if len(final_embeddings) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
-                        context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Неверная размерность эмбеддингов: {len(final_embeddings)}, ожидалось {self.config.DEFAULT_VECTOR_SIZE}"); return kem_pb2.KEM()
-                    self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION, points=[PointStruct(id=kem_id, vector=final_embeddings)]) # Используем self.config
-                elif not final_embeddings and self.qdrant_client:
-                    points_resp = self.qdrant_client.get_points(self.config.QDRANT_COLLECTION, ids=[kem_id], with_vectors=True) # Используем self.config
-                    if points_resp.points and points_resp.points[0].vector: final_embeddings = list(points_resp.points[0].vector)
+                qdrant_payload_update = {"kem_id_ref": kem_id}
+
+                # Собираем payload для Qdrant из обновленных данных KEM
+                # Метаданные берем из current_kem_dict['metadata'], так как они уже обновлены
+                if current_kem_dict.get('metadata'):
+                    for k, v in current_kem_dict['metadata'].items():
+                        qdrant_payload_update[f"md_{k}"] = v
+
+                # created_at берем из оригинальной записи (не меняется при обновлении)
+                # updated_at берем новый (ts_now)
+                # Для этого нужно будет преобразовать original_created_at_iso и ts_now в секунды
+                try:
+                    # Преобразуем ISO строку created_at обратно в Timestamp, затем в секунды
+                    created_at_proto_for_qdrant = Timestamp()
+                    created_at_proto_for_qdrant.FromJsonString(original_created_at_iso + "Z" if not original_created_at_iso.endswith("Z") else original_created_at_iso)
+                    qdrant_payload_update["created_at_ts"] = created_at_proto_for_qdrant.seconds
+                except Exception as e_ts_create:
+                    logger.warning(f"UpdateKEM: Не удалось распарсить original_created_at_iso ('{original_created_at_iso}') для Qdrant payload: {e_ts_create}")
+
+                qdrant_payload_update["updated_at_ts"] = ts_now.seconds
+
+
+                if self.qdrant_client:
+                    if final_embeddings: # Если в запросе на обновление есть эмбеддинги
+                        if len(final_embeddings) != self.config.DEFAULT_VECTOR_SIZE:
+                            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Неверная размерность эмбеддингов: {len(final_embeddings)}, ожидалось {self.config.DEFAULT_VECTOR_SIZE}"); return kem_pb2.KEM()
+                        # Обновляем и вектор, и payload
+                        self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION,
+                                                  points=[PointStruct(id=kem_id, vector=final_embeddings, payload=qdrant_payload_update)])
+                        logger.info(f"UpdateKEM: Вектор и payload для КЕП ID '{kem_id}' обновлены в Qdrant.")
+                    else: # Эмбеддинги не переданы в запросе на обновление, обновляем только payload
+                          # Предполагаем, что вектор остается прежним. Qdrant позволяет обновлять только payload.
+                          # Для этого нужно использовать client.set_payload или client.overwrite_payload
+                          # или client.upsert с тем же вектором, если он известен.
+                          # Проще всего здесь - если нет новых эмбеддингов, не трогать вектор, только payload.
+                          # Но upsert без вектора удалит существующий вектор.
+                          # Поэтому, если эмбеддинги не предоставлены, мы ДОЛЖНЫ извлечь существующий вектор.
+                        points_resp = self.qdrant_client.get_points(self.config.QDRANT_COLLECTION, ids=[kem_id], with_vectors=True)
+                        if points_resp.points and points_resp.points[0].vector:
+                            existing_vector = list(points_resp.points[0].vector)
+                            final_embeddings = existing_vector # Сохраняем для возврата в KEM
+                            self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION,
+                                                      points=[PointStruct(id=kem_id, vector=existing_vector, payload=qdrant_payload_update)])
+                            logger.info(f"UpdateKEM: Payload для КЕП ID '{kem_id}' обновлен в Qdrant (вектор сохранен).")
+                        else: # Вектора не было или не удалось получить
+                            # Если вектора не было, а payload хотим обновить, то это upsert без вектора
+                            self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION,
+                                                      points=[PointStruct(id=kem_id, vector=None, payload=qdrant_payload_update)])
+                            logger.info(f"UpdateKEM: Payload для КЕП ID '{kem_id}' обновлен в Qdrant (вектор отсутствует или не изменен).")
+
                 current_kem_dict['created_at'] = original_created_at_iso
                 current_kem_dict['embeddings'] = final_embeddings
                 return self._kem_dict_to_proto(current_kem_dict)
