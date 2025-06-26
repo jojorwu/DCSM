@@ -5,7 +5,7 @@ import warnings
 
 import swm_service_pb2 as swm__service__pb2
 
-GRPC_GENERATED_VERSION = '1.73.0'
+GRPC_GENERATED_VERSION = '1.73.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -55,6 +55,31 @@ class SharedWorkingMemoryServiceStub(object):
                 request_serializer=swm__service__pb2.LoadKEMsFromGLMRequest.SerializeToString,
                 response_deserializer=swm__service__pb2.LoadKEMsFromGLMResponse.FromString,
                 _registered_method=True)
+        self.AcquireLock = channel.unary_unary(
+                '/dcsm.SharedWorkingMemoryService/AcquireLock',
+                request_serializer=swm__service__pb2.AcquireLockRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.AcquireLockResponse.FromString,
+                _registered_method=True)
+        self.ReleaseLock = channel.unary_unary(
+                '/dcsm.SharedWorkingMemoryService/ReleaseLock',
+                request_serializer=swm__service__pb2.ReleaseLockRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.ReleaseLockResponse.FromString,
+                _registered_method=True)
+        self.GetLockInfo = channel.unary_unary(
+                '/dcsm.SharedWorkingMemoryService/GetLockInfo',
+                request_serializer=swm__service__pb2.GetLockInfoRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.LockInfo.FromString,
+                _registered_method=True)
+        self.IncrementCounter = channel.unary_unary(
+                '/dcsm.SharedWorkingMemoryService/IncrementCounter',
+                request_serializer=swm__service__pb2.IncrementCounterRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.CounterValueResponse.FromString,
+                _registered_method=True)
+        self.GetCounter = channel.unary_unary(
+                '/dcsm.SharedWorkingMemoryService/GetCounter',
+                request_serializer=swm__service__pb2.DistributedCounterRequest.SerializeToString,
+                response_deserializer=swm__service__pb2.CounterValueResponse.FromString,
+                _registered_method=True)
 
 
 class SharedWorkingMemoryServiceServicer(object):
@@ -89,6 +114,46 @@ class SharedWorkingMemoryServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def AcquireLock(self, request, context):
+        """--- RPC для управления блокировками ---
+        Пытается получить блокировку на ресурс.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseLock(self, request, context):
+        """Освобождает ранее полученную блокировку.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetLockInfo(self, request, context):
+        """Получает информацию о текущем состоянии блокировки для ресурса.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def IncrementCounter(self, request, context):
+        """--- RPC для распределенных счетчиков ---
+        Атомарно инкрементирует (или декрементирует) значение счетчика.
+        Если счетчик не существует, он создается со значением increment_by.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetCounter(self, request, context):
+        """Получает текущее значение счетчика.
+        Если счетчик не существует, может вернуть ошибку или значение по умолчанию (например, 0).
+        TODO: Добавить DeleteCounter(DistributedCounterRequest) returns (google.protobuf.Empty) в будущем.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SharedWorkingMemoryServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -111,6 +176,31 @@ def add_SharedWorkingMemoryServiceServicer_to_server(servicer, server):
                     servicer.LoadKEMsFromGLM,
                     request_deserializer=swm__service__pb2.LoadKEMsFromGLMRequest.FromString,
                     response_serializer=swm__service__pb2.LoadKEMsFromGLMResponse.SerializeToString,
+            ),
+            'AcquireLock': grpc.unary_unary_rpc_method_handler(
+                    servicer.AcquireLock,
+                    request_deserializer=swm__service__pb2.AcquireLockRequest.FromString,
+                    response_serializer=swm__service__pb2.AcquireLockResponse.SerializeToString,
+            ),
+            'ReleaseLock': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseLock,
+                    request_deserializer=swm__service__pb2.ReleaseLockRequest.FromString,
+                    response_serializer=swm__service__pb2.ReleaseLockResponse.SerializeToString,
+            ),
+            'GetLockInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetLockInfo,
+                    request_deserializer=swm__service__pb2.GetLockInfoRequest.FromString,
+                    response_serializer=swm__service__pb2.LockInfo.SerializeToString,
+            ),
+            'IncrementCounter': grpc.unary_unary_rpc_method_handler(
+                    servicer.IncrementCounter,
+                    request_deserializer=swm__service__pb2.IncrementCounterRequest.FromString,
+                    response_serializer=swm__service__pb2.CounterValueResponse.SerializeToString,
+            ),
+            'GetCounter': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetCounter,
+                    request_deserializer=swm__service__pb2.DistributedCounterRequest.FromString,
+                    response_serializer=swm__service__pb2.CounterValueResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -222,6 +312,141 @@ class SharedWorkingMemoryService(object):
             '/dcsm.SharedWorkingMemoryService/LoadKEMsFromGLM',
             swm__service__pb2.LoadKEMsFromGLMRequest.SerializeToString,
             swm__service__pb2.LoadKEMsFromGLMResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AcquireLock(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dcsm.SharedWorkingMemoryService/AcquireLock',
+            swm__service__pb2.AcquireLockRequest.SerializeToString,
+            swm__service__pb2.AcquireLockResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseLock(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dcsm.SharedWorkingMemoryService/ReleaseLock',
+            swm__service__pb2.ReleaseLockRequest.SerializeToString,
+            swm__service__pb2.ReleaseLockResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetLockInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dcsm.SharedWorkingMemoryService/GetLockInfo',
+            swm__service__pb2.GetLockInfoRequest.SerializeToString,
+            swm__service__pb2.LockInfo.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def IncrementCounter(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dcsm.SharedWorkingMemoryService/IncrementCounter',
+            swm__service__pb2.IncrementCounterRequest.SerializeToString,
+            swm__service__pb2.CounterValueResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetCounter(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dcsm.SharedWorkingMemoryService/GetCounter',
+            swm__service__pb2.DistributedCounterRequest.SerializeToString,
+            swm__service__pb2.CounterValueResponse.FromString,
             options,
             channel_credentials,
             insecure,

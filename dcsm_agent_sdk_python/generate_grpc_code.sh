@@ -1,10 +1,14 @@
 #!/bin/bash
+SCRIPT_DIR_SDK=$(dirname "$0")
+cd "$SCRIPT_DIR_SDK" || exit 1 # Переходим в директорию скрипта
+
+echo "Текущая директория для генерации SDK кода: $(pwd)"
 echo "Генерация gRPC кода для клиента SDK..."
 PYTHON_EXE="python3" # Используем python3 из активированного venv
 OUTPUT_DIR="./generated_grpc_code" # Генерация в поддиректорию SDK
 # PROTO_DIR теперь указывает на канонический источник
 # Относительный путь из dcsm_agent_sdk_python/ до dcs_memory/common/grpc_protos/
-PROTO_DIR="../dcs_memory/common/grpc_protos"
+PROTO_DIR="../dcs_memory/common/grpc_protos" # Путь остается таким же, т.к. мы теперь в директории скрипта
 
 mkdir -p $OUTPUT_DIR
 

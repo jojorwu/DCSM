@@ -21,6 +21,23 @@ service SharedWorkingMemoryService {
 
   // Запрашивает загрузку КЕП из GLM в SWM (в кэш SWM).
   rpc LoadKEMsFromGLM(LoadKEMsFromGLMRequest) returns (LoadKEMsFromGLMResponse);
+
+  // --- RPC для управления блокировками ---
+  // Пытается получить блокировку на ресурс.
+  rpc AcquireLock(AcquireLockRequest) returns (AcquireLockResponse);
+  // Освобождает ранее полученную блокировку.
+  rpc ReleaseLock(ReleaseLockRequest) returns (ReleaseLockResponse);
+  // Получает информацию о текущем состоянии блокировки для ресурса.
+  rpc GetLockInfo(GetLockInfoRequest) returns (LockInfo);
+
+  // --- RPC для распределенных счетчиков ---
+  // Атомарно инкрементирует (или декрементирует) значение счетчика.
+  // Если счетчик не существует, он создается со значением increment_by.
+  rpc IncrementCounter(IncrementCounterRequest) returns (CounterValueResponse);
+  // Получает текущее значение счетчика.
+  // Если счетчик не существует, может вернуть ошибку или значение по умолчанию (например, 0).
+  rpc GetCounter(DistributedCounterRequest) returns (CounterValueResponse);
+  // TODO: Добавить DeleteCounter(DistributedCounterRequest) returns (google.protobuf.Empty) в будущем.
 }
 
 // --- Сообщения для PublishKEMToSWM ---
@@ -100,3 +117,93 @@ message LoadKEMsFromGLMResponse {
   repeated string loaded_kem_ids = 3; // Список ID КЕП, которые были загружены/обновлены в SWM
   string status_message = 4;
 }
+
+// ----- Сообщения и RPC для управления блокировками -----
+
+message AcquireLockRequest {
+  string resource_id = 1; // Идентификатор ресурса, для которого запрашивается блокировка
+  string agent_id = 2;    // Идентификатор агента, запрашивающего блокировку
+  int32 timeout_ms = 3;   // Максимальное время ожидания блокировки в миллисекундах (0 - не ждать, -1 - ждать бесконечно)
+  int32 lease_duration_ms = 4; // Запрашиваемое время удержания блокировки в мс (0 - до явного освобождения или потери связи)
+                               // SWM может установить свое максимальное/минимальное время.
+}
+
+enum LockStatusValue {
+  LOCK_STATUS_UNSPECIFIED = 0;
+  ACQUIRED = 1;         // Блокировка успешно получена
+  ALREADY_HELD_BY_YOU = 2; // Блокировка уже удерживается этим же agent_id
+  TIMEOUT = 3;          // Время ожидания истекло, блокировка не получена
+  NOT_AVAILABLE = 4;    // Блокировка удерживается другим агентом (если timeout_ms = 0)
+  ERROR = 5;            // Произошла ошибка на сервере
+}
+
+message AcquireLockResponse {
+  string resource_id = 1;
+  string agent_id = 2;
+  LockStatusValue status = 3;
+  string lock_id = 4;         // Уникальный ID блокировки, если получена (может быть полезен для ReleaseLock)
+  int64 acquired_at_unix_ms = 5; // Время получения блокировки (мс с эпохи UTC)
+  int64 lease_expires_at_unix_ms = 6; // Время истечения аренды блокировки (мс с эпохи UTC), если применимо
+  string message = 7;         // Дополнительное сообщение
+}
+
+message ReleaseLockRequest {
+  string resource_id = 1;
+  string agent_id = 2;    // Агент, который пытается освободить блокировку
+  string lock_id = 3;     // Опционально: ID блокировки, полученный при AcquireLock (для проверки)
+}
+
+enum ReleaseStatusValue {
+  RELEASE_STATUS_UNSPECIFIED = 0;
+  RELEASED = 1;         // Блокировка успешно освобождена
+  NOT_HELD = 2;         // Блокировка не удерживалась этим агентом или для этого ресурса
+  INVALID_LOCK_ID = 3;  // Предоставленный lock_id не соответствует активной блокировке
+  ERROR_RELEASING = 4;  // Ошибка на сервере при освобождении
+}
+
+message ReleaseLockResponse {
+  string resource_id = 1;
+  ReleaseStatusValue status = 2;
+  string message = 3;
+}
+
+message GetLockInfoRequest {
+  string resource_id = 1;
+}
+
+message LockInfo {
+  string resource_id = 1;
+  bool is_locked = 2;
+  string current_holder_agent_id = 3; // Если is_locked = true
+  string lock_id = 4;                 // Если is_locked = true
+  int64 acquired_at_unix_ms = 5;      // Если is_locked = true
+  int64 lease_expires_at_unix_ms = 6;   // Если is_locked = true and lease_duration_ms > 0
+}
+// Сервис SharedWorkingMemoryService дополняется новыми RPC
+// ... (в определении service SharedWorkingMemoryService)
+// rpc AcquireLock(AcquireLockRequest) returns (AcquireLockResponse);
+// rpc ReleaseLock(ReleaseLockRequest) returns (ReleaseLockResponse);
+// rpc GetLockInfo(GetLockInfoRequest) returns (LockInfo);
+
+// ----- Сообщения и RPC для распределенных структур данных (начало - счетчик) -----
+
+message DistributedCounterRequest {
+  string counter_id = 1; // Уникальный идентификатор счетчика
+}
+
+message IncrementCounterRequest {
+  string counter_id = 1;
+  int64 increment_by = 2; // Значение, на которое увеличить счетчик (может быть отрицательным для уменьшения)
+}
+
+message CounterValueResponse {
+  string counter_id = 1;
+  int64 current_value = 2;
+  string status_message = 3; // Для ошибок или информации
+}
+
+// ... (в определении service SharedWorkingMemoryService)
+// rpc IncrementCounter(IncrementCounterRequest) returns (CounterValueResponse);
+// rpc GetCounter(DistributedCounterRequest) returns (CounterValueResponse);
+// rpc DeleteCounter(DistributedCounterRequest) returns (SimpleResponse); // SimpleResponse можно определить или использовать google.protobuf.Empty
+// Для простоты, пока без DeleteCounter.
