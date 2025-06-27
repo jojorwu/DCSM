@@ -37,7 +37,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
     *   Vector searchsimilarity search based on embeddings to find semantically similar KEMs.
     *   Updating and deleting existing KEMs.
     *   **Write Conflict Handling**: When saving KEMs (`StoreKEM`, `BatchStoreKEMs`) with an existing ID, the data is overwritten (logic of `INSERT OR REPLACE` in SQLite and `upsert` in Qdrant).
-    *   **Batch Storing and Consistency (`BatchStoreKEMs`)**: The `BatchStoreKEMs` method attempts to save each KEM in the batch. If embeddings for any KEM (if present) cannot be saved to Qdrant, the corresponding record for that KEM is deleted from SQLite to maintain basic consistency between metadata and vector stores.
+    *   **Batch Storing and Consistency (`BatchStoreKEMs`)**: The `BatchStoreKEMs` method attempts to save each KEM in the batch. If embeddings for any KEM (if present) cannot be saved to Qdrant, the corresponding record for that KEM is deleted from SQLite to maintain basic consistency between metadata and vector stores. Internally, Qdrant updates for batches are optimized by sending points to Qdrant in a single batch call where possible.
 *   **Technologies (current implementation):**
     *   gRPC for API definition and serving.
     *   Qdrant: Used as a vector database for storing embeddings and performing similarity searches.
@@ -92,7 +92,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
     *   gRPC for API.
     *   `IndexedLRUCache` (based on `cachetools.LRUCache`): for the internal cache with indexing.
     *   GLM gRPC client (with retry logic).
-    *   `queue.Queue` for managing subscriber events.
+    *   `asyncio.Queue` for managing per-subscriber event queues in its asynchronous gRPC environment.
 *   **API (gRPC - `swm_service.proto`):**
     *   `PublishKEMToSWM`: Publishes a KEM to SWM (and optionally to GLM).
     *   `SubscribeToSWMEvents`: Subscribes to SWM events.
@@ -215,7 +215,6 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
     *   If the `persist_to_glm_if_new_or_updated` flag is true and a GLM client is available:
         *   SWM calls GLM's `StoreKEM` method to save/update the KEM in long-term memory.
         *   Upon successful persistence in GLM, SWM may update the KEM in its cache with the version returned by GLM (for ID and GLM server-side timestamp consistency).
-    *   (Future prospect) Generates a `KEM_PUBLISHED` or `KEM_UPDATED` event for subscribers.
 4.  **SWM** returns a response to the agent about the SWM publication status and (if applicable) the status of the GLM operation.
 
 #### 4.3.1. Data Structure in SWM (Cache)
@@ -274,7 +273,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 
 ## 6. Future Directions
 
-*   **Full-fledged Pub/Sub in SWM:** Using `asyncio` and per-subscriber queues or integrating with a message broker (e.g., Redis Pub/Sub, Kafka, RabbitMQ) for reliable and scalable event distribution for `SubscribeToSWMEvents`.
+*   **Full-fledged Pub/Sub in SWM:** Further enhancements to the Pub/Sub mechanism in SWM. While SWM currently uses `asyncio` and per-subscriber `asyncio.Queue`s for event handling, future work could include more sophisticated server-side event filtering, durable subscriptions, dead-letter queues, or optional integration with dedicated message brokers (e.g., Redis Pub/Sub, Kafka, RabbitMQ) for even greater scalability and reliability in large-scale deployments.
 *   **More Sophisticated Caching and Eviction Policies in SWM:** For example, based on access frequency, KEM size, or explicit agent-set priorities.
 *   **Enhanced Filtering in `QuerySWM`:** Support for more complex queries on cached data, if feasible without turning SWM into a full-fledged database.
 *   **Implementation of Other Services:** Such as a service for managing agent configurations or a memory usage analytics service.
