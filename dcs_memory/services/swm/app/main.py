@@ -6,28 +6,28 @@ import os
 import uuid
 import logging
 import threading
-import queue # Для очередей событий подписчиков
-from dataclasses import dataclass, field # Для SubscriberInfo
+import queue # For subscriber event queues
+from dataclasses import dataclass, field # For SubscriberInfo
 from cachetools import LRUCache, Cache
 from google.protobuf.timestamp_pb2 import Timestamp
-import typing # Добавлено для typing.Optional и typing.List
+import typing
 
-# Импортируем конфигурацию
+# Import configuration
 from .config import SWMConfig
 
-# Глобальный экземпляр конфигурации
+# Global config instance
 config = SWMConfig()
 
-# --- Настройка логирования ---
+# --- Logging Setup ---
 logging.basicConfig(
     level=config.get_log_level_int(),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
-# --- Конец настройки логирования ---
+# --- End Logging Setup ---
 
-# --- Начало блока для корректного импорта сгенерированного кода ---
+# --- gRPC Code Import Block ---
 current_script_path = os.path.abspath(__file__)
 app_dir_swm = os.path.dirname(current_script_path)
 service_root_dir_swm = os.path.dirname(app_dir_swm)
@@ -41,7 +41,7 @@ from generated_grpc import glm_service_pb2_grpc
 from generated_grpc import swm_service_pb2
 from generated_grpc import swm_service_pb2_grpc
 from dcs_memory.common.grpc_utils import retry_grpc_call
-# --- Конец блока для корректного импорта ---
+# --- End gRPC Code Import Block ---
 
 @dataclass
 class SubscriberInfo:
@@ -89,7 +89,7 @@ class IndexedLRUCache(Cache):
                         try:
                             self._on_evict_callback(evicted_kem)
                         except Exception as e_cb:
-                            logger.error(f"Ошибка в on_evict_callback для КЕП ID '{_evicted_id}': {e_cb}", exc_info=True)
+                            logger.error(f"Error in on_evict_callback for KEM ID '{_evicted_id}': {e_cb}", exc_info=True)
             self._lru[kem_id] = kem
             self._add_to_metadata_indexes(kem)
     def __getitem__(self, kem_id: str) -> kem_pb2.KEM:
@@ -153,7 +153,7 @@ class LockInfoInternal:
 class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemoryServiceServicer):
     def __init__(self):
         self.config = config
-        logger.info(f"Инициализация SharedWorkingMemoryServiceImpl... Размер кэша: {self.config.CACHE_MAX_SIZE}, Индексируемые ключи: {self.config.INDEXED_METADATA_KEYS}")
+        logger.info(f"Initializing SharedWorkingMemoryServiceImpl... Cache size: {self.config.CACHE_MAX_SIZE}, Indexed keys: {self.config.INDEXED_METADATA_KEYS}")
         self.glm_channel = None
         self.glm_stub = None
         self.retry_max_attempts = self.config.GLM_RETRY_MAX_ATTEMPTS
@@ -173,21 +173,21 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         self.counters_lock = threading.Lock()
 
         self._stop_event = threading.Event()
-        self._lock_cleanup_thread: Optional[threading.Thread] = None
+        self._lock_cleanup_thread: typing.Optional[threading.Thread] = None
         self._lock_cleanup_interval_seconds = getattr(self.config, 'LOCK_CLEANUP_INTERVAL_S', 60)
         self._start_expired_lock_cleanup_thread()
 
         try:
             self.glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS)
             self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
-            logger.info(f"GLM клиент для SWM инициализирован, целевой адрес: {self.config.GLM_SERVICE_ADDRESS}")
+            logger.info(f"GLM client for SWM initialized, target address: {self.config.GLM_SERVICE_ADDRESS}")
         except Exception as e:
-            logger.error(f"Ошибка при инициализации GLM клиента в SWM: {e}")
+            logger.error(f"Error initializing GLM client in SWM: {e}")
 
     def _expired_lock_cleanup_task(self):
-        logger.info("SWM: Запущен фоновый поток очистки истекших блокировок.")
+        logger.info("SWM: Expired lock cleanup background thread started.")
         while not self._stop_event.wait(self._lock_cleanup_interval_seconds):
-            logger.debug("SWM: Выполняется периодическая очистка истекших блокировок...")
+            logger.debug("SWM: Performing periodic cleanup of expired locks...")
             with self.lock_condition:
                 current_time_ms = int(time.time() * 1000)
                 expired_resource_ids = []
@@ -202,47 +202,47 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                         if lock_to_remove and lock_to_remove.lease_duration_ms > 0 and \
                            current_time_ms >= lock_to_remove.lease_expires_at_unix_ms:
                             del self.locks[resource_id]
-                            logger.info(f"SWM Cleanup: Истекшая блокировка для resource='{lock_to_remove.resource_id}' (агент '{lock_to_remove.agent_id}') удалена.")
+                            logger.info(f"SWM Cleanup: Expired lock for resource='{lock_to_remove.resource_id}' (agent '{lock_to_remove.agent_id}') removed.")
                             self.lock_condition.notify_all()
                             cleaned_count +=1
                     if cleaned_count > 0:
-                        logger.info(f"SWM Cleanup: Удалено {cleaned_count} истекших блокировок.")
+                        logger.info(f"SWM Cleanup: Removed {cleaned_count} expired locks.")
                 else:
-                    logger.debug("SWM Cleanup: Истекших блокировок не найдено.")
-        logger.info("SWM: Фоновый поток очистки истекших блокировок остановлен.")
+                    logger.debug("SWM Cleanup: No expired locks found.")
+        logger.info("SWM: Expired lock cleanup background thread stopped.")
 
     def _start_expired_lock_cleanup_thread(self):
         if self._lock_cleanup_thread is None or not self._lock_cleanup_thread.is_alive():
             self._stop_event.clear()
             self._lock_cleanup_thread = threading.Thread(target=self._expired_lock_cleanup_task, daemon=True)
             self._lock_cleanup_thread.start()
-            logger.info("SWM: Фоновый поток очистки блокировок успешно запущен/перезапущен.")
+            logger.info("SWM: Lock cleanup background thread successfully started/restarted.")
         else:
-            logger.info("SWM: Фоновый поток очистки блокировок уже активен.")
+            logger.info("SWM: Lock cleanup background thread is already active.")
 
     def _stop_expired_lock_cleanup_thread(self):
         if self._lock_cleanup_thread and self._lock_cleanup_thread.is_alive():
-            logger.info("SWM: Остановка фонового потока очистки блокировок...")
+            logger.info("SWM: Stopping lock cleanup background thread...")
             self._stop_event.set()
         self._lock_cleanup_thread = None
 
     @retry_grpc_call
     def _glm_retrieve_kems_with_retry(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int = 20) -> glm_service_pb2.RetrieveKEMsResponse:
         if not self.glm_stub:
-            logger.error("SWM._glm_retrieve_kems_with_retry: GLM stub не инициализирован.")
+            logger.error("SWM._glm_retrieve_kems_with_retry: GLM stub not initialized.")
             raise grpc.RpcError("GLM stub not available in SWM")
         return self.glm_stub.RetrieveKEMs(request, timeout=timeout)
 
     @retry_grpc_call
     def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
         if not self.glm_stub:
-            logger.error("SWM._glm_store_kem_with_retry: GLM stub не инициализирован.")
+            logger.error("SWM._glm_store_kem_with_retry: GLM stub not initialized.")
             raise grpc.RpcError("GLM stub not available in SWM")
         return self.glm_stub.StoreKEM(request, timeout=timeout)
 
     def _handle_kem_eviction(self, evicted_kem: kem_pb2.KEM):
         if evicted_kem:
-            logger.info(f"SWM: КЕП ID '{evicted_kem.id}' была вытеснена из кэша. Уведомление подписчиков.")
+            logger.info(f"SWM: KEM ID '{evicted_kem.id}' was evicted from cache. Notifying subscribers.")
             self._notify_subscribers(evicted_kem, swm_service_pb2.SWMMemoryEvent.EventType.KEM_EVICTED, source_agent_id="SWM_CACHE_EVICTION")
 
     def _get_kem_from_cache(self, kem_id: str) -> typing.Optional[kem_pb2.KEM]:
@@ -250,11 +250,11 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
     def _put_kem_to_cache(self, kem: kem_pb2.KEM) -> None:
         if not kem or not kem.id:
-            logger.warning("Попытка добавить невалидную КЕП в кэш SWM.")
+            logger.warning("Attempt to add an invalid KEM to SWM cache.")
             return
         was_present = kem.id in self.swm_cache
         self.swm_cache[kem.id] = kem
-        logger.info("КЕП ID '{}' добавлена/обновлена в кэше SWM. Размер кэша: {}/{}".format(
+        logger.info("KEM ID '{}' added/updated in SWM cache. Cache size: {}/{}".format(
             kem.id, len(self.swm_cache), self.swm_cache.maxsize))
         event_type = swm_service_pb2.SWMMemoryEvent.EventType.KEM_UPDATED if was_present else swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED
         self._notify_subscribers(kem, event_type)
@@ -263,20 +263,20 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         if kem_id in self.swm_cache:
             try:
                 evicted_kem = self.swm_cache.pop(kem_id)
-                logger.info(f"КЕП ID '{kem_id}' удалена из кэша SWM.")
+                logger.info(f"KEM ID '{kem_id}' removed from SWM cache.")
                 if evicted_kem:
                     self._notify_subscribers(evicted_kem, swm_service_pb2.SWMMemoryEvent.EventType.KEM_EVICTED)
                 return True
             except KeyError:
-                logger.warning(f"КЕП ID '{kem_id}' не найдена в кэше при попытке удаления (возможно, гонка).")
+                logger.warning(f"KEM ID '{kem_id}' not found in cache during deletion attempt (possible race condition).")
                 return False
         return False
 
     def _notify_subscribers(self, kem: kem_pb2.KEM, event_type: swm_service_pb2.SWMMemoryEvent.EventType, source_agent_id: str = "SWM_SERVER"):
         if not kem or not kem.id:
-            logger.warning("_notify_subscribers вызван с невалидной КЕП.")
+            logger.warning("_notify_subscribers called with an invalid KEM.")
             return
-        logger.info(f"Формирование события {swm_service_pb2.SWMMemoryEvent.EventType.Name(event_type)} для КЕП ID '{kem.id}'")
+        logger.info(f"Forming event {swm_service_pb2.SWMMemoryEvent.EventType.Name(event_type)} for KEM ID '{kem.id}'")
         event_time_proto = Timestamp(); event_time_proto.GetCurrentTime()
         event_to_dispatch = swm_service_pb2.SWMMemoryEvent(
             event_id=str(uuid.uuid4()), event_type=event_type, kem_payload=kem,
@@ -288,9 +288,9 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             if not self.subscribers: return
             subscribers_copy = dict(self.subscribers)
         if not subscribers_copy:
-            logger.debug("Нет подписчиков для уведомления.")
+            logger.debug("No subscribers to notify.")
             return
-        logger.debug(f"Проверка и рассылка события {event_to_dispatch.event_id} для {len(subscribers_copy)} подписчиков.")
+        logger.debug(f"Checking and dispatching event {event_to_dispatch.event_id} to {len(subscribers_copy)} subscribers.")
         for sub_id, sub_info in subscribers_copy.items():
             should_send = False
             if not sub_info.topics: should_send = True
@@ -299,7 +299,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                     criteria = topic.filter_criteria.strip()
                     if not criteria: should_send = True; break
                     if '=' not in criteria:
-                        logger.warning(f"Неверный формат filter_criteria '{criteria}' для подписчика {sub_id}. Пропуск фильтра.")
+                        logger.warning(f"Invalid filter_criteria format '{criteria}' for subscriber {sub_id}. Skipping filter.")
                         should_send = True; break
                     filter_key, filter_value = criteria.split("=", 1)
                     filter_key = filter_key.strip(); filter_value = filter_value.strip()
@@ -311,23 +311,23 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                            event_to_dispatch.kem_payload.metadata[meta_actual_key] == filter_value:
                             should_send = True; break
                     else:
-                        logger.warning(f"Неизвестный ключ фильтрации '{filter_key}' для подписчика {sub_id}. Событие будет отправлено.")
+                        logger.warning(f"Unknown filter key '{filter_key}' for subscriber {sub_id}. Event will be sent.")
                         should_send = True; break
             if should_send:
                 try: sub_info.event_queue.put_nowait(event_to_dispatch)
-                except queue.Full: logger.warning(f"Очередь подписчика {sub_id} переполнена для события {event_to_dispatch.event_id}. Событие потеряно.")
-                except Exception as e: logger.error(f"Неожиданная ошибка при добавлении события в очередь подписчика {sub_id}: {e}", exc_info=True)
+                except queue.Full: logger.warning(f"Subscriber queue {sub_id} is full for event {event_to_dispatch.event_id}. Event lost.")
+                except Exception as e: logger.error(f"Unexpected error adding event to subscriber queue {sub_id}: {e}", exc_info=True)
 
     def LoadKEMsFromGLM(self, request: swm_service_pb2.LoadKEMsFromGLMRequest, context):
-        logger.info("SWM: LoadKEMsFromGLM вызван с запросом: {}".format(request.query_for_glm))
+        logger.info(f"SWM: LoadKEMsFromGLM called with query: {request.query_for_glm}")
         if not self.glm_stub:
-            msg = "GLM сервис недоступен для SWM (клиент не инициализирован)."
+            msg = "GLM service is unavailable to SWM (client not initialized)."
             logger.error(msg); context.abort(grpc.StatusCode.INTERNAL, msg)
             return swm_service_pb2.LoadKEMsFromGLMResponse(status_message=msg)
         glm_retrieve_request = glm_service_pb2.RetrieveKEMsRequest(query=request.query_for_glm)
         loaded_kems_count = 0; loaded_ids = []; kems_from_glm_for_stats = 0
         try:
-            logger.info("SWM: Запрос к GLM.RetrieveKEMs (с retry): {}".format(glm_retrieve_request))
+            logger.info(f"SWM: Requesting GLM.RetrieveKEMs (with retry): {glm_retrieve_request}")
             glm_response = self._glm_retrieve_kems_with_retry(glm_retrieve_request, timeout=20)
             if glm_response and glm_response.kems:
                 kems_from_glm_for_stats = len(glm_response.kems)
@@ -335,34 +335,34 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                     self._put_kem_to_cache(kem_from_glm)
                     loaded_ids.append(kem_from_glm.id)
                 loaded_kems_count = len(loaded_ids)
-                status_msg = "Загружено {} КЕП.".format(loaded_kems_count)
+                status_msg = f"Loaded {loaded_kems_count} KEMs."
                 logger.info(f"SWM: {status_msg}")
             else:
-                status_msg = "GLM не вернул КЕП по запросу."; logger.info(status_msg)
+                status_msg = "GLM returned no KEMs for the query."; logger.info(status_msg)
             return swm_service_pb2.LoadKEMsFromGLMResponse(
                 kems_queried_in_glm_count=kems_from_glm_for_stats, kems_loaded_to_swm_count=loaded_kems_count,
                 loaded_kem_ids=loaded_ids, status_message=status_msg )
         except grpc.RpcError as e:
-            msg = f"SWM: gRPC ошибка при вызове GLM.RetrieveKEMs: code={e.code()}, details={e.details()}"
+            msg = f"SWM: gRPC error calling GLM.RetrieveKEMs: code={e.code()}, details={e.details()}"
             logger.error(msg); context.abort(e.code(), msg)
         except Exception as e:
-            msg = f"SWM: Непредвиденная ошибка в LoadKEMsFromGLM при работе с GLM: {e}"
+            msg = f"SWM: Unexpected error in LoadKEMsFromGLM while working with GLM: {e}"
             logger.error(msg, exc_info=True); context.abort(grpc.StatusCode.INTERNAL, msg)
-        return swm_service_pb2.LoadKEMsFromGLMResponse(status_message="Ошибка при загрузке из GLM")
+        return swm_service_pb2.LoadKEMsFromGLMResponse(status_message="Error loading from GLM")
 
 
     def QuerySWM(self, request: swm_service_pb2.QuerySWMRequest, context):
         query = request.query
-        logger.info("SWM: QuerySWM вызван с KEMQuery: {}".format(query))
+        logger.info(f"SWM: QuerySWM called with KEMQuery: {query}")
         if query.embedding_query or query.text_query:
-            msg = "Векторный или текстовый поиск напрямую в SWM кэше не поддерживается. Используйте GLM."
+            msg = "Vector or text search is not supported directly in SWM cache. Use GLM."
             logger.warning(msg); context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
             return swm_service_pb2.QuerySWMResponse()
         page_size = request.page_size if request.page_size > 0 else self.config.DEFAULT_PAGE_SIZE
         offset = 0
         if request.page_token:
             try: offset = int(request.page_token)
-            except ValueError: logger.warning(f"Неверный page_token для QuerySWM: '{request.page_token}', используется offset=0.")
+            except ValueError: logger.warning(f"Invalid page_token for QuerySWM: '{request.page_token}', using offset=0.")
 
         processed_kems_list: typing.List[kem_pb2.KEM] = []
         final_candidate_ids: typing.Optional[typing.Set[str]] = None
@@ -374,7 +374,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                 if key in self.swm_cache._indexed_keys: indexed_metadata_queries[key] = value
                 else: unindexed_metadata_queries[key] = value
         if indexed_metadata_queries:
-            logger.debug(f"Применение индексированных фильтров метаданных: {indexed_metadata_queries}")
+            logger.debug(f"Applying indexed metadata filters: {indexed_metadata_queries}")
             intersected_ids: typing.Optional[typing.Set[str]] = None
             for key, value in indexed_metadata_queries.items():
                 ids_from_index = self.swm_cache.get_ids_by_metadata_filter(key, value)
@@ -382,19 +382,18 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                 else: intersected_ids.intersection_update(ids_from_index if ids_from_index is not None else set())
                 if not intersected_ids: break
             if not intersected_ids :
-                logger.info("QuerySWM: Результат пуст после применения индексированных фильтров метаданных.")
+                logger.info("QuerySWM: Result is empty after applying indexed metadata filters.")
                 return swm_service_pb2.QuerySWMResponse(kems=[], next_page_token="")
             final_candidate_ids = intersected_ids
-            logger.debug(f"Кандидатские ID после индексированных фильтров: {len(final_candidate_ids if final_candidate_ids else [])}")
+            logger.debug(f"Candidate IDs after indexed filters: {len(final_candidate_ids if final_candidate_ids else [])}")
 
-        # Corrected logic for processed_kems_list initialization
         if final_candidate_ids is not None:
             for kem_id in final_candidate_ids:
                 kem = self.swm_cache.get(kem_id)
                 if kem: processed_kems_list.append(kem)
-        else: # No indexed filters applied, or they resulted in None (should be empty set)
+        else:
             processed_kems_list = self.swm_cache.values()
-        logger.debug(f"КЕП после этапа индексных фильтров (или все из кэша): {len(processed_kems_list)}")
+        logger.debug(f"KEMs after indexed filter stage (or all from cache): {len(processed_kems_list)}")
 
         if query.ids:
             ids_set = set(query.ids)
@@ -423,16 +422,16 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         kems_on_page = processed_kems_list[start_index:end_index]
         next_page_token_str = ""
         if end_index < len(processed_kems_list): next_page_token_str = str(end_index)
-        logger.info("QuerySWM: Возвращено {} КЕП.".format(len(kems_on_page)))
+        logger.info(f"QuerySWM: Returning {len(kems_on_page)} KEMs.")
         return swm_service_pb2.QuerySWMResponse(kems=kems_on_page, next_page_token=next_page_token_str)
 
     def PublishKEMToSWM(self, request: swm_service_pb2.PublishKEMToSWMRequest, context):
         kem_to_publish = request.kem_to_publish
-        logger.info("SWM: PublishKEMToSWM вызван для КЕП ID (предложенный): '{}'".format(kem_to_publish.id))
+        logger.info(f"SWM: PublishKEMToSWM called for KEM ID (suggested): '{kem_to_publish.id}'")
         kem_id_final = kem_to_publish.id
         if not kem_id_final:
             kem_id_final = str(uuid.uuid4()); kem_to_publish.id = kem_id_final
-            logger.info(f"SWM: ID не предоставлен, сгенерирован новый ID: '{kem_id_final}'")
+            logger.info(f"SWM: No ID provided, new ID generated: '{kem_id_final}'")
         ts = Timestamp(); ts.GetCurrentTime()
         existing_kem_in_cache = self._get_kem_from_cache(kem_id_final)
         if existing_kem_in_cache and existing_kem_in_cache.HasField("created_at"):
@@ -441,26 +440,26 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         kem_to_publish.updated_at.CopyFrom(ts)
         self._put_kem_to_cache(kem_to_publish)
         published_to_swm_flag = True; persistence_triggered_flag = False
-        status_msg = f"КЕП ID '{kem_id_final}' успешно опубликована в SWM."
+        status_msg = f"KEM ID '{kem_id_final}' successfully published to SWM."
         if request.persist_to_glm_if_new_or_updated:
             if not self.glm_stub:
-                msg_glm = f"GLM сервис недоступен, КЕП ID '{kem_id_final}' не будет сохранена."
+                msg_glm = f"GLM service unavailable, KEM ID '{kem_id_final}' will not be persisted."
                 logger.error(msg_glm); status_msg += " " + msg_glm
             else:
                 try:
-                    logger.info(f"SWM: Инициирование сохранения КЕП ID '{kem_id_final}' в GLM (с retry)...")
+                    logger.info(f"SWM: Initiating persistence of KEM ID '{kem_id_final}' to GLM (with retry)...")
                     glm_store_req = glm_service_pb2.StoreKEMRequest(kem=kem_to_publish)
                     glm_store_resp = self._glm_store_kem_with_retry(glm_store_req, timeout=10)
                     if glm_store_resp and glm_store_resp.kem and glm_store_resp.kem.id:
                         self._put_kem_to_cache(glm_store_resp.kem)
                         kem_id_final = glm_store_resp.kem.id
-                        status_msg += f" Успешно сохранено/обновлено в GLM с ID '{kem_id_final}'."
+                        status_msg += f" Successfully persisted/updated in GLM with ID '{kem_id_final}'."
                         persistence_triggered_flag = True
                     else:
-                        msg_glm_err = f"GLM.StoreKEM не вернул ответ для КЕП ID '{kem_id_final}'."
+                        msg_glm_err = f"GLM.StoreKEM did not return an expected response for KEM ID '{kem_id_final}'."
                         logger.error(msg_glm_err); status_msg += " " + msg_glm_err
                 except Exception as e:
-                    msg_glm_rpc_err = f"Ошибка при сохранении КЕП ID '{kem_id_final}' в GLM: {e}"
+                    msg_glm_rpc_err = f"Error persisting KEM ID '{kem_id_final}' to GLM: {e}"
                     logger.error(msg_glm_rpc_err, exc_info=True); status_msg += " " + msg_glm_rpc_err
         return swm_service_pb2.PublishKEMToSWMResponse(
             kem_id=kem_id_final, published_to_swm=published_to_swm_flag,
@@ -468,44 +467,44 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
     def SubscribeToSWMEvents(self, request: swm_service_pb2.SubscribeToSWMEventsRequest, context):
         agent_id = request.agent_id
-        logger.info(f"SWM: Новый подписчик {agent_id} на темы: {request.topics}")
+        logger.info(f"SWM: New subscriber {agent_id} for topics: {request.topics}")
         subscriber_id = agent_id if agent_id else str(uuid.uuid4())
         event_q = queue.Queue(maxsize=100)
         subscriber_info = SubscriberInfo(event_queue=event_q, topics=list(request.topics))
         with self.subscribers_lock:
-            if subscriber_id in self.subscribers: logger.warning(f"Подписчик с ID '{subscriber_id}' уже существует. Старая подписка будет заменена новой.")
+            if subscriber_id in self.subscribers: logger.warning(f"Subscriber with ID '{subscriber_id}' already exists. Old subscription will be replaced.")
             self.subscribers[subscriber_id] = subscriber_info
-            logger.info(f"SWM: Новый подписчик '{subscriber_id}' зарегистрирован с {len(subscriber_info.topics)} топиками/фильтрами. Всего подписчиков: {len(self.subscribers)}")
+            logger.info(f"SWM: New subscriber '{subscriber_id}' registered with {len(subscriber_info.topics)} topics/filters. Total subscribers: {len(self.subscribers)}")
         try:
             while context.is_active():
                 try: yield event_q.get(timeout=1.0)
                 except queue.Empty: continue
                 except grpc.RpcError as rpc_error:
-                    logger.info(f"SWM: RPC ошибка для подписчика '{subscriber_id}': {rpc_error.code()} - {rpc_error.details()}. Завершение стрима.")
+                    logger.info(f"SWM: RPC error for subscriber '{subscriber_id}': {rpc_error.code()} - {rpc_error.details()}. Terminating stream.")
                     break
-                except Exception as e: logger.error(f"SWM: Ошибка в стриме для подписчика '{subscriber_id}': {e}", exc_info=True); break
+                except Exception as e: logger.error(f"SWM: Error in event stream for subscriber '{subscriber_id}': {e}", exc_info=True); break
         finally:
             with self.subscribers_lock:
                 removed_info = self.subscribers.pop(subscriber_id, None)
                 if removed_info:
-                    logger.info(f"SWM: Подписчик '{subscriber_id}' удален. Осталось подписчиков: {len(self.subscribers)}")
+                    logger.info(f"SWM: Subscriber '{subscriber_id}' removed. Remaining subscribers: {len(self.subscribers)}")
                     while not removed_info.event_queue.empty():
                         try: removed_info.event_queue.get_nowait()
                         except queue.Empty: break
-                else: logger.warning(f"SWM: Попытка удалить несуществующего подписчика '{subscriber_id}'.")
+                else: logger.warning(f"SWM: Attempted to remove non-existent subscriber '{subscriber_id}'.")
 
     def __del__(self):
-        logger.info("SWM: Завершение работы SharedWorkingMemoryServiceImpl...")
+        logger.info("SWM: Shutting down SharedWorkingMemoryServiceImpl...")
         self._stop_expired_lock_cleanup_thread()
         if self.glm_channel:
             self.glm_channel.close()
-            logger.info("Канал GLM клиента в SWM закрыт.")
+            logger.info("GLM client channel in SWM closed.")
 
     # --- RPC Lock Implementations ---
     def AcquireLock(self, request: swm_service_pb2.AcquireLockRequest, context) -> swm_service_pb2.AcquireLockResponse:
         resource_id = request.resource_id; agent_id = request.agent_id
         timeout_ms = request.timeout_ms; lease_duration_ms = request.lease_duration_ms
-        logger.info(f"SWM: Запрос AcquireLock для resource='{resource_id}' от agent='{agent_id}', timeout={timeout_ms}ms, lease={lease_duration_ms}ms")
+        logger.info(f"SWM: AcquireLock request for resource='{resource_id}' by agent='{agent_id}', timeout={timeout_ms}ms, lease={lease_duration_ms}ms")
         start_time_monotonic = time.monotonic()
         with self.lock_condition:
             while True:
@@ -513,7 +512,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                 existing_lock = self.locks.get(resource_id)
                 if existing_lock and existing_lock.lease_duration_ms > 0 and \
                    current_time_ms >= existing_lock.lease_expires_at_unix_ms:
-                    logger.info(f"SWM: Существующая блокировка для resource='{resource_id}' агентом '{existing_lock.agent_id}' истекла. Удаление.")
+                    logger.info(f"SWM: Existing lock for resource='{resource_id}' by agent '{existing_lock.agent_id}' has expired. Removing.")
                     del self.locks[resource_id]; existing_lock = None
                     self.lock_condition.notify_all()
                 if not existing_lock:
@@ -521,68 +520,68 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                     expires_at = acquired_at + lease_duration_ms if lease_duration_ms > 0 else 0
                     new_lock_info = LockInfoInternal(resource_id, agent_id, new_lock_id, acquired_at, lease_duration_ms, expires_at)
                     self.locks[resource_id] = new_lock_info
-                    logger.info(f"SWM: Ресурс '{resource_id}' успешно заблокирован агентом '{agent_id}'. Lock ID: {new_lock_id}, Lease expires at: {expires_at if expires_at > 0 else 'never'}")
-                    return swm_service_pb2.AcquireLockResponse(resource_id, agent_id, swm_service_pb2.LockStatusValue.ACQUIRED, new_lock_id, acquired_at, expires_at, "Блокировка успешно получена.")
+                    logger.info(f"SWM: Resource '{resource_id}' successfully locked by agent '{agent_id}'. Lock ID: {new_lock_id}, Lease expires at: {expires_at if expires_at > 0 else 'never'}")
+                    return swm_service_pb2.AcquireLockResponse(resource_id, agent_id, swm_service_pb2.LockStatusValue.ACQUIRED, new_lock_id, acquired_at, expires_at, "Lock successfully acquired.")
                 if existing_lock.agent_id == agent_id:
-                    logger.info(f"SWM: Ресурс '{resource_id}' уже заблокирован этим же агентом '{agent_id}'.")
+                    logger.info(f"SWM: Resource '{resource_id}' is already locked by the same agent '{agent_id}'.")
                     if lease_duration_ms > 0:
                         existing_lock.lease_expires_at_unix_ms = current_time_ms + lease_duration_ms
                         existing_lock.lease_duration_ms = lease_duration_ms
-                        logger.info(f"SWM: Lease для '{resource_id}' обновлен. Истекает в: {existing_lock.lease_expires_at_unix_ms}")
+                        logger.info(f"SWM: Lease for '{resource_id}' updated. Expires at: {existing_lock.lease_expires_at_unix_ms}")
                     elif lease_duration_ms == 0 and existing_lock.lease_duration_ms > 0 :
                          existing_lock.lease_expires_at_unix_ms = 0; existing_lock.lease_duration_ms = 0
-                         logger.info(f"SWM: Lease для '{resource_id}' снят.")
-                    return swm_service_pb2.AcquireLockResponse(resource_id, agent_id, swm_service_pb2.LockStatusValue.ALREADY_HELD_BY_YOU, existing_lock.lock_id, existing_lock.acquired_at_unix_ms, existing_lock.lease_expires_at_unix_ms, "Блокировка уже удерживается вами.")
+                         logger.info(f"SWM: Lease for '{resource_id}' removed (now held until explicit release).")
+                    return swm_service_pb2.AcquireLockResponse(resource_id, agent_id, swm_service_pb2.LockStatusValue.ALREADY_HELD_BY_YOU, existing_lock.lock_id, existing_lock.acquired_at_unix_ms, existing_lock.lease_expires_at_unix_ms, "Lock already held by you.")
                 if timeout_ms == 0:
-                    logger.info(f"SWM: Ресурс '{resource_id}' заблокирован агентом '{existing_lock.agent_id}'. timeout_ms=0, отказ для '{agent_id}'.")
-                    return swm_service_pb2.AcquireLockResponse(resource_id, agent_id, swm_service_pb2.LockStatusValue.NOT_AVAILABLE, message=f"Ресурс заблокирован агентом {existing_lock.agent_id}.")
+                    logger.info(f"SWM: Resource '{resource_id}' is locked by agent '{existing_lock.agent_id}'. timeout_ms=0, denying for '{agent_id}'.")
+                    return swm_service_pb2.AcquireLockResponse(resource_id, agent_id, swm_service_pb2.LockStatusValue.NOT_AVAILABLE, message=f"Resource is locked by agent {existing_lock.agent_id}.")
                 elapsed_monotonic_ms = (time.monotonic() - start_time_monotonic) * 1000
                 wait_timeout_sec: typing.Optional[float]
                 if timeout_ms < 0: wait_timeout_sec = None
                 else:
                     remaining_timeout_ms = timeout_ms - elapsed_monotonic_ms
                     if remaining_timeout_ms <= 0:
-                        logger.info(f"SWM: Общий таймаут ({timeout_ms}ms) истек для resource='{resource_id}', агент '{agent_id}'.")
-                        return swm_service_pb2.AcquireLockResponse(resource_id, agent_id, swm_service_pb2.LockStatusValue.TIMEOUT, message="Время ожидания блокировки истекло.")
+                        logger.info(f"SWM: Overall timeout ({timeout_ms}ms) expired for resource='{resource_id}', agent '{agent_id}'.")
+                        return swm_service_pb2.AcquireLockResponse(resource_id, agent_id, swm_service_pb2.LockStatusValue.TIMEOUT, message="Lock acquisition timed out.")
                     wait_timeout_sec = remaining_timeout_ms / 1000.0
-                logger.debug(f"SWM: Агент '{agent_id}' ожидает блокировку '{resource_id}'. Wait timeout sec: {wait_timeout_sec}")
+                logger.debug(f"SWM: Agent '{agent_id}' waiting for lock on '{resource_id}'. Wait timeout sec: {wait_timeout_sec}")
                 if not self.lock_condition.wait(timeout=wait_timeout_sec):
-                    logger.info(f"SWM: Таймаут ({wait_timeout_sec}s) ожидания на condition истек для resource='{resource_id}', агент '{agent_id}'.")
-                logger.debug(f"SWM: Агент '{agent_id}' пробудился от ожидания блокировки '{resource_id}'. Перепроверка...")
+                    logger.info(f"SWM: Condition wait timeout ({wait_timeout_sec}s) for resource='{resource_id}', agent '{agent_id}'.")
+                logger.debug(f"SWM: Agent '{agent_id}' awakened for lock on '{resource_id}'. Re-checking...")
 
     def ReleaseLock(self, request: swm_service_pb2.ReleaseLockRequest, context) -> swm_service_pb2.ReleaseLockResponse:
         resource_id = request.resource_id; agent_id = request.agent_id; lock_id_from_request = request.lock_id
-        logger.info(f"SWM: Запрос ReleaseLock для resource='{resource_id}' от agent='{agent_id}', lock_id_req='{lock_id_from_request}'")
+        logger.info(f"SWM: ReleaseLock request for resource='{resource_id}' by agent='{agent_id}', lock_id_req='{lock_id_from_request}'")
         with self.lock_condition:
             existing_lock = self.locks.get(resource_id)
             if not existing_lock:
-                logger.warning(f"SWM: Попытка освободить несуществующую блокировку для resource='{resource_id}'.")
-                return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.NOT_HELD, "Блокировка для ресурса не найдена.")
+                logger.warning(f"SWM: Attempt to release a non-existent lock for resource='{resource_id}'.")
+                return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.NOT_HELD, "Lock for resource not found.")
             current_time_ms = int(time.time() * 1000)
             if existing_lock.lease_duration_ms > 0 and current_time_ms >= existing_lock.lease_expires_at_unix_ms:
-                logger.info(f"SWM: Блокировка для resource='{resource_id}' (агент '{existing_lock.agent_id}') уже истекла при попытке ReleaseLock. Удаление.")
+                logger.info(f"SWM: Lock for resource='{resource_id}' (agent '{existing_lock.agent_id}') already expired before ReleaseLock attempt. Removing.")
                 del self.locks[resource_id]; self.lock_condition.notify_all()
-                return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.NOT_HELD, "Блокировка истекла до попытки освобождения.")
+                return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.NOT_HELD, "Lock expired before release attempt.")
             if existing_lock.agent_id != agent_id:
-                logger.warning(f"SWM: Агент '{agent_id}' пытается освободить блокировку для resource='{resource_id}', удерживаемую агентом '{existing_lock.agent_id}'. Отказ.")
-                return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.ERROR_RELEASING, "Блокировка удерживается другим агентом.")
+                logger.warning(f"SWM: Agent '{agent_id}' attempting to release lock for resource='{resource_id}' held by agent '{existing_lock.agent_id}'. Denied.")
+                return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.ERROR_RELEASING, "Lock held by another agent.")
             if lock_id_from_request and existing_lock.lock_id != lock_id_from_request:
-                logger.warning(f"SWM: Неверный lock_id ('{lock_id_from_request}') при попытке освободить блокировку resource='{resource_id}' (ожидался '{existing_lock.lock_id}'). Отказ.")
-                return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.INVALID_LOCK_ID, "Неверный ID блокировки.")
+                logger.warning(f"SWM: Invalid lock_id ('{lock_id_from_request}') for ReleaseLock on resource='{resource_id}' (expected '{existing_lock.lock_id}'). Denied.")
+                return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.INVALID_LOCK_ID, "Invalid lock ID.")
             del self.locks[resource_id]
-            logger.info(f"SWM: Блокировка для resource='{resource_id}' успешно освобождена агентом '{agent_id}'. Уведомление ожидающих.")
+            logger.info(f"SWM: Lock for resource='{resource_id}' successfully released by agent '{agent_id}'. Notifying waiters.")
             self.lock_condition.notify_all()
-            return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.RELEASED, "Блокировка успешно освобождена.")
+            return swm_service_pb2.ReleaseLockResponse(resource_id, swm_service_pb2.ReleaseStatusValue.RELEASED, "Lock successfully released.")
 
     def GetLockInfo(self, request: swm_service_pb2.GetLockInfoRequest, context) -> swm_service_pb2.LockInfo:
         resource_id = request.resource_id
-        logger.debug(f"SWM: Запрос GetLockInfo для resource='{resource_id}'")
+        logger.debug(f"SWM: GetLockInfo request for resource='{resource_id}'")
         with self.lock_condition:
             current_time_ms = int(time.time() * 1000)
             lock_data = self.locks.get(resource_id)
             if lock_data:
                 if lock_data.lease_duration_ms > 0 and current_time_ms >= lock_data.lease_expires_at_unix_ms:
-                    logger.info(f"SWM (GetLockInfo): Блокировка для resource='{resource_id}' (агент '{lock_data.agent_id}') истекла. Удаление.")
+                    logger.info(f"SWM (GetLockInfo): Lock for resource='{resource_id}' (agent '{lock_data.agent_id}') has expired. Removing.")
                     del self.locks[resource_id]; lock_data = None; self.lock_condition.notify_all()
             if lock_data:
                 return swm_service_pb2.LockInfo(resource_id, True, lock_data.agent_id, lock_data.lock_id, lock_data.acquired_at_unix_ms, lock_data.lease_expires_at_unix_ms if lock_data.lease_duration_ms > 0 else 0)
@@ -592,52 +591,56 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
     # --- RPC Distributed Counter Implementations ---
     def IncrementCounter(self, request: swm_service_pb2.IncrementCounterRequest, context) -> swm_service_pb2.CounterValueResponse:
         counter_id = request.counter_id; increment_by = request.increment_by
-        logger.info(f"SWM: Запрос IncrementCounter для counter_id='{counter_id}', increment_by={increment_by}")
-        if not counter_id: context.abort(grpc.StatusCode.INVALID_ARGUMENT, "counter_id не может быть пустым.")
+        logger.info(f"SWM: IncrementCounter request for counter_id='{counter_id}', increment_by={increment_by}")
+        if not counter_id: context.abort(grpc.StatusCode.INVALID_ARGUMENT, "counter_id cannot be empty.")
         with self.counters_lock:
             current_value = self.counters.get(counter_id, 0)
             new_value = current_value + increment_by
             self.counters[counter_id] = new_value
-            logger.info(f"SWM: Счетчик '{counter_id}' обновлен. Старое значение: {current_value}, Новое значение: {new_value}")
-            return swm_service_pb2.CounterValueResponse(counter_id, new_value, "Счетчик успешно обновлен.")
+            logger.info(f"SWM: Counter '{counter_id}' updated. Old value: {current_value}, New value: {new_value}")
+            return swm_service_pb2.CounterValueResponse(counter_id, new_value, "Counter successfully updated.")
 
     def GetCounter(self, request: swm_service_pb2.DistributedCounterRequest, context) -> swm_service_pb2.CounterValueResponse:
         counter_id = request.counter_id
-        logger.info(f"SWM: Запрос GetCounter для counter_id='{counter_id}'")
-        if not counter_id: context.abort(grpc.StatusCode.INVALID_ARGUMENT, "counter_id не может быть пустым.")
+        logger.info(f"SWM: GetCounter request for counter_id='{counter_id}'")
+        if not counter_id: context.abort(grpc.StatusCode.INVALID_ARGUMENT, "counter_id cannot be empty.")
         with self.counters_lock:
             current_value = self.counters.get(counter_id)
             if current_value is None:
-                logger.warning(f"SWM: Счетчик '{counter_id}' не найден.")
-                return swm_service_pb2.CounterValueResponse(counter_id, 0, f"Счетчик '{counter_id}' не найден, возвращено значение по умолчанию 0.")
+                logger.warning(f"SWM: Counter '{counter_id}' not found.")
+                return swm_service_pb2.CounterValueResponse(counter_id, 0, f"Counter '{counter_id}' not found, returned default value 0.")
             else:
-                logger.info(f"SWM: Счетчик '{counter_id}', текущее значение: {current_value}")
-                return swm_service_pb2.CounterValueResponse(counter_id, current_value, "Значение счетчика успешно получено.")
+                logger.info(f"SWM: Counter '{counter_id}', current value: {current_value}")
+                return swm_service_pb2.CounterValueResponse(counter_id, current_value, "Counter value successfully retrieved.")
 
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    # Создаем экземпляр сервисера один раз
+    servicer_instance = SharedWorkingMemoryServiceImpl()
     swm_service_pb2_grpc.add_SharedWorkingMemoryServiceServicer_to_server(
-        SharedWorkingMemoryServiceImpl(), server
+        servicer_instance, server
     )
     server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Запуск SWM (Shared Working Memory Service) на {config.GRPC_LISTEN_ADDRESS}...")
+    logger.info(f"Starting SWM (Shared Working Memory Service) on {config.GRPC_LISTEN_ADDRESS}...")
     server.start()
-    logger.info(f"SWM запущен и ожидает соединений на {config.GRPC_LISTEN_ADDRESS}.")
+    logger.info(f"SWM started and listening on {config.GRPC_LISTEN_ADDRESS}.")
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:
-        logger.info("Остановка SWM...")
+        logger.info("Stopping SWM (KeyboardInterrupt)...")
     finally:
-        # Попытка корректно остановить фоновый поток перед выходом
-        servicer_instance = None # Не можем получить ссылку на инстанс здесь легко
-                               # Вместо этого, остановка должна быть частью server.stop() или server.shutdown()
-        # или сам servicer должен иметь метод stop(), вызываемый извне.
-        # Пока что daemon=True на потоке обеспечит его завершение с программой.
-        # Если бы мы хотели явного join:
-        # if hasattr(server, '_servicer') and hasattr(server._servicer, '_stop_expired_lock_cleanup_thread'):
-        #     server._servicer._stop_expired_lock_cleanup_thread()
-        server.stop(None) # graceful stop
-        logger.info("SWM остановлен.")
+        logger.info("SWM: Initiating graceful shutdown...")
+        # Уведомляем фоновый поток об остановке
+        servicer_instance._stop_expired_lock_cleanup_thread() # Вызываем метод остановки у нашего инстанса
+        # Даем время потоку завершиться, если он был в wait()
+        if servicer_instance._lock_cleanup_thread and servicer_instance._lock_cleanup_thread.is_alive():
+             logger.info("SWM: Waiting for lock cleanup thread to finish...")
+             servicer_instance._lock_cleanup_thread.join(timeout=servicer_instance._lock_cleanup_interval_seconds + 1)
+             if servicer_instance._lock_cleanup_thread.is_alive():
+                 logger.warning("SWM: Lock cleanup thread did not finish in time.")
+
+        server.stop(grace=5) # Даем 5 секунд на завершение активных RPC
+        logger.info("SWM stopped.")
 
 if __name__ == '__main__':
     serve()

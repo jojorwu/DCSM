@@ -1,153 +1,178 @@
 # dcsm_agent_sdk_python/example.py
 import sys
 import os
-import grpc # Импортируем grpc для обработки RpcError
+import grpc # Import grpc for RpcError handling
 import time
+import logging # For logging within the example
+import typing # For Optional type hint
 
-# --- Начало блока для корректного импорта sdk ---
-# Добавляем родительскую директорию dcsm_agent_sdk_python в sys.path,
-# если example.py запускается напрямую изнутри этой директории.
-# Это позволяет импортировать 'sdk' как модуль.
-# В реальном использовании, пакет dcsm_agent_sdk_python должен быть установлен
-# или его родительская директория должна быть в PYTHONPATH.
-
+# --- Start of SDK import block ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-# Если dcsm_agent_sdk_python - это пакет, и мы хотим импортировать из него,
-# то родительская директория dcsm_agent_sdk_python должна быть в sys.path.
-# Для запуска example.py из dcsm_agent_sdk_python, мы можем сделать так:
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
-     sys.path.insert(0, project_root) # Добавляет родителя dcsm_agent_sdk_python
+     sys.path.insert(0, project_root)
 
-# Теперь пробуем импортировать AgentSDK
 try:
     from dcsm_agent_sdk_python.sdk import AgentSDK
+    from dcsm_agent_sdk_python.generated_grpc_code import swm_service_pb2 as common_swm_pb2 # For SWM enums
 except ImportError:
-    # Если предыдущий импорт не удался (например, запускаем example.py напрямую из его директории)
-    # пробуем импортировать sdk как локальный модуль (если sdk.py в той же директории)
-    print("Не удалось импортировать 'from dcsm_agent_sdk_python.sdk import AgentSDK', пробую 'from sdk import AgentSDK'")
+    # Fallback for direct execution if the above fails
+    logging.warning("Could not import 'from dcsm_agent_sdk_python.sdk import AgentSDK', trying 'from sdk import AgentSDK'")
     from sdk import AgentSDK
-# --- Конец блока для корректного импорта sdk ---
+    from generated_grpc_code import swm_service_pb2 as common_swm_pb2
 
+logger = logging.getLogger("AgentSDKExample")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# --- End of SDK import block ---
 
 def run_example():
-    print("Запуск расширенного примера AgentSDK...")
-    print("Убедитесь, что GLM сервер запущен на localhost:50051 для этого примера.")
-    print("Для реального выполнения установите переменную окружения RUN_SDK_EXAMPLE=true")
+    logger.info("Starting comprehensive AgentSDK example...")
+    logger.info("Ensure GLM and SWM servers are running (e.g., on localhost:50051 and localhost:50053).")
+    logger.info("To actually run network-dependent parts, set environment variable RUN_SDK_EXAMPLE=true")
 
-    sdk_instance = None # Для использования в блоке finally
-    glm_server_address = 'localhost:50051'
+    sdk_instance: typing.Optional[AgentSDK] = None
+    glm_server_address = os.getenv("DCSM_GLM_ADDRESS", 'localhost:50051')
+    swm_server_address = os.getenv("DCSM_SWM_ADDRESS", 'localhost:50053')
 
     if os.getenv("RUN_SDK_EXAMPLE") != "true":
-        print("Переменная окружения RUN_SDK_EXAMPLE не установлена в 'true'. Пример не будет подключаться к серверу.")
-        print("Для демонстрации будут вызваны только локальные части SDK, если это возможно.")
-        # Можно добавить сюда вызовы sdk.local_memory для демонстрации без сервера
-        sdk_instance = AgentSDK(glm_server_address=glm_server_address, lpa_max_size=5)
-        sdk_instance.local_memory.put("local_test_001", {"id":"local_test_001", "data":"test"})
-        print("Локальная память содержит local_test_001: {}".format(sdk_instance.local_memory.get("local_test_001")))
-        sdk_instance.close() # Закрываем, даже если не подключались, для консистентности
+        logger.warning("RUN_SDK_EXAMPLE environment variable not set to 'true'. Example will not connect to servers.")
+        logger.info("Only local SDK parts (like LocalAgentMemory) might be demonstrated if possible without server.")
+        sdk_instance = AgentSDK(glm_server_address=glm_server_address, swm_server_address=swm_server_address, lpa_max_size=5, connect_on_init=False)
+        sdk_instance.local_memory.put("local_test_001", {"id":"local_test_001", "data":"test_content"})
+        logger.info(f"Local Agent Memory contains local_test_001: {sdk_instance.local_memory.get('local_test_001')}")
+        sdk_instance.close()
         return
 
     try:
-        # Используем контекстный менеджер для SDK
-        with AgentSDK(glm_server_address=glm_server_address, lpa_max_size=5) as sdk:
-            sdk_instance = sdk # Сохраняем для блока finally
+        with AgentSDK(glm_server_address=glm_server_address, swm_server_address=swm_server_address, lpa_max_size=5, connect_on_init=True) as sdk:
+            sdk_instance = sdk
 
-            # 1. Очистим ЛПА для чистоты эксперимента
             sdk.local_memory.clear()
-            print("\\n--- ЛПА очищена ---")
+            logger.info("\n--- Local Agent Memory (LAM) cleared ---")
 
-            # 2. Данные для КЕП
-            kems_data = [
-                {"id": "ex_sdk_001", "content_type": "text/plain", "content": "Первая КЕП для примера SDK.", "metadata": {"tag": "example", "version": 1}},
-                {"id": "ex_sdk_002", "content_type": "application/json", "content": '{"message": "Вторая КЕП"}', "metadata": {"tag": "example", "format": "json"}, "embeddings": [0.1,0.1]},
-                {"id": "ex_sdk_003", "content_type": "text/plain", "content": "Третья КЕП, будет удалена.", "metadata": {"tag": "temp"}},
+            kems_data_glm = [
+                {"id": "ex_sdk_glm_001", "content_type": "text/plain", "content": "First KEM for GLM.", "metadata": {"tag": "glm_example", "version": 1}},
+                {"id": "ex_sdk_glm_002", "content_type": "application/json", "content": '{"message": "Second GLM KEM"}', "metadata": {"tag": "glm_example", "format": "json"}, "embeddings": [0.1,0.1,0.1]},
+                {"id": "ex_sdk_glm_003", "content_type": "text/plain", "content": "Third GLM KEM, to be deleted.", "metadata": {"tag": "temp_glm"}},
             ]
 
-            # 3. Сохранение нескольких КЕП
-            print("\\n--- Сохранение нескольких КЕП ---")
-            stored_ids, count, errors = sdk.store_kems(kems_data)
-            if count and count > 0 and stored_ids:
-                print("Успешно сохранено {} КЕП. ID: {}".format(count, stored_ids))
-                for kem_id in stored_ids:
-                    assert sdk.local_memory.contains(kem_id), "КЕП {} должна быть в ЛПА после сохранения!".format(kem_id)
-            else:
-                print("Ошибка при сохранении КЕП: {}".format(errors if errors else "Нет информации"))
-                # Если сохранение не удалось, нет смысла продолжать тесты, зависящие от этих данных
-                if not (count and count > 0 and stored_ids) : return
+            logger.info("\n--- Storing multiple KEMs in GLM ---")
+            stored_kems_info, failed_refs_glm, error_msg_glm = sdk.store_kems(kems_data_glm)
 
+            successful_glm_ids = []
+            if stored_kems_info:
+                successful_glm_ids = [k['id'] for k in stored_kems_info]
+                logger.info(f"Successfully stored in GLM {len(successful_glm_ids)} KEMs. IDs: {successful_glm_ids}")
+                for kem_id_glm in successful_glm_ids:
+                    assert sdk.local_memory.contains(kem_id_glm), f"KEM {kem_id_glm} should be in LAM after GLM store!"
+            if failed_refs_glm: logger.error(f"Errors during GLM store (references): {failed_refs_glm}")
+            if error_msg_glm: logger.error(f"Overall error message from GLM store: {error_msg_glm}")
+            if not successful_glm_ids : logger.warning("GLM store failed, subsequent GLM tests might be affected.")
 
-            # 4. Получение одной из КЕП (должна быть взята из ЛПА)
-            print("\\n--- Получение ex_sdk_001 (из ЛПА) ---")
-            kem1_lpa = sdk.get_kem("ex_sdk_001")
-            if kem1_lpa:
-                print("Получена (ЛПА) ex_sdk_001: {}".format(kem1_lpa.get("content")))
-            else:
-                print("КЕП ex_sdk_001 не найдена в ЛПА, хотя должна была быть!")
+            if "ex_sdk_glm_001" in successful_glm_ids:
+                logger.info("\n--- Retrieving ex_sdk_glm_001 (from LAM) ---")
+                kem1_lpa = sdk.get_kem("ex_sdk_glm_001")
+                if kem1_lpa: logger.info(f"Retrieved (LAM) ex_sdk_glm_001: {kem1_lpa.get('content')}")
+                else: logger.error("KEM ex_sdk_glm_001 not found in LAM, though it should be!")
 
-            # 5. Принудительное получение той же КЕП с сервера
-            print("\\n--- Принудительное получение ex_sdk_001 (с сервера) ---")
-            kem1_remote = sdk.get_kem("ex_sdk_001", force_remote=True)
-            if kem1_remote:
-                print("Получена (сервер) ex_sdk_001: {}".format(kem1_remote.get("content")))
-            else:
-                print("КЕП ex_sdk_001 не найдена на сервере!")
+            if "ex_sdk_glm_001" in successful_glm_ids:
+                logger.info("\n--- Force retrieving ex_sdk_glm_001 (from GLM server) ---")
+                kem1_remote = sdk.get_kem("ex_sdk_glm_001", force_remote=True)
+                if kem1_remote: logger.info(f"Retrieved (GLM server) ex_sdk_glm_001: {kem1_remote.get('content')}")
+                else: logger.error("KEM ex_sdk_glm_001 not found on GLM server!")
 
-            # 6. Обновление КЕП ex_sdk_002
-            print("\\n--- Обновление ex_sdk_002 ---")
-            update_payload = {"metadata": {"tag": "example_updated", "format": "json_v2"}, "content": '{"message": "Обновленная вторая КЕП"}'}
-            updated_kem2 = sdk.update_kem("ex_sdk_002", update_payload)
-            if updated_kem2:
-                print("КЕП ex_sdk_002 обновлена. Новое содержимое: '{}', новые метаданные: {}".format(updated_kem2.get("content"), updated_kem2.get("metadata")))
-                kem2_lpa_after_update = sdk.local_memory.get("ex_sdk_002")
-                assert kem2_lpa_after_update and kem2_lpa_after_update.get("metadata", {}).get("format") == "json_v2", "Обновление ex_sdk_002 не отразилось в ЛПА!"
-                print("Проверка ЛПА для ex_sdk_002 после обновления прошла успешно.")
-            else:
-                print("Не удалось обновить ex_sdk_002.")
+            if "ex_sdk_glm_002" in successful_glm_ids:
+                logger.info("\n--- Updating ex_sdk_glm_002 in GLM ---")
+                update_payload_glm = {"metadata": {"tag": "glm_example_updated", "format": "json_v2"}, "content": '{"message": "Updated second GLM KEM"}'}
+                updated_kem2_glm = sdk.update_kem("ex_sdk_glm_002", update_payload_glm)
+                if updated_kem2_glm:
+                    logger.info(f"KEM ex_sdk_glm_002 updated. New content: '{updated_kem2_glm.get('content')}', new metadata: {updated_kem2_glm.get('metadata')}")
+                    kem2_lpa_after_update = sdk.local_memory.get("ex_sdk_glm_002")
+                    assert kem2_lpa_after_update and kem2_lpa_after_update.get("metadata", {}).get("format") == "json_v2", "Update of ex_sdk_glm_002 not reflected in LAM!"
+                    logger.info("LAM check for ex_sdk_glm_002 after GLM update successful.")
+                else: logger.error("Failed to update ex_sdk_glm_002 in GLM.")
 
-            # 7. Удаление КЕП ex_sdk_003
-            print("\\n--- Удаление ex_sdk_003 ---")
-            deleted = sdk.delete_kem("ex_sdk_003")
-            if deleted:
-                print("КЕП ex_sdk_003 успешно удалена.")
-                assert not sdk.local_memory.contains("ex_sdk_003"), "КЕП ex_sdk_003 все еще в ЛПА!"
-                assert sdk.get_kem("ex_sdk_003") is None, "Удаленная КЕП ex_sdk_003 все еще получается через get_kem!"
-                print("Проверки удаления для ex_sdk_003 прошли успешно.")
-            else:
-                print("Не удалось удалить ex_sdk_003.")
+            if "ex_sdk_glm_003" in successful_glm_ids:
+                logger.info("\n--- Deleting ex_sdk_glm_003 from GLM ---")
+                deleted_glm = sdk.delete_kem("ex_sdk_glm_003")
+                if deleted_glm:
+                    logger.info("KEM ex_sdk_glm_003 successfully deleted from GLM.")
+                    assert not sdk.local_memory.contains("ex_sdk_glm_003"), "KEM ex_sdk_glm_003 still in LAM!"
+                    assert sdk.get_kem("ex_sdk_glm_003") is None, "Deleted KEM ex_sdk_glm_003 still retrievable via get_kem!"
+                    logger.info("Deletion checks for ex_sdk_glm_003 passed.")
+                else: logger.error("Failed to delete ex_sdk_glm_003 from GLM.")
 
-            # 8. Демонстрация LRU в ЛПА (размер ЛПА = 5)
-            print("\\n--- Демонстрация LRU в ЛПА (max_size=5) ---")
+            logger.info("\n--- Demonstrating LRU in LAM (max_size=5) ---")
+            sdk.local_memory.clear()
             for i in range(1, 7):
-                kem_id = "kem_lru_{}".format(i)
-                sdk.local_memory.put(kem_id, {"id": kem_id, "content": "LRU test {}".format(i)})
+                kem_id_lru = f"kem_lru_{i}"
+                sdk.local_memory.put(kem_id_lru, {"id": kem_id_lru, "content": f"LRU test {i}"})
+            logger.info(f"LAM size after adding 6 items (max 5): {sdk.local_memory.current_size}")
+            assert sdk.local_memory.current_size == 5, "LAM size does not match max_size."
+            assert not sdk.local_memory.contains("kem_lru_1"), "kem_lru_1 (oldest) should have been evicted."
+            assert sdk.local_memory.contains("kem_lru_2"), "kem_lru_2 should be in LAM."
+            assert sdk.local_memory.contains("kem_lru_6"), "kem_lru_6 (newest) should be in LAM."
+            logger.info("LRU checks in LAM passed.")
 
-            print("Размер ЛПА после добавления 6 элементов (max 5): {}".format(sdk.local_memory.current_size))
-            assert sdk.local_memory.current_size == 5, "Размер ЛПА не соответствует max_size."
-            assert not sdk.local_memory.contains("kem_lru_1"), "kem_lru_1 (самая старая) должна была быть вытеснена."
-            assert sdk.local_memory.contains("kem_lru_2"), "kem_lru_2 должна быть в ЛПА."
-            assert sdk.local_memory.contains("kem_lru_6"), "kem_lru_6 (самая новая) должна быть в ЛПА."
-            print("Проверки LRU в ЛПА прошли успешно.")
+            logger.info("\n--- Testing SWM functions ---")
+            kems_to_pub_swm = [
+                {"id": "sdk_swm_pub_001", "content": "SWM pub 1", "metadata": {"tag": "swm_batch_example"}},
+                {"id": "sdk_swm_pub_002", "content": "SWM pub 2", "metadata": {"tag": "swm_batch_example"}}
+            ]
+            s_pubs, f_pubs = sdk.publish_kems_to_swm_batch(kems_to_pub_swm, persist_to_glm=False)
+            logger.info(f"SWM Batch Publish: Success {len(s_pubs)}, Failed {len(f_pubs)}")
+            assert len(s_pubs) == len(kems_to_pub_swm); assert len(f_pubs) == 0
 
-            print("\\n--- Пример завершен успешно! ---")
+            time.sleep(0.5)
+            sdk.local_memory.clear()
+            loaded_kems_from_swm = sdk.load_kems_to_lpa_from_swm({"metadata_filters": {"tag": "swm_batch_example"}}, max_kems_to_load=5)
+            logger.info(f"Loaded from SWM to LAM: {len(loaded_kems_from_swm)} KEMs.")
+            assert len(loaded_kems_from_swm) == len(kems_to_pub_swm)
+            for lk_swm in loaded_kems_from_swm:
+                logger.info(f"  LAM: {lk_swm.get('id')} - {lk_swm.get('content')}")
+                assert sdk.local_memory.contains(lk_swm.get('id'))
+
+            counter_id_example = "sdk_example_counter"
+            logger.info(f"Initial value of counter '{counter_id_example}': {sdk.get_distributed_counter(counter_id_example)}")
+            sdk.increment_distributed_counter(counter_id_example, 3)
+            logger.info(f"Value of counter '{counter_id_example}' after +3: {sdk.get_distributed_counter(counter_id_example)}")
+            assert sdk.get_distributed_counter(counter_id_example) == 3
+            sdk.increment_distributed_counter(counter_id_example, -1)
+            logger.info(f"Value of counter '{counter_id_example}' after -1: {sdk.get_distributed_counter(counter_id_example)}")
+            assert sdk.get_distributed_counter(counter_id_example) == 2
+
+            res_id_example = "sdk_shared_resource_example"
+            agent_example_id = "sdk_example_agent"
+            logger.info(f"Attempting lock on '{res_id_example}' by agent '{agent_example_id}'...")
+            with sdk.distributed_lock(res_id_example, agent_example_id, acquire_timeout_ms=1000, lease_duration_ms=10000) as lock_resp_example:
+                if lock_resp_example and lock_resp_example.status == common_swm_pb2.LockStatusValue.ACQUIRED:
+                    logger.info(f"Lock '{res_id_example}' acquired by agent '{agent_example_id}'. Lock ID: {lock_resp_example.lock_id}")
+                    time.sleep(0.5)
+                    logger.info(f"Work on resource '{res_id_example}' finished.")
+                else:
+                    status_name_example = common_swm_pb2.LockStatusValue.Name(lock_resp_example.status) if lock_resp_example else "N/A"
+                    logger.warning(f"Failed to acquire lock '{res_id_example}'. Status: {status_name_example}")
+            logger.info(f"Lock '{res_id_example}' should be released.")
+            lock_info_after = sdk.get_distributed_lock_info(res_id_example)
+            assert lock_info_after is not None and not lock_info_after.is_locked, "Lock was not released by context manager!"
+
+            logger.info("\n--- AgentSDK Example Run Successfully Completed! ---")
 
     except grpc.RpcError as e:
-        print("!!!!!!!!!! gRPC ОШИБКА !!!!!!!!!")
-        print("Не удалось подключиться к GLM серверу или произошла другая ошибка gRPC.")
-        if sdk_instance and sdk_instance.glm_client:
-             print("Адрес сервера: {}".format(sdk_instance.glm_client.server_address))
-        else:
-             print("Адрес сервера: {}".format(glm_server_address))
-        print("Пожалуйста, убедитесь, что GLM сервер запущен.")
-        print("Код ошибки: {}".format(e.code()))
-        print("Детали: {}".format(e.details()))
+        logger.error(f"!!!!!!!!!! gRPC ERROR !!!!!!!!!")
+        logger.error(f"Failed to connect to GLM/SWM server or other gRPC error occurred.")
+        if sdk_instance:
+            if sdk_instance.glm_client: logger.error(f"GLM Server Address: {sdk_instance.glm_client.server_address}")
+            if sdk_instance.swm_client: logger.error(f"SWM Server Address: {sdk_instance.swm_client.server_address}")
+        logger.error("Please ensure GLM and SWM servers are running.")
+        logger.error(f"Error Code: {e.code()}")
+        logger.error(f"Details: {e.details()}", exc_info=True)
     except Exception as e:
-        print("Произошла непредвиденная ошибка в примере: {}".format(e))
+        logger.error(f"An unexpected error occurred in the example: {e}", exc_info=True)
         import traceback
         traceback.print_exc()
-    # Блок finally не нужен, так как используется контекстный менеджер 'with AgentSDK(...)'
 
 if __name__ == '__main__':
     run_example()
+
+```

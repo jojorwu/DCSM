@@ -3,99 +3,99 @@ syntax = "proto3";
 package dcsm;
 
 import "kem.proto";
-import "glm_service.proto"; // Для KEMQuery, если мы его переиспользуем
+import "glm_service.proto"; // For KEMQuery, if reused
 import "google/protobuf/timestamp.proto";
 
-option go_package = "github.com/your_org/dcsm_protos/gen/go/swm;swm_service_pb";
+option go_package = "github.com/your_org/dcsm_protos/gen/go/swm;swm_service_pb"; // Example Go package option
 
-// Сервис Общей Рабочей Памяти (Shared Working Memory Service)
+// Shared Working Memory Service (SWM)
 service SharedWorkingMemoryService {
-  // Публикует КЕП в SWM. Может также инициировать сохранение/обновление в GLM.
+  // Publishes a KEM to SWM. May also initiate persistence/update in GLM.
   rpc PublishKEMToSWM(PublishKEMToSWMRequest) returns (PublishKEMToSWMResponse);
 
-  // Подписывается на события, происходящие в SWM (например, появление новых КЕП).
+  // Subscribes to events occurring in SWM (e.g., new KEMs appearing).
   rpc SubscribeToSWMEvents(SubscribeToSWMEventsRequest) returns (stream SWMMemoryEvent);
 
-  // Запрашивает активные КЕП непосредственно из SWM (из ее кэша).
+  // Queries active KEMs directly from SWM (from its cache).
   rpc QuerySWM(QuerySWMRequest) returns (QuerySWMResponse);
 
-  // Запрашивает загрузку КЕП из GLM в SWM (в кэш SWM).
+  // Requests loading of KEMs from GLM into SWM (into SWM's cache).
   rpc LoadKEMsFromGLM(LoadKEMsFromGLMRequest) returns (LoadKEMsFromGLMResponse);
 
-  // --- RPC для управления блокировками ---
-  // Пытается получить блокировку на ресурс.
+  // --- RPCs for Distributed Lock Management ---
+  // Attempts to acquire a lock on a resource.
   rpc AcquireLock(AcquireLockRequest) returns (AcquireLockResponse);
-  // Освобождает ранее полученную блокировку.
+  // Releases a previously acquired lock.
   rpc ReleaseLock(ReleaseLockRequest) returns (ReleaseLockResponse);
-  // Получает информацию о текущем состоянии блокировки для ресурса.
+  // Gets information about the current lock status for a resource.
   rpc GetLockInfo(GetLockInfoRequest) returns (LockInfo);
 
-  // --- RPC для распределенных счетчиков ---
-  // Атомарно инкрементирует (или декрементирует) значение счетчика.
-  // Если счетчик не существует, он создается со значением increment_by.
+  // --- RPCs for Distributed Counters ---
+  // Atomically increments (or decrements) the value of a counter.
+  // If the counter does not exist, it is created with the value of increment_by.
   rpc IncrementCounter(IncrementCounterRequest) returns (CounterValueResponse);
-  // Получает текущее значение счетчика.
-  // Если счетчик не существует, может вернуть ошибку или значение по умолчанию (например, 0).
+  // Gets the current value of a counter.
+  // If the counter does not exist, may return an error or a default value (e.g., 0).
   rpc GetCounter(DistributedCounterRequest) returns (CounterValueResponse);
-  // TODO: Добавить DeleteCounter(DistributedCounterRequest) returns (google.protobuf.Empty) в будущем.
+  // TODO: Add DeleteCounter(DistributedCounterRequest) returns (google.protobuf.Empty) in the future.
 }
 
-// --- Сообщения для PublishKEMToSWM ---
+// --- Messages for PublishKEMToSWM ---
 message PublishKEMToSWMRequest {
   KEM kem_to_publish = 1;
-  bool persist_to_glm_if_new_or_updated = 2; // Если true, SWM попытается сохранить/обновить КЕП в GLM
+  bool persist_to_glm_if_new_or_updated = 2; // If true, SWM will attempt to save/update the KEM in GLM.
 }
 
 message PublishKEMToSWMResponse {
-  string kem_id = 1; // ID опубликованной КЕП (может быть сгенерирован GLM, если persist_to_glm=true и ID не было)
-  bool published_to_swm = 2; // Успешно ли опубликовано в кэше SWM
-  bool persistence_triggered_to_glm = 3; // Был ли инициирован вызов к GLM
-  string status_message = 4; // Дополнительное сообщение о статусе
+  string kem_id = 1; // ID of the published KEM (could be GLM-generated if persist_to_glm=true and ID was initially empty).
+  bool published_to_swm = 2; // Whether successfully published to SWM's cache.
+  bool persistence_triggered_to_glm = 3; // Whether a call to GLM was initiated.
+  string status_message = 4; // Additional status message.
 }
 
-// --- Сообщения для SubscribeToSWMEvents ---
+// --- Messages for SubscribeToSWMEvents ---
 message SubscriptionTopic {
   enum TopicType {
     UNDEFINED_TOPIC = 0;
-    KEM_LIFECYCLE_EVENTS = 1;     // Все обновления КЕП (создание, обновление, удаление/вытеснение из SWM)
-    // SYSTEM_EVENTS = 2;   // Общие системные события SWM (пока не используем)
+    KEM_LIFECYCLE_EVENTS = 1;     // All KEM updates (creation, update, deletion/eviction from SWM).
+    // SYSTEM_EVENTS = 2;   // General SWM system events (not currently used).
   }
   TopicType type = 1;
-  string filter_criteria = 2; // Критерии фильтрации для темы (например, "metadata.topic='project_x'" или "kem_id='id123'")
-                              // Формат критериев нужно будет определить (например, простой DSL или JSONPath).
-                              // Для KEM_LIFECYCLE_EVENTS это может быть фильтр по ID, типу контента, метаданным.
+  string filter_criteria = 2; // Filter criteria for the topic (e.g., "metadata.topic='project_x'" or "kem_id='id123'").
+                              // The format of criteria needs to be defined (e.g., simple DSL or JSONPath).
+                              // For KEM_LIFECYCLE_EVENTS, this could be a filter by ID, content type, metadata.
 }
 
 message SubscribeToSWMEventsRequest {
-  string agent_id = 1; // Идентификатор агента-подписчика (для логирования и управления подписками)
-  repeated SubscriptionTopic topics = 2; // Список тем, на которые агент подписывается
+  string agent_id = 1; // Identifier of the subscribing agent (for logging and subscription management).
+  repeated SubscriptionTopic topics = 2; // List of topics the agent subscribes to.
 }
 
 message SWMMemoryEvent {
   enum EventType {
-    EVENT_TYPE_UNSPECIFIED = 0; // Используем UNSPECIFIED как значение по умолчанию согласно конвенции
-    KEM_PUBLISHED = 1; // Новая КЕП опубликована в SWM (пришла от другого агента или загружена из GLM)
-    KEM_UPDATED = 2;   // Существующая КЕП в SWM была обновлена (например, через PublishKEMToSWM с тем же ID)
-    KEM_EVICTED = 3; // КЕП была вытеснена из кэша SWM
-    // KEM_ACCESSED = 4; // Опционально: событие доступа к КЕП (может быть слишком много событий)
+    EVENT_TYPE_UNSPECIFIED = 0; // Use UNSPECIFIED as the default value per convention.
+    KEM_PUBLISHED = 1; // New KEM published in SWM (from another agent or loaded from GLM).
+    KEM_UPDATED = 2;   // Existing KEM in SWM was updated (e.g., via PublishKEMToSWM with the same ID).
+    KEM_EVICTED = 3; // KEM was evicted from SWM's cache.
+    // KEM_ACCESSED = 4; // Optional: KEM access event (might generate too many events).
   }
-  string event_id = 1; // Уникальный ID события
+  string event_id = 1; // Unique event ID.
   EventType event_type = 2;
-  KEM kem_payload = 3;        // КЕП, к которой относится событие.
-                               // Для KEM_EVICTED может содержать только kem_id.
-  google.protobuf.Timestamp event_time = 4; // Время события на сервере SWM
-  string source_agent_id = 5; // Опционально: ID агента, инициировавшего событие (например, при Publish)
-  string details = 6;   // Дополнительные детали о событии в текстовом формате
+  KEM kem_payload = 3;        // KEM related to the event.
+                               // For KEM_EVICTED, may only contain kem_id.
+  google.protobuf.Timestamp event_time = 4; // Server time of the event in SWM.
+  string source_agent_id = 5; // Optional: ID of the agent that initiated the event (e.g., on Publish).
+  string details = 6;   // Additional details about the event in text format.
 }
 
-// --- Сообщения для QuerySWM ---
+// --- Messages for QuerySWM ---
 message QuerySWMRequest {
-  // Используем KEMQuery из GLM, т.к. он уже содержит много полезных полей для запроса.
-  // SWM будет пытаться выполнить этот запрос на своем внутреннем кэше.
-  // Не все поля KEMQuery могут быть эффективно поддержаны на уровне кэша SWM.
-  dcsm.KEMQuery query = 1; // Явно указываем пакет dcsm для KEMQuery из glm_service.proto
+  // Using KEMQuery from GLM as it already contains many useful query fields.
+  // SWM will attempt to execute this query on its internal cache.
+  // Not all KEMQuery fields may be efficiently supported at the SWM cache level.
+  dcsm.KEMQuery query = 1; // Explicitly specify dcsm package for KEMQuery from glm_service.proto.
   int32 page_size = 2;
-  string page_token = 3; // Может быть просто смещением (offset) или более сложным токеном
+  string page_token = 3; // Can be a simple offset or a more complex token.
 }
 
 message QuerySWMResponse {
@@ -103,62 +103,62 @@ message QuerySWMResponse {
   string next_page_token = 2;
 }
 
-// --- Сообщения для LoadKEMsFromGLM ---
+// --- Messages for LoadKEMsFromGLM ---
 message LoadKEMsFromGLMRequest {
-  // Используем KEMQuery, чтобы указать GLM, какие КЕПы нужно извлечь и загрузить в SWM.
+  // Using KEMQuery to specify to GLM which KEMs to retrieve and load into SWM.
   dcsm.KEMQuery query_for_glm = 1;
-  // int32 limit_override = 2; // Можно управлять через query_for_glm.page_size или здесь
-  // bool load_embeddings_if_missing = 3; // Опция для SWM, чтобы дозагрузить эмбеддинги из GLM, если их нет
+  // int32 limit_override = 2; // Can be controlled via query_for_glm.page_size or here.
+  // bool load_embeddings_if_missing = 3; // Option for SWM to fetch embeddings from GLM if missing.
 }
 
 message LoadKEMsFromGLMResponse {
-  int32 kems_queried_in_glm_count = 1; // Сколько КЕП было запрошено у GLM (может отличаться от реально загруженных из-за ошибок или дубликатов)
-  int32 kems_loaded_to_swm_count = 2;    // Количество КЕП, реально добавленных/обновленных в кэше SWM
-  repeated string loaded_kem_ids = 3; // Список ID КЕП, которые были загружены/обновлены в SWM
+  int32 kems_queried_in_glm_count = 1; // How many KEMs were requested from GLM (may differ from actually loaded due to errors or duplicates).
+  int32 kems_loaded_to_swm_count = 2;    // Number of KEMs actually added/updated in SWM's cache.
+  repeated string loaded_kem_ids = 3; // List of KEM IDs that were loaded/updated in SWM.
   string status_message = 4;
 }
 
-// ----- Сообщения и RPC для управления блокировками -----
+// ----- Messages and RPCs for Distributed Lock Management -----
 
 message AcquireLockRequest {
-  string resource_id = 1; // Идентификатор ресурса, для которого запрашивается блокировка
-  string agent_id = 2;    // Идентификатор агента, запрашивающего блокировку
-  int32 timeout_ms = 3;   // Максимальное время ожидания блокировки в миллисекундах (0 - не ждать, -1 - ждать бесконечно)
-  int32 lease_duration_ms = 4; // Запрашиваемое время удержания блокировки в мс (0 - до явного освобождения или потери связи)
-                               // SWM может установить свое максимальное/минимальное время.
+  string resource_id = 1; // Identifier of the resource for which the lock is requested.
+  string agent_id = 2;    // Identifier of the agent requesting the lock.
+  int32 timeout_ms = 3;   // Maximum time to wait for the lock in milliseconds (0 - don't wait, -1 - wait indefinitely).
+  int32 lease_duration_ms = 4; // Requested lock lease duration in ms (0 - until explicitly released or connection loss).
+                               // SWM may enforce its own min/max lease time.
 }
 
 enum LockStatusValue {
   LOCK_STATUS_UNSPECIFIED = 0;
-  ACQUIRED = 1;         // Блокировка успешно получена
-  ALREADY_HELD_BY_YOU = 2; // Блокировка уже удерживается этим же agent_id
-  TIMEOUT = 3;          // Время ожидания истекло, блокировка не получена
-  NOT_AVAILABLE = 4;    // Блокировка удерживается другим агентом (если timeout_ms = 0)
-  ERROR = 5;            // Произошла ошибка на сервере
+  ACQUIRED = 1;         // Lock successfully acquired.
+  ALREADY_HELD_BY_YOU = 2; // Lock is already held by this agent_id.
+  TIMEOUT = 3;          // Wait time expired, lock not acquired.
+  NOT_AVAILABLE = 4;    // Lock held by another agent (if timeout_ms = 0).
+  ERROR = 5;            // An error occurred on the server.
 }
 
 message AcquireLockResponse {
   string resource_id = 1;
   string agent_id = 2;
   LockStatusValue status = 3;
-  string lock_id = 4;         // Уникальный ID блокировки, если получена (может быть полезен для ReleaseLock)
-  int64 acquired_at_unix_ms = 5; // Время получения блокировки (мс с эпохи UTC)
-  int64 lease_expires_at_unix_ms = 6; // Время истечения аренды блокировки (мс с эпохи UTC), если применимо
-  string message = 7;         // Дополнительное сообщение
+  string lock_id = 4;         // Unique ID for the lock if acquired (can be useful for ReleaseLock).
+  int64 acquired_at_unix_ms = 5; // Time lock was acquired (ms since UTC epoch).
+  int64 lease_expires_at_unix_ms = 6; // Lease expiration time (ms since UTC epoch), if applicable.
+  string message = 7;         // Additional message.
 }
 
 message ReleaseLockRequest {
   string resource_id = 1;
-  string agent_id = 2;    // Агент, который пытается освободить блокировку
-  string lock_id = 3;     // Опционально: ID блокировки, полученный при AcquireLock (для проверки)
+  string agent_id = 2;    // Agent attempting to release the lock.
+  string lock_id = 3;     // Optional: Lock ID received from AcquireLock (for verification).
 }
 
 enum ReleaseStatusValue {
   RELEASE_STATUS_UNSPECIFIED = 0;
-  RELEASED = 1;         // Блокировка успешно освобождена
-  NOT_HELD = 2;         // Блокировка не удерживалась этим агентом или для этого ресурса
-  INVALID_LOCK_ID = 3;  // Предоставленный lock_id не соответствует активной блокировке
-  ERROR_RELEASING = 4;  // Ошибка на сервере при освобождении
+  RELEASED = 1;         // Lock successfully released.
+  NOT_HELD = 2;         // Lock was not held by this agent or for this resource.
+  INVALID_LOCK_ID = 3;  // Provided lock_id does not match the active lock.
+  ERROR_RELEASING = 4;  // Server error during release.
 }
 
 message ReleaseLockResponse {

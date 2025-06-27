@@ -1,117 +1,118 @@
-# ДКОП (DCSM): Динамическая Контекстуализированная Общая Память
+# DCSM: Dynamic Contextualized Shared Memory
 
-**Интеллектуальная система памяти для современных ИИ-агентов и Больших Языковых Моделей (LLM)**
+**An Intelligent Memory System for Modern AI Agents and Large Language Models (LLMs)**
 
-## Введение
+## Introduction
 
-Динамическая Контекстуализированная Общая Память (ДКОП или DCSM - Dynamic Contextualized Shared Memory) — это продвинутая система управления знаниями, разработанная для эффективной работы в сложных, многоагентных ИИ-системах и для расширения возможностей LLM. ДКОП развивает идеи таких подходов, как Cache-Augmented Generation (CAG) и Retrieval-Augmented Generation (RAG), фокусируясь на динамическом, распределенном и глубоко контекстуализированном доступе к информации.
+Dynamic Contextualized Shared Memory (DCSM) is an advanced knowledge management system designed for efficient operation in complex, multi-agent AI systems and for augmenting the capabilities of LLMs. DCSM evolves ideas from approaches like Cache-Augmented Generation (CAG) and Retrieval-Augmented Generation (RAG), focusing on dynamic, distributed, and deeply contextualized access to information.
 
-Основная цель системы — предоставлять агентам релевантные знания точно в нужный момент, оптимизируя при этом использование вычислительных ресурсов и способствуя совместному накоплению и использованию знаний в группе агентов.
+The primary goal of the system is to provide agents with relevant knowledge precisely when needed, while optimizing computational resource usage and fostering collaborative knowledge accumulation and utilization within a group of agents.
 
-## Основные Принципы
+## Core Principles
 
-Система ДКОП базируется на следующих ключевых принципах:
+The DCSM system is based on the following key principles:
 
-*   **Контекстуализированные Единицы Памяти (КЕП)**: Знания в системе не являются монолитными блоками, а представляются в виде семантически связанных "Контекстуализированных Единиц Памяти" (КЕП). Каждая КЕП — это не просто фрагмент данных, а структурированный объект, содержащий сам контент и богатые метаданные (например, тема, источник, временные метки, права доступа, векторные эмбеддинги). Такой подход обеспечивает гранулированное и интеллектуальное управление знаниями.
+*   **Contextualized Memory Units (KEMs)**: Knowledge within the system is not stored as monolithic blocks but is represented as semantically coherent "Contextualized Memory Units" (KEMs). Each KEM is not just a data fragment but a structured object containing the content itself and rich metadata (e.g., topic, source, timestamps, access rights, vector embeddings). This approach enables granular and intelligent knowledge management.
 
-*   **Иерархическая Структура Памяти**: Для достижения оптимального баланса между скоростью доступа и объемом хранимой информации, ДКОП использует многоуровневую архитектуру памяти:
-    *   **GLM (Глобальная/Долгосрочная Память)**: Основное, персистентное хранилище для всех КЕП в системе. Обеспечивает надежность и долговременное сохранение знаний.
-    *   **SWM (Общая Рабочая Память)**: Высокопроизводительный, активный кэширующий слой. SWM хранит "горячие" (часто используемые или недавно запрошенные) КЕП, с которыми непосредственно взаимодействуют агенты.
-    *   **ЛПА (Локальная Память Агента)**: Краткосрочный кэш на стороне каждого агента, реализованный в Agent SDK. Хранит наиболее релевантные для конкретного агента КЕП, минимизируя задержки.
+*   **Hierarchical Memory Structure**: To achieve an optimal balance between access speed and storage volume, DCSM employs a multi-level memory architecture:
+    *   **GLM (Global/Long-Term Memory)**: The primary, persistent storage for all KEMs in the system. It ensures reliability and long-term knowledge preservation.
+    *   **SWM (Shared Working Memory)**: A high-performance, active caching layer. SWM stores "hot" (frequently used or recently requested) KEMs that agents interact with directly.
+    *   **LAM (Local Agent Memory)**: A short-term cache on each agent's side, implemented within the Agent SDK. It stores KEMs most relevant to a specific agent, minimizing latency.
 
-*   **Динамическое Управление и Обмен Знаниями**:
-    *   SWM динамически управляет своим содержимым, подгружая необходимые КЕП из GLM и вытесняя менее актуальные по LRU-стратегии (Least Recently Used).
-    *   Система поддерживает механизм Pub/Sub через SWM, позволяя агентам подписываться на интересующие их типы событий или изменения в КЕП и публиковать новые или обновленные КЕП, делая их доступными для других участников системы.
+*   **Dynamic Management and Knowledge Sharing**:
+    *   SWM dynamically manages its content by pre-loading necessary KEMs from GLM and evicting less current ones based on an LRU (Least Recently Used) strategy.
+    *   The system supports a Pub/Sub mechanism via SWM, allowing agents to subscribe to event types or KEM changes they are interested in, and to publish new or updated KEMs, making them available to other system participants.
 
-## Архитектура Системы
+## System Architecture
 
-ДКОП реализована как набор взаимодействующих микросервисов, общающихся посредством gRPC.
+DCSM is implemented as a set of interacting microservices communicating via gRPC.
 
 *   **GLM (Global Long-Term Memory Service)**:
-    *   **Назначение**: Персистентное хранилище всех КЕП.
-    *   **Технологии**: Использует SQLite для хранения метаданных и основного контента КЕП, и Qdrant (векторную базу данных) для хранения эмбеддингов и выполнения семантического поиска.
+    *   **Purpose**: Persistent storage for all KEMs.
+    *   **Technologies**: Uses SQLite for storing KEM metadata and main content, and Qdrant (a vector database) for storing embeddings and performing semantic searches.
 
 *   **KPS (Knowledge Processor Service)**:
-    *   **Назначение**: Точка входа для новых знаний в систему.
-    *   **Функции**: Принимает сырые данные (например, текст), обрабатывает их, генерирует векторные эмбеддинги с помощью моделей `sentence-transformers` и формирует КЕП для последующего сохранения в GLM.
+    *   **Purpose**: The entry point for new knowledge into the system.
+    *   **Functions**: Accepts raw data (e.g., text), processes it, generates vector embeddings using `sentence-transformers` models, and forms KEMs for subsequent storage in GLM.
 
 *   **SWM (Shared Working Memory Service)**:
-    *   **Назначение**: Активный кэширующий слой и хаб для обмена знаниями между агентами.
-    *   **Функции**: Кэширует КЕП, управляет их жизненным циклом в кэше (LRU-вытеснение с индексацией), обеспечивает Pub/Sub механизм для событий памяти, может загружать данные из GLM и сохранять их обратно.
+    *   **Purpose**: An active caching layer and a hub for knowledge exchange among agents.
+    *   **Functions**: Caches KEMs, manages their lifecycle within the cache (LRU eviction with indexing), provides a Pub/Sub mechanism for memory events, and can load data from/persist data to GLM. It also supports distributed locks and counters.
 
 *   **Agent SDK (Python)**:
-    *   **Назначение**: Предоставляет удобный Python-интерфейс для агентов для взаимодействия с сервисами ДКОП.
-    *   **Функции**: Включает клиент для GLM, реализует ЛПА (Локальную Память Агента) с кэшированием и индексацией, упрощает интеграцию логики агентов с системой памяти.
+    *   **Purpose**: Provides a convenient Python interface for agents to interact with DCSM services.
+    *   **Functions**: Includes clients for GLM and SWM, implements LAM (Local Agent Memory) with caching and indexing, and simplifies the integration of agent logic with the memory system.
 
-**Упрощенная схема взаимодействия:**
+**Simplified Interaction Diagram:**
 ```
 +-------------------+     +---------------------+     +-------------------+
-|      Агенты       |<--->|     Agent SDK       |<--->|        SWM        |
-| (Пользователи КЕП)|     | (ЛПА, Клиенты S/G)  |     | (Кэш, Шина Памяти)|
+|      Agents       |<--->|     Agent SDK       |<--->|        SWM        |
+|  (KEM Consumers)  |     | (LAM, S/G Clients)  |     |  (Cache, Mem Bus) |
 +-------------------+     +---------------------+     +-------------------+
-                                                        |      ^ (Загрузка/
-                                                        |        Сохранение)
+                                                        |      ^ (Load/
+                                                        |        Persist)
                                                         v      |
                                         +---------------------+
                                         |         GLM         |
                                         | (Qdrant, SQLite)  |
                                         +---------------------+
                                                   ^
-                                                  | (Сохранение КЕП)
+                                                  | (KEM Persistence)
                                                   |
                                         +---------------------+
                                         |         KPS         |
-                                        | (Обработка, Эмбед.) |
+                                        | (Processing, Embed.)|
                                         +---------------------+
 ```
-Более подробное описание архитектуры, форматов данных и взаимодействия компонентов вы найдете в документе [dcs_memory/ARCHITECTURE.md](dcs_memory/ARCHITECTURE.md).
+For a more detailed description of the architecture, data formats, and component interactions, please refer to the [dcs_memory/ARCHITECTURE_EN.md](dcs_memory/ARCHITECTURE_EN.md) document.
 
-## Ключевые Преимущества
+## Key Advantages
 
-*   **Контекстуализация Знаний**: Благодаря хранению КЕП с богатыми метаданными и векторными эмбеддингами, система позволяет осуществлять глубокий семантический поиск и предоставлять агентам информацию в точном соответствии с их текущим контекстом.
-*   **Многоуровневое Кэширование**: Иерархия памяти (GLM, SWM, ЛПА) обеспечивает оптимальный баланс между скоростью доступа к "горячим" данным и возможностью хранения больших объемов информации в долгосрочной памяти.
-*   **Гибкость и Масштабируемость**: Микросервисная архитектура и использование gRPC для взаимодействия компонентов позволяют системе быть гибкой в развертывании и масштабировании отдельных ее частей.
-*   **Динамичность и Адаптивность**: SWM и ЛПА динамически адаптируют свое содержимое под текущие нужды агентов, используя LRU-стратегии и (в SWM) Pub/Sub механизм для своевременного обновления релевантной информацией.
-*   **Эффективный Поиск**: Интеграция с векторной базой данных Qdrant в GLM обеспечивает мощные возможности для семантического поиска и нахождения близких по смыслу КЕП. `IndexedLRUCache` в SWM и ЛПА также ускоряет поиск по метаданным в кэшах.
-*   **Поддержка Коллективной Работы**: SWM выступает как общая рабочая область, где агенты могут публиковать новые знания и подписываться на обновления от других агентов, способствуя синергии в многоагентных системах.
+*   **Knowledge Contextualization**: By storing KEMs with rich metadata and vector embeddings, the system enables deep semantic search and provides agents with information precisely tailored to their current context.
+*   **Multi-Level Caching**: The memory hierarchy (GLM, SWM, LAM) ensures an optimal balance between fast access to "hot" data and the capacity to store large volumes of information in long-term memory.
+*   **Flexibility and Scalability**: The microservice architecture and use of gRPC for component interaction allow the system to be flexible in deployment and to scale individual parts as needed.
+*   **Dynamism and Adaptability**: SWM and LAM dynamically adapt their content to the current needs of agents, using LRU strategies and (in SWM) a Pub/Sub mechanism for timely updates with relevant information.
+*   **Efficient Search**: Integration with the Qdrant vector database in GLM provides powerful capabilities for semantic search and finding conceptually similar KEMs. `IndexedLRUCache` in SWM and LAM also speeds up metadata-based searches within caches.
+*   **Support for Collaborative Work**: SWM acts as a shared workspace where agents can publish new knowledge and subscribe to updates from other agents, fostering synergy in multi-agent systems.
+*   **Coordination Primitives**: SWM offers distributed locks and counters, facilitating coordination and synchronization tasks among multiple agents.
 
-## Начало Работы
+## Getting Started
 
-Для запуска системы ДКОП локально вам потребуется Docker и docker-compose.
+To run the DCSM system locally, you will need Docker and docker-compose.
 
-1.  Клонируйте репозиторий:
+1.  Clone the repository:
     ```bash
-    # Замените <repo_url> на актуальный URL вашего репозитория
+    # Replace <repo_url> with the actual URL of your repository
     git clone <repo_url>
-    cd <имя_директории_репозитория>
+    cd <repository_directory_name>
     ```
-2.  Запустите все сервисы с помощью docker-compose:
+2.  Start all services using docker-compose:
     ```bash
     docker-compose up --build
     ```
-    Эта команда соберет Docker-образы для всех сервисов (если они еще не собраны) и запустит их.
+    This command will build Docker images for all services (if not already built) and start them.
 
-После успешного запуска будут доступны следующие сервисы:
-*   **Qdrant**: векторная БД (порт gRPC 6333, HTTP 6334)
-*   **GLM Service**: gRPC на порту 50051
-*   **KPS Service**: gRPC на порту 50052
-*   **SWM Service**: gRPC на порту 50053
+After successful startup, the following services will be available:
+*   **Qdrant**: Vector DB (gRPC port 6333, HTTP 6334)
+*   **GLM Service**: gRPC on port 50051
+*   **KPS Service**: gRPC on port 50052
+*   **SWM Service**: gRPC on port 50053
 
-Вы можете начать взаимодействие с системой, используя [Agent SDK (Python)](dcsm_agent_sdk_python/README.md) или любой другой gRPC-клиент. Примеры использования SDK можно найти в `dcsm_agent_sdk_python/example.py`.
+You can start interacting with the system using the [Python Agent SDK](dcsm_agent_sdk_python/README.md) or any other gRPC client. Examples of SDK usage can be found in `dcsm_agent_sdk_python/example.py`.
 
-## Статус Проекта и Будущие Направления
+## Project Status and Future Directions
 
-Система ДКОП находится в стадии активной разработки. Текущая реализация включает все основные описанные компоненты и базовую функциональность.
+The DCSM system is under active development. The current implementation includes all major described components and core functionality.
 
-**Ключевые направления дальнейшего развития:**
-*   Полноценная реализация Pub/Sub механизма в SWM с использованием `asyncio` или интеграцией с брокерами сообщений.
-*   Разработка более сложных политик кэширования и вытеснения в SWM.
-*   Расширение возможностей фильтрации и запросов в SWM.
-*   Усиление аспектов безопасности: аутентификация и авторизация.
-*   Комплексное интеграционное и нагрузочное тестирование.
-*   Улучшение механизмов отказоустойчивости и обработки ошибок.
+**Key directions for future development:**
+*   Full-fledged Pub/Sub mechanism in SWM using `asyncio` or integration with message brokers.
+*   Development of more sophisticated caching and eviction policies in SWM.
+*   Expansion of filtering and querying capabilities in SWM.
+*   Enhancement of security aspects: authentication and authorization.
+*   Comprehensive integration and load testing.
+*   Improvement of fault tolerance and error handling mechanisms.
 
-Мы приглашаем к обсуждению и возможному участию в развитии проекта!
+We welcome discussion and potential contributions to the project!
 
 ---
-*(Опционально: здесь можно добавить разделы "Contributing" и "License", если это применимо к вашему проекту.)*
+*(Optionally: Sections like "Contributing" and "License" can be added here if applicable to your project.)*

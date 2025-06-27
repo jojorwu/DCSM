@@ -9,21 +9,10 @@ import grpc
 from .generated_grpc_code import kem_pb2
 from .generated_grpc_code import glm_service_pb2
 from .generated_grpc_code import glm_service_pb2_grpc
-from google.protobuf.json_format import MessageToDict, ParseDict
+# from google.protobuf.json_format import MessageToDict, ParseDict # Заменены утилитами
 from google.protobuf import empty_pb2 # Для DeleteKEM
-import time # Для задержек в retry
-import random # Для джиттера в retry
-from functools import wraps # Для создания декоратора
-
-from google.protobuf.json_format import MessageToDict, ParseDict
-from google.protobuf import empty_pb2 # Для DeleteKEM
-# Импорты для retry-декоратора теперь из общего модуля
-# import time
-# import random
-# from functools import wraps
-from dcs_memory.common.grpc_utils import retry_grpc_call # <--- Новый импорт
-
-# Коды ошибок и JITTER_FRACTION теперь в grpc_utils.py
+from dcs_memory.common.grpc_utils import retry_grpc_call
+from .proto_utils import kem_dict_to_proto, kem_proto_to_dict # <--- Новый импорт
 
 # Нужно добавить logger для GLMClient
 import logging
@@ -41,61 +30,28 @@ class GLMClient:
         self.retry_max_attempts = retry_max_attempts
         self.retry_initial_delay_s = retry_initial_delay_s
         self.retry_backoff_factor = retry_backoff_factor
-        # self.connect()
+        # self.connect() # Connection is now typically managed by __enter__ or _ensure_connected
 
     def connect(self):
         if not self.channel:
             self.channel = grpc.insecure_channel(self.server_address)
             self.stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.channel)
-            print(f"GLMClient подключен к: {self.server_address}")
+            logger.info(f"GLMClient connected to: {self.server_address}")
 
     def _ensure_connected(self):
         if not self.stub:
             self.connect()
 
-    def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
-        kem_data_copy = kem_data.copy()
-        # ParseDict не очень хорошо работает с вложенными Timestamp, если они не строки RFC 3339.
-        # Очистим их, если они не строки, чтобы избежать ошибок. Сервер должен управлять ими.
-        if 'created_at' in kem_data_copy and not isinstance(kem_data_copy['created_at'], str):
-            del kem_data_copy['created_at']
-        if 'updated_at' in kem_data_copy and not isinstance(kem_data_copy['updated_at'], str):
-            del kem_data_copy['updated_at']
+    # _kem_dict_to_proto and _kem_proto_to_dict are now imported from proto_utils
 
-        # content должен быть bytes
-        if 'content' in kem_data_copy and isinstance(kem_data_copy['content'], str):
-            kem_data_copy['content'] = kem_data_copy['content'].encode('utf-8')
-
-        return ParseDict(kem_data_copy, kem_pb2.KEM(), ignore_unknown_fields=True)
-
-    def _kem_proto_to_dict(self, kem_proto: kem_pb2.KEM) -> dict:
-        # Параметр including_default_value_fields может отсутствовать в старых версиях protobuf. Убираем его для совместимости.
-        kem_dict = MessageToDict(kem_proto, preserving_proto_field_name=True)
-        if 'content' in kem_dict and isinstance(kem_dict['content'], str): # MessageToDict кодирует bytes в base64 строки
-            try:
-                # Попытаемся декодировать, если это была строка, закодированная в base64, а потом в строку.
-                # Но проще если сервер возвращает bytes, и мы здесь декодируем.
-                # Если kem_proto.content это bytes, MessageToDict его преобразует в base64 строку.
-                # Чтобы получить оригинальные bytes, нужно было бы работать с kem_proto.content напрямую.
-                # Для простоты, если это строка, пытаемся ее декодировать из utf-8, если нет - оставляем.
-                # Это поведение нужно будет уточнить в зависимости от того, как реально используется content.
-                # Если content всегда текст, то декодирование полезно. Если бинарные данные - нет.
-                # kem_dict['content'] = base64.b64decode(kem_dict['content']).decode('utf-8')
-                pass # Оставляем как есть, если это base64 строка или уже декодировано как-то
-            except Exception:
-                pass
-        # Для Timestamp полей, MessageToDict возвращает строки в формате RFC 3339 UTC Z.
-        # Например: "2023-10-27T10:30:00Z". Это удобно для преобразования в datetime объекты.
-        return kem_dict
-
-    @retry_grpc_call # Используем новое имя декоратора
+    @retry_grpc_call
     def batch_store_kems(self, kems_data: list[dict]) -> tuple[list[dict] | None, list[str] | None, str | None]:
-        """Сохраняет пакет КЕП и возвращает список успешно сохраненных КЕП (как dict) и ошибки."""
+        """Stores a batch of KEMs and returns a list of successfully stored KEMs (as dicts) and errors."""
         self._ensure_connected()
-        proto_kems = [self._kem_dict_to_proto(data) for data in kems_data]
+        proto_kems = [kem_dict_to_proto(data) for data in kems_data]
         request = glm_service_pb2.BatchStoreKEMsRequest(kems=proto_kems)
-        response = self.stub.BatchStoreKEMs(request, timeout=20)
-        successfully_stored_kems_as_dicts = [self._kem_proto_to_dict(k) for k in response.successfully_stored_kems]
+        response = self.stub.BatchStoreKEMs(request, timeout=20) # type: ignore
+        successfully_stored_kems_as_dicts = [kem_proto_to_dict(k) for k in response.successfully_stored_kems]
         return successfully_stored_kems_as_dicts, list(response.failed_kem_references), response.overall_error_message
 
     @retry_grpc_call
@@ -110,27 +66,27 @@ class GLMClient:
             query_proto.embedding_query.extend(embedding_query)
         if metadata_filters:
             for key, value in metadata_filters.items():
-                query_proto.metadata_filters[key] = str(value)
+                query_proto.metadata_filters[key] = str(value) # Ensure value is string for proto
         if ids_filter:
             query_proto.ids.extend(ids_filter)
         request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, page_size=page_size, page_token=page_token if page_token else "")
-        response = self.stub.RetrieveKEMs(request, timeout=10)
-        kems_as_dicts = [self._kem_proto_to_dict(kem) for kem in response.kems]
+        response = self.stub.RetrieveKEMs(request, timeout=10) # type: ignore
+        kems_as_dicts = [kem_proto_to_dict(kem) for kem in response.kems]
         return kems_as_dicts, response.next_page_token
 
     @retry_grpc_call
     def update_kem(self, kem_id: str, kem_data_update: dict) -> dict | None:
         self._ensure_connected()
-        kem_proto_update = self._kem_dict_to_proto(kem_data_update)
+        kem_proto_update = kem_dict_to_proto(kem_data_update)
         request = glm_service_pb2.UpdateKEMRequest(kem_id=kem_id, kem_data_update=kem_proto_update)
-        response_kem_proto = self.stub.UpdateKEM(request, timeout=10)
-        return self._kem_proto_to_dict(response_kem_proto)
+        response_kem_proto = self.stub.UpdateKEM(request, timeout=10) # type: ignore
+        return kem_proto_to_dict(response_kem_proto)
 
     @retry_grpc_call
     def delete_kem(self, kem_id: str) -> bool:
         self._ensure_connected()
         request = glm_service_pb2.DeleteKEMRequest(kem_id=kem_id)
-        self.stub.DeleteKEM(request, timeout=10)
+        self.stub.DeleteKEM(request, timeout=10) # type: ignore
         return True
 
     def close(self):
@@ -138,37 +94,37 @@ class GLMClient:
             self.channel.close()
             self.channel = None
             self.stub = None
-            print("Канал GLMClient закрыт.")
+            logger.info("GLMClient channel closed.")
 
     def __enter__(self):
-        self.connect() # Подключаемся при входе в контекстный менеджер
+        self.connect() # Connect on entering context manager
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
 if __name__ == '__main__':
-    # Этот блок кода выполняется только при запуске файла напрямую (python glm_client.py)
-    # Он не будет выполняться при импорте GLMClient из другого модуля.
-    # Для запуска этого примера требуется, чтобы GLM сервер был запущен на localhost:50051
+    # This block executes only when the file is run directly (python glm_client.py)
+    # It will not run when GLMClient is imported from another module.
+    # Requires GLM server to be running on localhost:50051 for this example.
 
-    # Добавляем родительскую директорию в sys.path, чтобы можно было запустить этот файл напрямую
-    # для демонстрации, и чтобы импорты generated_grpc_code работали.
     import os
     import sys
-    # sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    # Это не совсем правильно, если generated_grpc_code не является устанавливаемым пакетом.
-    # Проще всего запускать пример из корневой директории SDK, добавив ее в PYTHONPATH,
-    # или убедившись, что generated_grpc_code устанавливается как часть пакета.
+    # Add parent directory to sys.path to allow direct execution for demonstration
+    # and to make generated_grpc_code imports work.
+    # This is not ideal if generated_grpc_code is not an installable package.
+    # Easiest to run example from SDK root, adding it to PYTHONPATH,
+    # or ensure generated_grpc_code is installed as part of the package.
 
-    print("Запуск примера использования GLMClient (требуется запущенный GLM сервер на localhost:50051)")
-    print("Этот пример не будет выполнен автоматически при выполнении subtask.")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger.info("Running GLMClient example (requires GLM server on localhost:50051)")
+    logger.info("This example will not run automatically during automated tasks.")
 
-    if os.getenv("RUN_GLM_CLIENT_EXAMPLE"): # Запускать пример только если установлена переменная окружения
+    if os.getenv("RUN_GLM_CLIENT_EXAMPLE") == "true": # Run example only if env var is set
         try:
             with GLMClient() as client:
                 # 1. Store KEMs
-                print("\n--- Тест StoreKEMs ---")
+                logger.info("\n--- Testing batch_store_kems ---")
                 kems_to_store = [
                     {"id": "kem_sdk_001", "content_type": "text/plain", "content": "KEM 1 from SDK.", "metadata": {"sdk_source": "python_glm_client", "topic": "sdk_test"}},
                     {"id": "kem_sdk_002", "content_type": "application/json", "content": '{"data_key": "data_value"}', "metadata": {"sdk_source": "python_glm_client", "status": "draft"}, "embeddings": [0.4, 0.5, 0.6]}

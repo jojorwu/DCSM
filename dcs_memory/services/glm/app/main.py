@@ -6,41 +6,36 @@ import os
 import uuid
 import json
 import sqlite3
-from qdrant_client import QdrantClient, models # Используем models для VectorParams и Distance
-from qdrant_client.http.models import PointStruct # PointStruct напрямую
+from qdrant_client import QdrantClient, models
+from qdrant_client.http.models import PointStruct
 from google.protobuf.timestamp_pb2 import Timestamp
-from google.protobuf.json_format import ParseDict # MessageToDict не используется напрямую в текущей версии
+from google.protobuf.json_format import ParseDict
 import typing
-import logging # Добавлен модуль логирования
+import logging
 
-# Импортируем конфигурацию
+# Import configuration
 from .config import GLMConfig
 
-# --- Начало блока для корректного импорта сгенерированного кода ---
-# app_dir определяется здесь для SQLITE_DB_PATH
+# --- Start of gRPC code import block ---
 current_script_path = os.path.abspath(__file__)
-app_dir = os.path.dirname(current_script_path) # /app/dcs_memory/services/glm/app
-# --- Конец определения app_dir ---
+app_dir = os.path.dirname(current_script_path)
+# --- End of app_dir definition ---
 
-# Глобальный экземпляр конфигурации
-# Он будет инициализирован один раз при загрузке модуля main.py
-# Pydantic автоматически прочитает переменные окружения (с префиксом GLM_) и .env файлы
+# Global configuration instance
 config = GLMConfig()
 
-# --- Настройка логирования ---
-# Используем уровень логирования из конфигурации
+# --- Logging setup ---
 logging.basicConfig(
-    level=config.get_log_level_int(), # Используем метод из BaseServiceConfig
+    level=config.get_log_level_int(),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
-# --- Конец настройки логирования ---
+# --- End of logging setup ---
 
-
-service_root_dir = os.path.dirname(app_dir) # /app/dcs_memory/services/glm
+service_root_dir = os.path.dirname(app_dir)
 if service_root_dir not in sys.path:
     sys.path.insert(0, service_root_dir)
 
@@ -48,147 +43,112 @@ from generated_grpc import kem_pb2
 from generated_grpc import glm_service_pb2
 from generated_grpc import glm_service_pb2_grpc
 from google.protobuf import empty_pb2
-# --- Конец блока для корректного импорта ---
+# --- End of gRPC code import block ---
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
-# --- Старые переменные конфигурации удалены, теперь используется объект config ---
-# SQLITE_DB_PATH будет config.DB_FILENAME (но нужно учесть app_dir)
-# QDRANT_HOST будет config.QDRANT_HOST
-# QDRANT_PORT будет config.QDRANT_PORT
-# QDRANT_COLLECTION будет config.QDRANT_COLLECTION
-# DEFAULT_VECTOR_SIZE будет config.DEFAULT_VECTOR_SIZE
-# DEFAULT_PAGE_SIZE будет config.DEFAULT_PAGE_SIZE
-# GRPC_LISTEN_ADDRESS будет config.GRPC_LISTEN_ADDRESS
-
-
 class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemoryServicer):
     def __init__(self):
-        logger.info("Инициализация GlobalLongTermMemoryServicerImpl...")
+        logger.info("Initializing GlobalLongTermMemoryServicerImpl...")
         self.qdrant_client = None
-        self.config = config # Сохраняем ссылку на глобальный config или передаем его
+        self.config = config
 
-        # Формируем полный путь к БД SQLite
         self.sqlite_db_path = os.path.join(app_dir, self.config.DB_FILENAME)
 
         try:
             self.qdrant_client = QdrantClient(host=self.config.QDRANT_HOST, port=self.config.QDRANT_PORT, timeout=10)
-            self.qdrant_client.get_collections()
-            logger.info(f"Qdrant клиент успешно подключен к {self.config.QDRANT_HOST}:{self.config.QDRANT_PORT}")
+            self.qdrant_client.get_collections() # Test connection
+            logger.info(f"Qdrant client successfully connected to {self.config.QDRANT_HOST}:{self.config.QDRANT_PORT}")
             self._ensure_qdrant_collection()
         except Exception as e:
-            logger.error(f"КРИТИЧЕСКАЯ ОШИБКА при инициализации Qdrant клиента: {e}. Сервис может работать некорректно.")
+            logger.error(f"CRITICAL ERROR during Qdrant client initialization: {e}. Service may not work correctly.")
             self.qdrant_client = None
 
         self._init_sqlite()
-        logger.info("Сервисер GLM инициализирован.")
+        logger.info("GLM servicer initialized.")
 
     def _get_sqlite_conn(self):
         conn = sqlite3.connect(self.sqlite_db_path, timeout=10)
-        # Установка PRAGMA-настроек для каждого нового соединения
         try:
             cursor = conn.cursor()
-            # WAL mode для лучшего параллелизма и производительности
             cursor.execute("PRAGMA journal_mode=WAL;")
-            # Synchronous NORMAL для ускорения записи (с небольшим риском при сбое питания)
             cursor.execute("PRAGMA synchronous=NORMAL;")
-            # Включение внешних ключей (хорошая практика, даже если сейчас не используются)
             cursor.execute("PRAGMA foreign_keys=ON;")
-            # Установка таймаута для операций, ожидающих снятия блокировки
-            cursor.execute("PRAGMA busy_timeout = 7500;") # 7.5 секунд
-
-            # Логирование установленных значений PRAGMA для проверки (опционально, но полезно для отладки)
-            # if logger.isEnabledFor(logging.DEBUG): # Проверяем уровень логирования перед выполнением доп. запросов
-            #     journal_mode = cursor.execute("PRAGMA journal_mode;").fetchone()
-            #     synchronous_mode = cursor.execute("PRAGMA synchronous;").fetchone()
-            #     foreign_keys_mode = cursor.execute("PRAGMA foreign_keys;").fetchone()
-            #     busy_timeout = cursor.execute("PRAGMA busy_timeout;").fetchone()
-            #     logger.debug(f"SQLite PRAGMA: journal_mode={journal_mode}, synchronous={synchronous_mode}, foreign_keys={foreign_keys_mode}, busy_timeout={busy_timeout}")
-
+            cursor.execute("PRAGMA busy_timeout = 7500;")
         except sqlite3.Error as e:
-            logger.error(f"Ошибка при установке PRAGMA-настроек SQLite: {e}", exc_info=True)
-            # Если PRAGMA не установились, соединение все равно может быть рабочим,
-            # но без оптимизаций. Решаем, нужно ли здесь прерывать или просто логировать.
-            # Пока просто логируем.
+            logger.error(f"Error setting SQLite PRAGMA options: {e}", exc_info=True)
         return conn
 
     def _init_sqlite(self):
-        logger.info(f"Инициализация SQLite БД по пути: {self.sqlite_db_path}")
+        logger.info(f"Initializing SQLite DB at path: {self.sqlite_db_path}")
         try:
-            # Получаем соединение уже с PRAGMA-настройками
             with self._get_sqlite_conn() as conn:
                 cursor = conn.cursor()
-                # Проверяем и логируем PRAGMA при инициализации
-                # Это поможет убедиться, что они применяются с самого начала
-                if logger.isEnabledFor(logging.INFO): # Логируем на INFO уровне при инициализации
+                if logger.isEnabledFor(logging.INFO):
                     jm = cursor.execute("PRAGMA journal_mode;").fetchone()
                     sm = cursor.execute("PRAGMA synchronous;").fetchone()
                     fk = cursor.execute("PRAGMA foreign_keys;").fetchone()
                     bt = cursor.execute("PRAGMA busy_timeout;").fetchone()
-                    logger.info(f"SQLite PRAGMA при инициализации: journal_mode={jm}, synchronous={sm}, foreign_keys={fk}, busy_timeout={bt}")
+                    logger.info(f"SQLite PRAGMA at initialization: journal_mode={jm}, synchronous={sm}, foreign_keys={fk}, busy_timeout={bt}")
 
                 cursor.execute('''
                 CREATE TABLE IF NOT EXISTS kems (
                     id TEXT PRIMARY KEY,
                     content_type TEXT,
                     content BLOB,
-                    metadata TEXT,
-                    created_at TEXT,
-                    updated_at TEXT
+                    metadata TEXT, /* JSON stored as TEXT */
+                    created_at TEXT, /* ISO 8601 format */
+                    updated_at TEXT  /* ISO 8601 format */
                 )
                 ''')
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_created_at ON kems (created_at);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_updated_at ON kems (updated_at);")
                 conn.commit()
-            logger.info("Таблица 'kems' и индексы в SQLite успешно инициализированы.")
+            logger.info("'kems' table and indexes in SQLite successfully initialized.")
         except Exception as e:
-            logger.error(f"Ошибка инициализации SQLite: {e}")
+            logger.error(f"Error initializing SQLite: {e}")
 
     def _ensure_qdrant_collection(self):
         if not self.qdrant_client:
-            logger.warning("Qdrant клиент не инициализирован, пропуск создания коллекции.")
+            logger.warning("Qdrant client not initialized, skipping collection creation/check.")
             return
         try:
             try:
                 collection_info = self.qdrant_client.get_collection(self.config.QDRANT_COLLECTION)
-                logger.info(f"Коллекция '{self.config.QDRANT_COLLECTION}' уже существует.")
-                # Проверяем существующую конфигурацию, если коллекция есть
-                if hasattr(collection_info.config.params.vectors, 'size'): # Для стандартных векторов
+                logger.info(f"Collection '{self.config.QDRANT_COLLECTION}' already exists.")
+                # Check existing configuration if collection exists
+                if hasattr(collection_info.config.params.vectors, 'size'): # For standard vectors
                     current_vector_size = collection_info.config.params.vectors.size
                     current_distance = collection_info.config.params.vectors.distance
-                elif isinstance(collection_info.config.params.vectors, dict): # Для именованных векторов
-                    # Предполагаем, что есть вектор по умолчанию или единственный вектор
-                    # Это потребует более сложной логики, если имен много.
-                    # Пока что, если это dict, ищем ключ 'size' и 'distance' или пропускаем проверку.
-                    # Для простоты, если это dict, предполагаем, что конфигурация проверяется вручную.
-                    logger.info("Проверка конфигурации для именованных векторов пока не реализована детально.")
-                    current_vector_size = self.config.DEFAULT_VECTOR_SIZE # Предполагаем совпадение
-                    current_distance = models.Distance.COSINE        # Предполагаем совпадение
-                else: # Неизвестный формат конфигурации векторов
-                     logger.warning(f"Не удалось определить конфигурацию векторов для коллекции '{self.config.QDRANT_COLLECTION}'. Пропуск проверки.")
+                elif isinstance(collection_info.config.params.vectors, dict): # For named vectors
+                    logger.info("Detailed configuration check for named vectors is not yet implemented.")
+                    current_vector_size = self.config.DEFAULT_VECTOR_SIZE # Assume match for now
+                    current_distance = models.Distance.COSINE        # Assume match
+                else: # Unknown vector configuration format
+                     logger.warning(f"Could not determine vector configuration for collection '{self.config.QDRANT_COLLECTION}'. Skipping check.")
                      current_vector_size = self.config.DEFAULT_VECTOR_SIZE
                      current_distance = models.Distance.COSINE
 
                 if current_vector_size != self.config.DEFAULT_VECTOR_SIZE or current_distance != models.Distance.COSINE:
-                     logger.warning(f"Конфигурация существующей коллекции '{self.config.QDRANT_COLLECTION}' не совпадает с ожидаемой (размер: {current_vector_size} vs {self.config.DEFAULT_VECTOR_SIZE}, дистанция: {current_distance}).")
+                     logger.warning(f"Configuration of existing collection '{self.config.QDRANT_COLLECTION}' (size: {current_vector_size}, distance: {current_distance}) "
+                                    f"does not match expected (size: {self.config.DEFAULT_VECTOR_SIZE}, distance: {models.Distance.COSINE}).")
                 else:
-                    logger.info(f"Конфигурация коллекции '{self.config.QDRANT_COLLECTION}' соответствует.")
-            except Exception as e_get_collection: # Явно ловим ошибку получения коллекции (например, если ее нет)
-                if "not found" in str(e_get_collection).lower() or (hasattr(e_get_collection, 'status_code') and e_get_collection.status_code == 404):
-                    logger.info(f"Коллекция '{self.config.QDRANT_COLLECTION}' не найдена. Создание новой коллекции...")
+                    logger.info(f"Collection configuration for '{self.config.QDRANT_COLLECTION}' is consistent.")
+            except Exception as e_get_collection: # Catch error when getting collection (e.g., if it doesn't exist)
+                if "not found" in str(e_get_collection).lower() or \
+                   (hasattr(e_get_collection, 'status_code') and e_get_collection.status_code == 404): # type: ignore
+                    logger.info(f"Collection '{self.config.QDRANT_COLLECTION}' not found. Creating new collection...")
                     self.qdrant_client.recreate_collection(
                         collection_name=self.config.QDRANT_COLLECTION,
                         vectors_config=models.VectorParams(size=self.config.DEFAULT_VECTOR_SIZE, distance=models.Distance.COSINE)
                     )
-                    logger.info(f"Коллекция '{self.config.QDRANT_COLLECTION}' успешно создана.")
-                else:
-                    # Другая ошибка при get_collection
-                    logger.error(f"Ошибка при получении информации о коллекции Qdrant '{self.config.QDRANT_COLLECTION}': {e_get_collection}")
-        except Exception as e: # Общая ошибка на случай проблем с recreate_collection и т.д.
-            logger.error(f"Ошибка при проверке/создании коллекции Qdrant '{self.config.QDRANT_COLLECTION}': {e}")
+                    logger.info(f"Collection '{self.config.QDRANT_COLLECTION}' successfully created.")
+                else: # Other error during get_collection
+                    logger.error(f"Error getting Qdrant collection info for '{self.config.QDRANT_COLLECTION}': {e_get_collection}")
+        except Exception as e: # General error for recreate_collection etc.
+            logger.error(f"Error ensuring Qdrant collection '{self.config.QDRANT_COLLECTION}': {e}")
 
     def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
-        # ... (остается без изменений) ...
         kem_data_copy = kem_data.copy()
         if 'created_at' in kem_data_copy and not isinstance(kem_data_copy['created_at'], str):
             del kem_data_copy['created_at']
@@ -198,15 +158,13 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
              kem_data_copy['content'] = kem_data_copy['content'].encode('utf-8')
         return ParseDict(kem_data_copy, kem_pb2.KEM(), ignore_unknown_fields=True)
 
-
     def _kem_from_db_row(self, row: sqlite3.Row, embeddings_map: typing.Optional[dict] = None) -> kem_pb2.KEM:
-        # ... (остается без изменений) ...
         kem_dict = dict(row)
         kem_dict['metadata'] = json.loads(kem_dict.get('metadata', '{}'))
         created_at_ts = Timestamp()
         if kem_dict.get('created_at'):
             created_at_str = kem_dict['created_at']
-            if not created_at_str.endswith("Z"): created_at_str += "Z"
+            if not created_at_str.endswith("Z"): created_at_str += "Z" # Ensure Zulu timezone for FromJsonString
             created_at_ts.FromJsonString(created_at_str)
         kem_dict['created_at'] = created_at_ts
         updated_at_ts = Timestamp()
@@ -217,13 +175,14 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         kem_dict['updated_at'] = updated_at_ts
         if embeddings_map and kem_dict['id'] in embeddings_map:
             kem_dict['embeddings'] = embeddings_map[kem_dict['id']]
+        else: # Ensure embeddings field is present even if empty
+            kem_dict.setdefault('embeddings', [])
         return self._kem_dict_to_proto(kem_dict)
 
-    def StoreKEM(self, request, context):
-        # ... (остается без изменений) ...
+    def StoreKEM(self, request: glm_service_pb2.StoreKEMRequest, context) -> glm_service_pb2.StoreKEMResponse:
         kem = request.kem
         kem_id = kem.id if kem.id else str(uuid.uuid4())
-        logger.info("StoreKEM: ID='{}' (клиентский ID='{}')".format(kem_id, request.kem.id))
+        logger.info(f"StoreKEM: ID='{kem_id}' (client-provided ID='{request.kem.id}')")
         current_time_proto = Timestamp()
         current_time_proto.GetCurrentTime()
         final_created_at_proto = Timestamp()
@@ -235,83 +194,90 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 existing_row = cursor.fetchone()
                 if existing_row:
                     is_new_kem = False
-                    final_created_at_proto.FromJsonString(existing_row[0] + "Z")
+                    final_created_at_proto.FromJsonString(existing_row[0] + ("Z" if not existing_row[0].endswith("Z") else ""))
                 if is_new_kem:
-                    if kem.HasField("created_at"):
+                    if kem.HasField("created_at") and kem.created_at.seconds > 0 : # Use provided if valid
                         final_created_at_proto.CopyFrom(kem.created_at)
                     else:
                         final_created_at_proto.CopyFrom(current_time_proto)
-                kem.id = kem_id
+
+                kem.id = kem_id # Ensure ID is set on the proto
                 kem.created_at.CopyFrom(final_created_at_proto)
-                kem.updated_at.CopyFrom(current_time_proto)
+                kem.updated_at.CopyFrom(current_time_proto) # Always set/update updated_at
+
                 cursor.execute('''
                 INSERT OR REPLACE INTO kems (id, content_type, content, metadata, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ''', (kem.id, kem.content_type, kem.content,
                       json.dumps(dict(kem.metadata)),
-                      kem.created_at.ToDatetime().isoformat(),
-                      kem.updated_at.ToDatetime().isoformat()))
+                      kem.created_at.ToDatetime().isoformat().replace('+00:00', ''), # Store as naive UTC string
+                      kem.updated_at.ToDatetime().isoformat().replace('+00:00', '')))
                 conn.commit()
-            logger.info("Метаданные/контент для КЕП ID '{}' сохранены/обновлены в SQLite.".format(kem_id))
+            logger.info(f"Metadata/content for KEM ID '{kem_id}' saved/updated in SQLite.")
         except Exception as e:
-            msg = "Ошибка SQLite (StoreKEM) для ID '{}': {}".format(kem_id, e)
+            msg = f"SQLite error (StoreKEM) for ID '{kem_id}': {e}"
             logger.error(msg, exc_info=True)
             context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
+
         if self.qdrant_client and kem.embeddings:
-            if len(kem.embeddings) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
-                msg = "Размерность эмбеддингов ({}) не совпадает с конфигурацией ({}).".format(len(kem.embeddings), self.config.DEFAULT_VECTOR_SIZE)
+            if len(kem.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
+                msg = f"Embedding dimension ({len(kem.embeddings)}) does not match Qdrant collection configuration ({self.config.DEFAULT_VECTOR_SIZE})."
                 logger.error(msg)
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg); return glm_service_pb2.StoreKEMResponse()
             try:
-                # --- НАЧАЛО ИЗМЕНЕНИЯ ---
                 qdrant_payload = {"kem_id_ref": kem_id}
                 if kem.metadata:
-                    for k, v_pb in kem.metadata.items():
-                        # Преобразуем Protobuf Value в Python значение, если это необходимо,
-                        # но KEM.metadata это map<string, string>, так что v_pb это уже строка.
-                        qdrant_payload[f"md_{k}"] = v_pb # Префикс "md_" для полей метаданных
-
+                    for k, v_pb_val in kem.metadata.items(): # KEM metadata is map<string, string>
+                        qdrant_payload[f"md_{k}"] = v_pb_val
                 if kem.HasField("created_at"):
                     qdrant_payload["created_at_ts"] = kem.created_at.seconds
                 if kem.HasField("updated_at"):
                     qdrant_payload["updated_at_ts"] = kem.updated_at.seconds
-                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
                 self.qdrant_client.upsert(
-                    collection_name=self.config.QDRANT_COLLECTION, # Используем self.config
-                    points=[PointStruct(id=kem_id, vector=list(kem.embeddings),
-                                        payload=qdrant_payload)] # Используем новый payload
+                    collection_name=self.config.QDRANT_COLLECTION,
+                    points=[PointStruct(id=kem_id, vector=list(kem.embeddings), payload=qdrant_payload)]
                 )
-                logger.info("Эмбеддинги и payload для КЕП ID '{}' сохранены/обновлены в Qdrant.".format(kem_id))
+                logger.info(f"Embeddings and payload for KEM ID '{kem_id}' saved/updated in Qdrant.")
             except Exception as e:
-                msg = "Ошибка Qdrant (StoreKEM) для ID '{}': {}".format(kem_id, e)
+                msg = f"Qdrant error (StoreKEM) for ID '{kem_id}': {e}"
                 logger.error(msg, exc_info=True)
+                # Potentially roll back SQLite change here if Qdrant fails? Current behavior: no rollback.
                 context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
-        logger.info("КЕП ID '{}' успешно сохранена/обновлена.".format(kem_id))
+
+        logger.info(f"KEM ID '{kem_id}' successfully saved/updated.")
         return glm_service_pb2.StoreKEMResponse(kem=kem)
 
-    def RetrieveKEMs(self, request, context):
+    def RetrieveKEMs(self, request: glm_service_pb2.RetrieveKEMsRequest, context) -> glm_service_pb2.RetrieveKEMsResponse:
         query = request.query
-        page_size = request.page_size if request.page_size > 0 else self.config.DEFAULT_PAGE_SIZE # Используем self.config
+        page_size = request.page_size if request.page_size > 0 else self.config.DEFAULT_PAGE_SIZE
         offset = 0
         if request.page_token:
-            try: offset = int(request.page_token)
-            except ValueError: logger.warning(f"Неверный формат page_token: '{request.page_token}'. Используется offset=0.")
-        logger.info(f"RetrieveKEMs: query={query}, page_size={page_size}, offset={offset}")
+            try:
+                offset = int(request.page_token)
+                if offset < 0: offset = 0 # Offset cannot be negative
+            except ValueError:
+                logger.warning(f"Invalid page_token format: '{request.page_token}'. Using offset=0.")
+
+        logger.info(f"RetrieveKEMs: query_filters={query.metadata_filters}, query_ids={list(query.ids)}, "
+                    f"vector_query_present={bool(query.embedding_query)}, page_size={page_size}, offset={offset}")
+
         found_kems_proto = []
         next_offset_str = ""
         embeddings_from_qdrant = {}
 
-        # Вспомогательная функция для построения фильтра Qdrant
-        # Помещена здесь для локальности, может быть вынесена на уровень класса или модуля
-        def _build_qdrant_filter_local(kem_query: glm_service_pb2.KEMQuery) -> models.Filter:
+        def _build_qdrant_filter_local(kem_query: glm_service_pb2.KEMQuery) -> typing.Optional[models.Filter]:
             q_conditions = []
             if kem_query.ids:
-                q_conditions.append(models.FieldCondition(key="kem_id_ref", match=models.MatchAny(any=list(kem_query.ids))))
+                # Qdrant point IDs are strings, KEM IDs are strings.
+                q_conditions.append(models.HasIdCondition(has_id=list(kem_query.ids)))
 
             if kem_query.metadata_filters:
-                for k, v in kem_query.metadata_filters.items():
-                    q_conditions.append(models.FieldCondition(key=f"md_{k}", match=models.MatchValue(value=v)))
+                for k, v_str in kem_query.metadata_filters.items():
+                    # Assuming metadata values are simple types that Qdrant can match.
+                    # Numbers might need specific handling if stored as numbers in Qdrant payload.
+                    # For now, assuming string match is sufficient for md_<key>.
+                    q_conditions.append(models.FieldCondition(key=f"md_{k}", match=models.MatchValue(value=v_str)))
 
             def add_ts_range_condition(field_name, ts_start, ts_end):
                 gte_val, lte_val = None, None
@@ -327,12 +293,12 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
         if query.embedding_query:
             if not self.qdrant_client:
-                context.abort(grpc.StatusCode.INTERNAL, "Qdrant сервис недоступен."); return glm_service_pb2.RetrieveKEMsResponse()
-            if len(query.embedding_query) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Неверная размерность вектора: {len(query.embedding_query)}, ожидалось {self.config.DEFAULT_VECTOR_SIZE}"); return glm_service_pb2.RetrieveKEMsResponse()
+                context.abort(grpc.StatusCode.INTERNAL, "Qdrant service unavailable."); return glm_service_pb2.RetrieveKEMsResponse()
+            if len(query.embedding_query) != self.config.DEFAULT_VECTOR_SIZE:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid vector dimension: {len(query.embedding_query)}, expected {self.config.DEFAULT_VECTOR_SIZE}"); return glm_service_pb2.RetrieveKEMsResponse()
             try:
-                qdrant_filter_obj = _build_qdrant_filter_local(query) # Используем локальную функцию
-                logger.debug(f"RetrieveKEMs: Qdrant filter object: {qdrant_filter_obj}")
+                qdrant_filter_obj = _build_qdrant_filter_local(query)
+                logger.debug(f"RetrieveKEMs (vector search): Qdrant filter object: {qdrant_filter_obj}")
 
                 search_result = self.qdrant_client.search(
                     collection_name=self.config.QDRANT_COLLECTION,
@@ -340,282 +306,351 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     query_filter=qdrant_filter_obj,
                     limit=page_size,
                     offset=offset,
-                    with_vectors=True
-                ) # Используем self.config
-                qdrant_ids_to_filter = [hit.id for hit in search_result]
-                for hit in search_result: embeddings_from_qdrant[hit.id] = list(hit.vector) if hit.vector else []
-                if not qdrant_ids_to_filter: return glm_service_pb2.RetrieveKEMsResponse(kems=[], next_page_token="")
-                placeholders = ','.join('?' for _ in qdrant_ids_to_filter)
-                sql_query_base = f"SELECT id, content_type, content, metadata, created_at, updated_at FROM kems WHERE id IN ({placeholders})"
-                sql_query_final = sql_query_base + f" ORDER BY INSTR(',' || ({placeholders}) || ',', ',' || id || ',')"
-                sql_params = qdrant_ids_to_filter * 2
+                    with_vectors=True # Retrieve vectors to populate KEM proto
+                )
+
+                qdrant_ids_retrieved = [hit.id for hit in search_result]
+                for hit in search_result:
+                    if hit.vector: embeddings_from_qdrant[hit.id] = list(hit.vector)
+
+                if not qdrant_ids_retrieved:
+                    return glm_service_pb2.RetrieveKEMsResponse(kems=[], next_page_token="")
+
+                # Fetch from SQLite using the order from Qdrant
+                placeholders = ','.join('?' for _ in qdrant_ids_retrieved)
+                sql_query_final = f"SELECT id, content_type, content, metadata, created_at, updated_at FROM kems WHERE id IN ({placeholders}) ORDER BY INSTR(',' || ? || ',', ',' || id || ',')"
+                # The INSTR trick preserves Qdrant's ordering by searching for ',id,' in ',id1,id2,id3,'
+                ordered_ids_string = ',' + ','.join(qdrant_ids_retrieved) + ','
+
                 with self._get_sqlite_conn() as conn:
                     conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-                    cursor.execute(sql_query_final, sql_params)
-                    for row_dict in cursor.fetchall(): found_kems_proto.append(self._kem_from_db_row(row_dict, embeddings_from_qdrant))
-                if len(search_result) == page_size: next_offset_str = str(offset + page_size)
+                    cursor.execute(sql_query_final, (ordered_ids_string,) + tuple(qdrant_ids_retrieved) )
+                    for row_dict in cursor.fetchall():
+                        found_kems_proto.append(self._kem_from_db_row(row_dict, embeddings_from_qdrant))
+
+                if len(search_result) == page_size: # Potential next page if Qdrant returned a full page
+                    # To confirm, Qdrant's SearchResponse usually has a `next_page_offset` if available.
+                    # Or we can assume if limit items were returned, there might be more.
+                    next_offset_str = str(offset + page_size)
+
             except Exception as e:
-                logger.error(f"Ошибка Qdrant (RetrieveKEMs - vector search): {e}", exc_info=True)
-                context.abort(grpc.StatusCode.INTERNAL, f"Ошибка Qdrant: {e}"); return glm_service_pb2.RetrieveKEMsResponse()
-        else:
+                logger.error(f"Qdrant error (RetrieveKEMs - vector search): {e}", exc_info=True)
+                context.abort(grpc.StatusCode.INTERNAL, f"Qdrant error: {e}"); return glm_service_pb2.RetrieveKEMsResponse()
+        else: # Non-vector search (SQLite primary)
             sql_conditions = []; sql_params = []
             if query.ids:
-                placeholders = ','.join('?' for _ in query.ids); sql_conditions.append(f"id IN ({placeholders})"); sql_params.extend(query.ids)
+                placeholders = ','.join('?' for _ in query.ids)
+                sql_conditions.append(f"id IN ({placeholders})"); sql_params.extend(query.ids)
+
             for key, value in query.metadata_filters.items():
                 sql_conditions.append(f"json_extract(metadata, '$.{key}') = ?"); sql_params.append(value)
+
             def add_date_condition(field_name, proto_ts, op):
                 if proto_ts.seconds > 0 or proto_ts.nanos > 0:
-                    sql_conditions.append(f"{field_name} {op} ?"); sql_params.append(proto_ts.ToDatetime().isoformat())
+                    # SQLite stores dates as TEXT in ISO format
+                    sql_conditions.append(f"{field_name} {op} ?"); sql_params.append(proto_ts.ToDatetime().isoformat().split('.')[0]) # Store as YYYY-MM-DD HH:MM:SS
+
             add_date_condition("created_at", query.created_at_start, ">="); add_date_condition("created_at", query.created_at_end, "<=")
             add_date_condition("updated_at", query.updated_at_start, ">="); add_date_condition("updated_at", query.updated_at_end, "<=")
+
             sql_where_clause = " WHERE " + " AND ".join(sql_conditions) if sql_conditions else ""
+            # Default sort for non-vector search; can be made configurable
             sql_query_ordered = f"SELECT id, content_type, content, metadata, created_at, updated_at FROM kems{sql_where_clause} ORDER BY updated_at DESC"
             sql_query_paginated = f"{sql_query_ordered} LIMIT ? OFFSET ?"
+
             try:
                 with self._get_sqlite_conn() as conn:
                     conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-                    cursor.execute(sql_query_paginated, sql_params + [page_size, offset])
+                    final_sql_params = sql_params + [page_size, offset]
+                    cursor.execute(sql_query_paginated, final_sql_params)
                     rows = cursor.fetchall()
+
                     ids_from_sqlite = [row['id'] for row in rows]
-                    if ids_from_sqlite and self.qdrant_client:
+                    if ids_from_sqlite and self.qdrant_client: # Fetch embeddings if Qdrant is available
                         try:
-                            q_points = self.qdrant_client.retrieve(self.config.QDRANT_COLLECTION, ids=ids_from_sqlite, with_vectors=True) # Используем self.config
-                            for p in q_points:
-                                if p.vector: embeddings_from_qdrant[p.id] = list(p.vector)
-                        except Exception as e_qd_retrieve: logger.warning(f"Не удалось получить эмбеддинги: {e_qd_retrieve}")
-                    for row_dict in rows: found_kems_proto.append(self._kem_from_db_row(row_dict, embeddings_from_qdrant))
-                    if len(rows) == page_size:
+                            qdrant_points = self.qdrant_client.retrieve(
+                                collection_name=self.config.QDRANT_COLLECTION,
+                                ids=ids_from_sqlite,
+                                with_vectors=True
+                            )
+                            for point in qdrant_points:
+                                if point.vector: embeddings_from_qdrant[point.id] = list(point.vector)
+                        except Exception as e_qd_retrieve:
+                            logger.warning(f"Failed to retrieve embeddings for KEMs from Qdrant: {e_qd_retrieve}")
+
+                    for row_dict in rows:
+                        found_kems_proto.append(self._kem_from_db_row(row_dict, embeddings_from_qdrant))
+
+                    if len(rows) == page_size: # Check if there might be a next page
                         cursor_count = conn.cursor()
-                        cursor_count.execute(f"SELECT COUNT(1) FROM ({sql_query_ordered} LIMIT 1 OFFSET ?)", sql_params + [offset + page_size])
-                        if cursor_count.fetchone()[0] > 0: next_offset_str = str(offset + page_size)
+                        # Check if there's at least one more record beyond the current page
+                        count_params = sql_params + [offset + page_size]
+                        cursor_count.execute(f"SELECT EXISTS({sql_query_ordered} LIMIT 1 OFFSET ?)", count_params)
+                        if cursor_count.fetchone()[0] == 1:
+                            next_offset_str = str(offset + page_size)
             except Exception as e:
-                logger.error(f"Ошибка SQLite (RetrieveKEMs non-vector): {e}", exc_info=True)
-                context.abort(grpc.StatusCode.INTERNAL, f"Ошибка SQLite: {e}"); return glm_service_pb2.RetrieveKEMsResponse()
+                logger.error(f"SQLite error (RetrieveKEMs non-vector): {e}", exc_info=True)
+                context.abort(grpc.StatusCode.INTERNAL, f"SQLite error: {e}"); return glm_service_pb2.RetrieveKEMsResponse()
+
         return glm_service_pb2.RetrieveKEMsResponse(kems=found_kems_proto, next_page_token=next_offset_str)
 
-    def UpdateKEM(self, request, context):
-        # ... (остается без изменений) ...
+    def UpdateKEM(self, request: glm_service_pb2.UpdateKEMRequest, context) -> kem_pb2.KEM:
         kem_id = request.kem_id; kem_data_update = request.kem_data_update
-        if not kem_id: context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID должен быть указан"); return kem_pb2.KEM()
+        if not kem_id:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID must be specified for update.")
+            return kem_pb2.KEM() # Should not be reached due to abort
+
         try:
             with self._get_sqlite_conn() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT id, content_type, content, metadata, created_at, updated_at FROM kems WHERE id = ?", (kem_id,))
                 row = cursor.fetchone()
-                if not row: context.abort(grpc.StatusCode.NOT_FOUND, f"КЕП с ID '{kem_id}' не найдена"); return kem_pb2.KEM()
-                current_kem_dict = dict(row)
-                current_kem_dict['metadata'] = json.loads(current_kem_dict.get('metadata', '{}'))
-                original_created_at_iso = current_kem_dict['created_at']
+                if not row:
+                    context.abort(grpc.StatusCode.NOT_FOUND, f"KEM with ID '{kem_id}' not found for update.")
+                    return kem_pb2.KEM()
+
+                current_kem_dict = dict(row) # Convert row to dict for easier manipulation
+                current_kem_dict['metadata'] = json.loads(current_kem_dict.get('metadata', '{}')) # Parse metadata JSON
+                original_created_at_iso = current_kem_dict['created_at'] # Preserve original creation time
+
+                # Apply updates from request
                 if kem_data_update.HasField("content_type"): current_kem_dict['content_type'] = kem_data_update.content_type
-                if kem_data_update.HasField("content"): current_kem_dict['content'] = kem_data_update.content.value
-                if kem_data_update.metadata: current_kem_dict['metadata'] = dict(kem_data_update.metadata)
+                if kem_data_update.HasField("content"): current_kem_dict['content'] = kem_data_update.content.value # content is bytes
+                if kem_data_update.metadata: # If metadata is provided, it replaces the old one
+                    current_kem_dict['metadata'] = dict(kem_data_update.metadata)
+
                 ts_now = Timestamp(); ts_now.GetCurrentTime()
-                current_kem_dict['updated_at'] = ts_now.ToDatetime().isoformat()
+                current_kem_dict['updated_at'] = ts_now.ToDatetime().isoformat().replace('+00:00', '') # Store as naive UTC
+
+                # Update SQLite
                 cursor.execute("UPDATE kems SET content_type = ?, content = ?, metadata = ?, updated_at = ? WHERE id = ?",
-                               (current_kem_dict['content_type'], current_kem_dict['content'], json.dumps(current_kem_dict['metadata']), current_kem_dict['updated_at'], kem_id))
+                               (current_kem_dict['content_type'], current_kem_dict['content'],
+                                json.dumps(current_kem_dict['metadata']),
+                                current_kem_dict['updated_at'], kem_id))
                 conn.commit()
 
-                final_embeddings = list(kem_data_update.embeddings)
+                # Prepare Qdrant update
+                final_embeddings = list(kem_data_update.embeddings) # Use new embeddings if provided
                 qdrant_payload_update = {"kem_id_ref": kem_id}
-
-                # Собираем payload для Qdrant из обновленных данных KEM
-                # Метаданные берем из current_kem_dict['metadata'], так как они уже обновлены
                 if current_kem_dict.get('metadata'):
-                    for k, v in current_kem_dict['metadata'].items():
-                        qdrant_payload_update[f"md_{k}"] = v
+                    for k, v_str in current_kem_dict['metadata'].items(): # metadata values are already strings
+                        qdrant_payload_update[f"md_{k}"] = v_str
 
-                # created_at берем из оригинальной записи (не меняется при обновлении)
-                # updated_at берем новый (ts_now)
-                # Для этого нужно будет преобразовать original_created_at_iso и ts_now в секунды
-                try:
-                    # Преобразуем ISO строку created_at обратно в Timestamp, затем в секунды
+                try: # Parse original created_at for Qdrant payload
                     created_at_proto_for_qdrant = Timestamp()
-                    created_at_proto_for_qdrant.FromJsonString(original_created_at_iso + "Z" if not original_created_at_iso.endswith("Z") else original_created_at_iso)
+                    created_at_proto_for_qdrant.FromJsonString(original_created_at_iso + ("Z" if not original_created_at_iso.endswith("Z") else ""))
                     qdrant_payload_update["created_at_ts"] = created_at_proto_for_qdrant.seconds
                 except Exception as e_ts_create:
-                    logger.warning(f"UpdateKEM: Не удалось распарсить original_created_at_iso ('{original_created_at_iso}') для Qdrant payload: {e_ts_create}")
-
+                    logger.warning(f"UpdateKEM: Failed to parse original_created_at_iso ('{original_created_at_iso}') for Qdrant payload: {e_ts_create}")
                 qdrant_payload_update["updated_at_ts"] = ts_now.seconds
 
-
                 if self.qdrant_client:
-                    if final_embeddings: # Если в запросе на обновление есть эмбеддинги
+                    vector_to_upsert: typing.Optional[list[float]] = None
+                    if final_embeddings: # New embeddings provided
                         if len(final_embeddings) != self.config.DEFAULT_VECTOR_SIZE:
-                            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Неверная размерность эмбеддингов: {len(final_embeddings)}, ожидалось {self.config.DEFAULT_VECTOR_SIZE}"); return kem_pb2.KEM()
-                        # Обновляем и вектор, и payload
-                        self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION,
-                                                  points=[PointStruct(id=kem_id, vector=final_embeddings, payload=qdrant_payload_update)])
-                        logger.info(f"UpdateKEM: Вектор и payload для КЕП ID '{kem_id}' обновлены в Qdrant.")
-                    else: # Эмбеддинги не переданы в запросе на обновление, обновляем только payload
-                          # Предполагаем, что вектор остается прежним. Qdrant позволяет обновлять только payload.
-                          # Для этого нужно использовать client.set_payload или client.overwrite_payload
-                          # или client.upsert с тем же вектором, если он известен.
-                          # Проще всего здесь - если нет новых эмбеддингов, не трогать вектор, только payload.
-                          # Но upsert без вектора удалит существующий вектор.
-                          # Поэтому, если эмбеддинги не предоставлены, мы ДОЛЖНЫ извлечь существующий вектор.
-                        points_resp = self.qdrant_client.get_points(self.config.QDRANT_COLLECTION, ids=[kem_id], with_vectors=True)
-                        if points_resp.points and points_resp.points[0].vector:
-                            existing_vector = list(points_resp.points[0].vector)
-                            final_embeddings = existing_vector # Сохраняем для возврата в KEM
-                            self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION,
-                                                      points=[PointStruct(id=kem_id, vector=existing_vector, payload=qdrant_payload_update)])
-                            logger.info(f"UpdateKEM: Payload для КЕП ID '{kem_id}' обновлен в Qdrant (вектор сохранен).")
-                        else: # Вектора не было или не удалось получить
-                            # Если вектора не было, а payload хотим обновить, то это upsert без вектора
-                            self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION,
-                                                      points=[PointStruct(id=kem_id, vector=None, payload=qdrant_payload_update)])
-                            logger.info(f"UpdateKEM: Payload для КЕП ID '{kem_id}' обновлен в Qdrant (вектор отсутствует или не изменен).")
+                            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid embedding dimension: {len(final_embeddings)}, expected {self.config.DEFAULT_VECTOR_SIZE}"); return kem_pb2.KEM()
+                        vector_to_upsert = final_embeddings
+                        logger.info(f"UpdateKEM: Updating vector and payload for KEM ID '{kem_id}' in Qdrant.")
+                    else: # No new embeddings, try to preserve existing or use None
+                        points_resp = self.qdrant_client.retrieve(self.config.QDRANT_COLLECTION, ids=[kem_id], with_vectors=True)
+                        if points_resp and points_resp[0].vector: # Qdrant returns list of points
+                            existing_vector = list(points_resp[0].vector)
+                            final_embeddings = existing_vector # For response KEM
+                            vector_to_upsert = existing_vector
+                            logger.info(f"UpdateKEM: Preserving existing vector, updating payload for KEM ID '{kem_id}' in Qdrant.")
+                        else: # No existing vector or couldn't retrieve
+                            logger.info(f"UpdateKEM: No new or existing vector found. Updating payload for KEM ID '{kem_id}' in Qdrant (vector will be None).")
 
-                current_kem_dict['created_at'] = original_created_at_iso
+                    self.qdrant_client.upsert(collection_name=self.config.QDRANT_COLLECTION,
+                                              points=[PointStruct(id=kem_id, vector=vector_to_upsert, payload=qdrant_payload_update)])
+
+                # Construct the KEM to return
+                current_kem_dict['created_at'] = original_created_at_iso # Keep original string format for proto dict
                 current_kem_dict['embeddings'] = final_embeddings
                 return self._kem_dict_to_proto(current_kem_dict)
-        except grpc.RpcError: raise
-        except Exception as e:
-            logger.error(f"Ошибка при обновлении КЕП ID '{kem_id}': {e}", exc_info=True)
-            context.abort(grpc.StatusCode.INTERNAL, f"Ошибка обновления: {e}"); return kem_pb2.KEM()
 
-    def DeleteKEM(self, request, context):
-        # ... (остается без изменений) ...
+        except grpc.RpcError: raise # Re-raise gRPC errors if they were aborted by context
+        except Exception as e:
+            logger.error(f"Error updating KEM ID '{kem_id}': {e}", exc_info=True)
+            context.abort(grpc.StatusCode.INTERNAL, f"Update error: {e}"); return kem_pb2.KEM() # Should not be reached
+
+    def DeleteKEM(self, request: glm_service_pb2.DeleteKEMRequest, context) -> empty_pb2.Empty:
         kem_id = request.kem_id
-        if not kem_id: context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID должен быть указан"); return empty_pb2.Empty()
+        if not kem_id:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID must be specified for deletion.")
+            return empty_pb2.Empty() # Should not be reached
+
         try:
             with self._get_sqlite_conn() as conn:
-                cursor = conn.cursor(); cursor.execute("DELETE FROM kems WHERE id = ?", (kem_id,))
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM kems WHERE id = ?", (kem_id,))
                 conn.commit()
-                if cursor.rowcount == 0: logger.warning(f"КЕП ID '{kem_id}' не найдена в SQLite для удаления.")
-                else: logger.info(f"КЕП ID '{kem_id}' удалена из SQLite.")
+                if cursor.rowcount == 0:
+                    logger.warning(f"KEM ID '{kem_id}' not found in SQLite for deletion (or already deleted).")
+                else:
+                    logger.info(f"KEM ID '{kem_id}' deleted from SQLite.")
+
             if self.qdrant_client:
-                try: self.qdrant_client.delete_points(self.config.QDRANT_COLLECTION, points_selector=models.PointIdsList(points=[kem_id])) # Используем self.config
-                except Exception as e_qd_del: logger.warning(f"Ошибка при удалении из Qdrant ID '{kem_id}': {e_qd_del}")
+                try:
+                    # Qdrant delete_points expects a list of point IDs or a filter.
+                    # Using PointIdsList for explicit ID deletion.
+                    self.qdrant_client.delete_points(
+                        collection_name=self.config.QDRANT_COLLECTION,
+                        points_selector=models.PointIdsList(points=[kem_id])
+                    )
+                    logger.info(f"Point for KEM ID '{kem_id}' deleted/marked for deletion from Qdrant.")
+                except Exception as e_qd_del:
+                    # Log warning but don't fail the whole operation if Qdrant delete fails,
+                    # as SQLite part was successful. Consistency might be an issue.
+                    logger.warning(f"Error deleting point for KEM ID '{kem_id}' from Qdrant: {e_qd_del}")
+
             return empty_pb2.Empty()
         except Exception as e:
-            logger.error(f"Ошибка DeleteKEM для ID '{kem_id}': {e}", exc_info=True)
-            context.abort(grpc.StatusCode.INTERNAL, f"Ошибка удаления: {e}"); return empty_pb2.Empty()
+            logger.error(f"Error in DeleteKEM for ID '{kem_id}': {e}", exc_info=True)
+            context.abort(grpc.StatusCode.INTERNAL, f"Deletion error: {e}"); return empty_pb2.Empty()
 
-    def BatchStoreKEMs(self, request: glm_service_pb2.BatchStoreKEMsRequest, context):
-        logger.info(f"BatchStoreKEMs: Получено {len(request.kems)} КЕП для сохранения.")
+    def BatchStoreKEMs(self, request: glm_service_pb2.BatchStoreKEMsRequest, context) -> glm_service_pb2.BatchStoreKEMsResponse:
+        logger.info(f"BatchStoreKEMs: Received {len(request.kems)} KEMs for storage.")
         successfully_stored_kems_list = []
         failed_kem_references_list = []
 
-        for idx, kem_in in enumerate(request.kems):
-            current_kem_processed = kem_pb2.KEM()
-            current_kem_processed.CopyFrom(kem_in)
-            kem_id = current_kem_processed.id if current_kem_processed.id else str(uuid.uuid4())
-            current_kem_processed.id = kem_id
+        for idx, kem_in_req in enumerate(request.kems):
+            # Create a mutable copy of the KEM from request
+            current_kem_to_process = kem_pb2.KEM()
+            current_kem_to_process.CopyFrom(kem_in_req)
 
-            current_time_proto = Timestamp()
-            current_time_proto.GetCurrentTime()
+            kem_id = current_kem_to_process.id if current_kem_to_process.id else str(uuid.uuid4())
+            current_kem_to_process.id = kem_id
+
+            current_time_proto = Timestamp(); current_time_proto.GetCurrentTime()
             final_created_at_proto = Timestamp()
-            is_new_kem = True
+            is_new_kem_in_db = True
+            sqlite_persisted_this_op = False
+            qdrant_persisted_this_op = True # Assume success if no embeddings or no Qdrant client
 
-            sqlite_persisted_this_kem = False
-            qdrant_persisted_this_kem = True # True if no embeddings or no qdrant client
-
-            # Шаг 1: Сохранение/Обновление в SQLite
+            # Step 1: Persist to SQLite
             try:
                 with self._get_sqlite_conn() as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT created_at FROM kems WHERE id = ?", (kem_id,))
                     existing_row = cursor.fetchone()
                     if existing_row:
-                        is_new_kem = False
-                        final_created_at_proto.FromJsonString(existing_row[0] + "Z")
+                        is_new_kem_in_db = False
+                        final_created_at_proto.FromJsonString(existing_row[0] + ("Z" if not existing_row[0].endswith("Z") else ""))
 
-                    if is_new_kem:
-                        final_created_at_proto.CopyFrom(current_kem_processed.created_at if current_kem_processed.HasField("created_at") else current_time_proto)
+                    if is_new_kem_in_db:
+                        final_created_at_proto.CopyFrom(current_kem_to_process.created_at if current_kem_to_process.HasField("created_at") and current_kem_to_process.created_at.seconds > 0 else current_time_proto)
 
-                    current_kem_processed.created_at.CopyFrom(final_created_at_proto)
-                    current_kem_processed.updated_at.CopyFrom(current_time_proto)
+                    current_kem_to_process.created_at.CopyFrom(final_created_at_proto)
+                    current_kem_to_process.updated_at.CopyFrom(current_time_proto)
 
                     cursor.execute('''
                     INSERT OR REPLACE INTO kems (id, content_type, content, metadata, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (current_kem_processed.id, current_kem_processed.content_type, current_kem_processed.content,
-                          json.dumps(dict(current_kem_processed.metadata)),
-                          current_kem_processed.created_at.ToDatetime().isoformat(),
-                          current_kem_processed.updated_at.ToDatetime().isoformat()))
+                    ''', (current_kem_to_process.id, current_kem_to_process.content_type,
+                          current_kem_to_process.content, json.dumps(dict(current_kem_to_process.metadata)),
+                          current_kem_to_process.created_at.ToDatetime().isoformat().replace('+00:00', ''),
+                          current_kem_to_process.updated_at.ToDatetime().isoformat().replace('+00:00', '')))
                     conn.commit()
-                sqlite_persisted_this_kem = True
+                sqlite_persisted_this_op = True
             except Exception as e_sqlite:
-                logger.error(f"BatchStoreKEMs: Ошибка SQLite для КЕП ID '{kem_id}' (индекс {idx}): {e_sqlite}", exc_info=True)
-                failed_kem_references_list.append(kem_in.id if kem_in.id else f"req_idx_{idx}")
-                continue # Переходим к следующей КЕП, эта не удалась на этапе SQLite
+                logger.error(f"BatchStoreKEMs: SQLite error for KEM (client ID '{kem_in_req.id}', server ID '{kem_id}', index {idx}): {e_sqlite}", exc_info=True)
+                failed_kem_references_list.append(kem_in_req.id if kem_in_req.id else f"req_idx_{idx}_generated_id_{kem_id}")
+                continue # Move to the next KEM in batch
 
-            # Шаг 2: Сохранение/Обновление эмбеддингов в Qdrant (только если SQLite был успешен)
-            has_embeddings = current_kem_processed.embeddings and len(current_kem_processed.embeddings) > 0
+            # Step 2: Persist to Qdrant if embeddings exist
+            has_embeddings = bool(current_kem_to_process.embeddings)
 
             if has_embeddings:
                 if not self.qdrant_client:
-                    logger.error(f"BatchStoreKEMs: Qdrant клиент не доступен, не удается сохранить эмбеддинги для КЕП ID '{kem_id}'.")
-                    qdrant_persisted_this_kem = False
-                elif len(current_kem_processed.embeddings) != self.config.DEFAULT_VECTOR_SIZE: # Используем self.config
-                    logger.error(f"BatchStoreKEMs: Неверная размерность эмбеддингов ({len(current_kem_processed.embeddings)}) для КЕП ID '{kem_id}'. Ожидалось {self.config.DEFAULT_VECTOR_SIZE}.")
-                    qdrant_persisted_this_kem = False
+                    logger.error(f"BatchStoreKEMs: Qdrant client not available, cannot save embeddings for KEM ID '{kem_id}'.")
+                    qdrant_persisted_this_op = False
+                elif len(current_kem_to_process.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
+                    logger.error(f"BatchStoreKEMs: Invalid embedding dimension ({len(current_kem_to_process.embeddings)}) for KEM ID '{kem_id}'. Expected {self.config.DEFAULT_VECTOR_SIZE}.")
+                    qdrant_persisted_this_op = False
                 else:
                     try:
+                        qdrant_payload = {"kem_id_ref": kem_id}
+                        if current_kem_to_process.metadata:
+                            for k, v_str in current_kem_to_process.metadata.items(): qdrant_payload[f"md_{k}"] = v_str
+                        if current_kem_to_process.HasField("created_at"): qdrant_payload["created_at_ts"] = current_kem_to_process.created_at.seconds
+                        if current_kem_to_process.HasField("updated_at"): qdrant_payload["updated_at_ts"] = current_kem_to_process.updated_at.seconds
+
                         self.qdrant_client.upsert(
-                            collection_name=self.config.QDRANT_COLLECTION, # Используем self.config
-                            points=[PointStruct(id=kem_id, vector=list(current_kem_processed.embeddings), payload={"kem_id_ref": kem_id})]
+                            collection_name=self.config.QDRANT_COLLECTION,
+                            points=[PointStruct(id=kem_id, vector=list(current_kem_to_process.embeddings), payload=qdrant_payload)]
                         )
                     except Exception as e_qdrant:
-                        logger.error(f"BatchStoreKEMs: Ошибка Qdrant для КЕП ID '{kem_id}': {e_qdrant}", exc_info=True)
-                        qdrant_persisted_this_kem = False
-            # Если эмбеддингов нет, qdrant_persisted_this_kem остается True
+                        logger.error(f"BatchStoreKEMs: Qdrant error for KEM ID '{kem_id}': {e_qdrant}", exc_info=True)
+                        qdrant_persisted_this_op = False
 
-            # Шаг 3: Проверка консистентности и откат SQLite при необходимости
-            if sqlite_persisted_this_kem and not qdrant_persisted_this_kem:
-                # Если эмбеддинги были, но не сохранились в Qdrant, или Qdrant был недоступен.
-                if kem_id not in failed_kem_references_list: # Добавляем в ошибки, если еще не там
-                    failed_kem_references_list.append(kem_id)
+            # Step 3: Check consistency and roll back SQLite if needed
+            if sqlite_persisted_this_op and not qdrant_persisted_this_op: # (Qdrant failed but SQLite succeeded for a KEM with embeddings)
+                if kem_id not in failed_kem_references_list: # Add to failed list
+                    failed_kem_references_list.append(kem_in_req.id if kem_in_req.id else f"req_idx_{idx}_generated_id_{kem_id}")
                 try:
                     with self._get_sqlite_conn() as conn_cleanup:
                         cursor_cleanup = conn_cleanup.cursor()
                         cursor_cleanup.execute("DELETE FROM kems WHERE id = ?", (kem_id,))
                         conn_cleanup.commit()
-                        logger.info(f"BatchStoreKEMs: Запись для КЕП ID '{kem_id}' удалена из SQLite из-за ошибки/отсутствия Qdrant при наличии эмбеддингов.")
+                        logger.info(f"BatchStoreKEMs: Record for KEM ID '{kem_id}' deleted from SQLite due to Qdrant error/absence when embeddings were present.")
                 except Exception as e_cleanup:
-                    logger.critical(f"BatchStoreKEMs: КРИТИЧЕСКАЯ ОШИБКА при откате SQLite для КЕП ID '{kem_id}': {e_cleanup}")
-            elif sqlite_persisted_this_kem and qdrant_persisted_this_kem:
-                successfully_stored_kems_list.append(current_kem_processed)
-            # else: если sqlite_persisted_this_kem == False, КЕП уже в failed_kem_references_list
+                    logger.critical(f"BatchStoreKEMs: CRITICAL ERROR during SQLite rollback for KEM ID '{kem_id}': {e_cleanup}")
+            elif sqlite_persisted_this_op and qdrant_persisted_this_op: # All good for this KEM
+                successfully_stored_kems_list.append(current_kem_to_process)
+            # If sqlite_persisted_this_op is False, it's already in failed_kem_references_list.
 
-        logger.info(f"BatchStoreKEMs: Успешно обработано {len(successfully_stored_kems_list)} КЕП, не удалось обработать {len(set(failed_kem_references_list))} КЕП.")
+        logger.info(f"BatchStoreKEMs: Successfully processed {len(successfully_stored_kems_list)} KEMs, failed to process {len(set(failed_kem_references_list))} KEMs.")
+
+        # Remove duplicates from failed_kem_references_list before returning
+        unique_failed_refs = list(set(failed_kem_references_list))
 
         response = glm_service_pb2.BatchStoreKEMsResponse(
             successfully_stored_kems=successfully_stored_kems_list,
-            failed_kem_references=list(set(failed_kem_references_list))
+            failed_kem_references=unique_failed_refs
         )
 
         if response.failed_kem_references:
-            response.overall_error_message = f"Не удалось полностью сохранить {len(response.failed_kem_references)} КЕП из пакета."
-        elif not request.kems and not successfully_stored_kems_list :
-            response.overall_error_message = "Получен пустой список КЕП для сохранения."
+            response.overall_error_message = f"Failed to fully store {len(response.failed_kem_references)} KEMs from the batch."
+        elif not request.kems and not successfully_stored_kems_list : # Empty request and empty success list
+            response.overall_error_message = "Received an empty list of KEMs to store."
+        # If request was not empty but all failed, overall_error_message will be set by the failed_kem_references condition.
+        # If request was not empty and all succeeded, overall_error_message will be empty.
 
         return response
 
 def serve():
-    # Используем глобальный объект config
-    logger.info(f"Конфигурация GLM: Qdrant={config.QDRANT_HOST}:{config.QDRANT_PORT} ({config.QDRANT_COLLECTION}), SQLite={os.path.join(app_dir, config.DB_FILENAME)}, gRPC Адрес={config.GRPC_LISTEN_ADDRESS}, LogLevel={config.LOG_LEVEL}")
+    logger.info(f"GLM Configuration: Qdrant={config.QDRANT_HOST}:{config.QDRANT_PORT} (Collection: '{config.QDRANT_COLLECTION}'), "
+                f"SQLite DB={os.path.join(app_dir, config.DB_FILENAME)}, gRPC Address={config.GRPC_LISTEN_ADDRESS}, LogLevel={config.LOG_LEVEL}")
     try:
+        # Test Qdrant connection early
         client_test = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT, timeout=2)
-        client_test.get_collections()
-        logger.info(f"Qdrant доступен на {config.QDRANT_HOST}:{config.QDRANT_PORT}.")
+        client_test.get_collections() # A simple call to check connectivity
+        logger.info(f"Qdrant is available at {config.QDRANT_HOST}:{config.QDRANT_PORT}.")
     except Exception as e:
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: Qdrant недоступен. {e}. Сервер НЕ ЗАПУЩЕН.")
+        logger.critical(f"CRITICAL ERROR: Qdrant is unavailable at {config.QDRANT_HOST}:{config.QDRANT_PORT}. Details: {e}. Server NOT STARTED.")
         return
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     try:
         servicer_instance = GlobalLongTermMemoryServicerImpl()
-    except Exception as e:
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА при инициализации GlobalLongTermMemoryServicerImpl: {e}")
+    except Exception as e: # Catch any exception during servicer initialization
+        logger.critical(f"CRITICAL ERROR initializing GlobalLongTermMemoryServicerImpl: {e}", exc_info=True)
         return
 
     glm_service_pb2_grpc.add_GlobalLongTermMemoryServicer_to_server(servicer_instance, server)
-    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS) # Используем config
-    logger.info(f"Запуск GLM сервера на {config.GRPC_LISTEN_ADDRESS}...")
-    server.start(); logger.info(f"GLM сервер запущен."); server.wait_for_termination()
-    logger.info("GLM сервер остановлен.")
+    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
+    logger.info(f"Starting GLM server on {config.GRPC_LISTEN_ADDRESS}...")
+    server.start()
+    logger.info(f"GLM server started and listening on {config.GRPC_LISTEN_ADDRESS}.")
+
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info("GLM server stopping via KeyboardInterrupt...")
+    finally:
+        server.stop(grace=5) # Allow 5 seconds for ongoing RPCs to complete
+        logger.info("GLM server stopped.")
 
 if __name__ == '__main__':
     serve()
