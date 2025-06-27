@@ -162,15 +162,14 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         kem_dict = dict(row)
         kem_dict['metadata'] = json.loads(kem_dict.get('metadata', '{}'))
         created_at_ts = Timestamp()
-        created_at_str = kem_dict.get('created_at')
-        if created_at_str: # Check if the string is not None or empty
+        if kem_dict.get('created_at'):
+            created_at_str = kem_dict['created_at']
             if not created_at_str.endswith("Z"): created_at_str += "Z" # Ensure Zulu timezone for FromJsonString
             created_at_ts.FromJsonString(created_at_str)
         kem_dict['created_at'] = created_at_ts
-
         updated_at_ts = Timestamp()
-        updated_at_str = kem_dict.get('updated_at')
-        if updated_at_str: # Check if the string is not None or empty
+        if kem_dict.get('updated_at'):
+            updated_at_str = kem_dict['updated_at']
             if not updated_at_str.endswith("Z"): updated_at_str += "Z"
             updated_at_ts.FromJsonString(updated_at_str)
         kem_dict['updated_at'] = updated_at_ts
