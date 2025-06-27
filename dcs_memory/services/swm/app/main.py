@@ -1,18 +1,20 @@
-import grpc.aio as grpc_aio # Changed import for asyncio server
-import asyncio # Added for asyncio
+import grpc.aio as grpc_aio
+import asyncio
 import time
 import sys
 import os
 import uuid
 import logging
 import threading
-import asyncio # Re-importing for clarity, though already imported above
-import queue as sync_queue # Keep sync_queue for now if used by non-async parts, or refactor fully
+import asyncio
+import queue # Renamed to sync_queue if still needed, but asyncio.Queue is primary for events
+# import queue as sync_queue # This was the previous thought, directly use queue for clarity if needed
 
 from dataclasses import dataclass, field
 from cachetools import LRUCache, Cache
 from google.protobuf.timestamp_pb2 import Timestamp
 import typing
+from typing import Optional, List, Set, Dict, Callable, AsyncGenerator, Tuple
 
 from .config import SWMConfig
 
@@ -41,8 +43,10 @@ from dcs_memory.common.grpc_utils import retry_grpc_call
 
 @dataclass
 class SubscriberInfo:
-    event_queue: asyncio.Queue # Changed to asyncio.Queue
+    event_queue: asyncio.Queue
     topics: typing.List[swm_service_pb2.SubscriptionTopic] = field(default_factory=list)
+    parsed_filters: Dict[str, Set[str]] = field(default_factory=dict)
+    subscribes_to_all_kem_lifecycle: bool = False
 
 class IndexedLRUCache(Cache):
     def __init__(self, maxsize, indexed_keys: typing.List[str], on_evict_callback: typing.Optional[typing.Callable[[kem_pb2.KEM], None]] = None):
@@ -50,16 +54,12 @@ class IndexedLRUCache(Cache):
         self._lru = LRUCache(maxsize=maxsize)
         self._indexed_keys = set(indexed_keys)
         self._metadata_indexes: typing.Dict[str, typing.Dict[str, typing.Set[str]]] = {key: {} for key in self._indexed_keys}
-        self._lock = threading.Lock() # Sync lock, as cachetools is sync
+        self._lock = threading.Lock()
         self._on_evict_callback = on_evict_callback
-
     def _add_to_metadata_indexes(self, kem: kem_pb2.KEM):
         if not kem or not kem.id: return
         for meta_key in self._indexed_keys:
-            if meta_key in kem.metadata:
-                value = kem.metadata[meta_key]
-                self._metadata_indexes.setdefault(meta_key, {}).setdefault(value, set()).add(kem.id)
-
+            if meta_key in kem.metadata: value = kem.metadata[meta_key]; self._metadata_indexes.setdefault(meta_key, {}).setdefault(value, set()).add(kem.id)
     def _remove_from_metadata_indexes(self, kem: kem_pb2.KEM):
         if not kem or not kem.id: return
         for meta_key in self._indexed_keys:
@@ -67,599 +67,385 @@ class IndexedLRUCache(Cache):
                 original_value = kem.metadata[meta_key]
                 if meta_key in self._metadata_indexes and original_value in self._metadata_indexes[meta_key]:
                     self._metadata_indexes[meta_key][original_value].discard(kem.id)
-                    if not self._metadata_indexes[meta_key][original_value]:
-                        del self._metadata_indexes[meta_key][original_value]
-                    if not self._metadata_indexes[meta_key]:
-                        del self._metadata_indexes[meta_key]
+                    if not self._metadata_indexes[meta_key][original_value]: del self._metadata_indexes[meta_key][original_value]
+                    if not self._metadata_indexes[meta_key]: del self._metadata_indexes[meta_key]
     def __setitem__(self, kem_id: str, kem: kem_pb2.KEM):
         with self._lock:
             evicted_kem = None
-            if kem_id in self._lru:
-                old_kem = self._lru[kem_id]
-                self._remove_from_metadata_indexes(old_kem)
+            if kem_id in self._lru: old_kem = self._lru[kem_id]; self._remove_from_metadata_indexes(old_kem)
             elif len(self._lru) >= self._lru.maxsize:
                 _evicted_id, evicted_kem = self._lru.popitem()
                 if evicted_kem:
                     self._remove_from_metadata_indexes(evicted_kem)
                     if self._on_evict_callback:
-                        try:
-                            self._on_evict_callback(evicted_kem) # This callback might need to be async or run in executor
-                        except Exception as e_cb:
-                            logger.error(f"Error in on_evict_callback for KEM ID '{_evicted_id}': {e_cb}", exc_info=True)
-            self._lru[kem_id] = kem
-            self._add_to_metadata_indexes(kem)
+                        try: self._on_evict_callback(evicted_kem)
+                        except Exception as e_cb: logger.error(f"Error in on_evict_callback for KEM ID '{_evicted_id}': {e_cb}", exc_info=True)
+            self._lru[kem_id] = kem; self._add_to_metadata_indexes(kem)
     def __getitem__(self, kem_id: str) -> kem_pb2.KEM:
-        with self._lock:
-            return self._lru[kem_id]
+        with self._lock: return self._lru[kem_id]
     def __delitem__(self, kem_id: str):
         with self._lock:
-            if kem_id in self._lru:
-                kem_to_remove = self._lru.pop(kem_id)
-                self._remove_from_metadata_indexes(kem_to_remove)
-            else:
-                raise KeyError(kem_id)
+            if kem_id in self._lru: kem_to_remove = self._lru.pop(kem_id); self._remove_from_metadata_indexes(kem_to_remove)
+            else: raise KeyError(kem_id)
     def get(self, kem_id: str, default=None) -> typing.Optional[kem_pb2.KEM]:
-        with self._lock:
-            return self._lru.get(kem_id, default)
+        with self._lock: return self._lru.get(kem_id, default)
     def pop(self, kem_id: str, default=object()) -> kem_pb2.KEM:
         with self._lock:
-            if kem_id in self._lru:
-                kem = self._lru.pop(kem_id)
-                self._remove_from_metadata_indexes(kem)
-                return kem
-            elif default is not object():
-                return default
-            else:
-                raise KeyError(kem_id)
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._lru)
-    def __contains__(self, kem_id: str) -> bool:
-        with self._lock:
-            return kem_id in self._lru
-    def values(self) -> typing.ValuesView[kem_pb2.KEM]: # Actually returns List due to list()
-        with self._lock:
-            return list(self._lru.values())
-    def items(self) -> typing.ItemsView[str, kem_pb2.KEM]: # Actually returns List due to list()
-        with self._lock:
-            return list(self._lru.items())
+            if kem_id in self._lru: kem = self._lru.pop(kem_id); self._remove_from_metadata_indexes(kem); return kem
+            elif default is not object(): return default # type: ignore
+            else: raise KeyError(kem_id)
+    def __len__(self) -> int: with self._lock: return len(self._lru)
+    def __contains__(self, kem_id: str) -> bool: with self._lock: return kem_id in self._lru
+    def values(self) -> List[kem_pb2.KEM]: with self._lock: return list(self._lru.values())
+    def items(self) -> List[Tuple[str, kem_pb2.KEM]]: with self._lock: return list(self._lru.items())
     def clear(self):
-        with self._lock:
-            self._lru.clear()
-            self._metadata_indexes.clear()
-            self._metadata_indexes = {key: {} for key in self._indexed_keys}
+        with self._lock: self._lru.clear(); self._metadata_indexes.clear(); self._metadata_indexes = {key: {} for key in self._indexed_keys}
     @property
-    def maxsize(self):
-        return self._lru.maxsize
-    def get_ids_by_metadata_filter(self, meta_key: str, meta_value: str) -> typing.Optional[typing.Set[str]]:
-        if meta_key not in self._indexed_keys:
-            return None
-        with self._lock:
-            return self._metadata_indexes.get(meta_key, {}).get(meta_value, set()).copy()
+    def maxsize(self): return self._lru.maxsize
+    def get_ids_by_metadata_filter(self, meta_key: str, meta_value: str) -> typing.Set[str]:
+        if meta_key not in self._indexed_keys: return set()
+        with self._lock: return self._metadata_indexes.get(meta_key, {}).get(meta_value, set()).copy()
 
 @dataclass
 class LockInfoInternal:
-    resource_id: str
-    agent_id: str
-    lock_id: str
-    acquired_at_unix_ms: int
-    lease_duration_ms: int
-    lease_expires_at_unix_ms: int
+    resource_id: str; agent_id: str; lock_id: str
+    acquired_at_unix_ms: int; lease_duration_ms: int; lease_expires_at_unix_ms: int
 
 class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemoryServiceServicer):
     def __init__(self):
         self.config = config
-        logger.info(f"Initializing SharedWorkingMemoryServiceImpl... Cache size: {self.config.CACHE_MAX_SIZE}, Indexed keys: {self.config.INDEXED_METADATA_KEYS}")
-        self.glm_channel: Optional[grpc_aio.Channel] = None # Potentially make GLM client async too
-        self.glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None # This is sync stub
-
-        self.retry_max_attempts = self.config.GLM_RETRY_MAX_ATTEMPTS
-        self.retry_initial_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
-        self.retry_backoff_factor = self.config.GLM_RETRY_BACKOFF_FACTOR
-
-        self.subscribers: typing.Dict[str, SubscriberInfo] = {}
-        self.subscribers_lock = asyncio.Lock() # Changed to asyncio.Lock
-
-        self.swm_cache = IndexedLRUCache( # This remains sync for now
-            maxsize=self.config.CACHE_MAX_SIZE,
-            indexed_keys=self.config.INDEXED_METADATA_KEYS,
-            on_evict_callback=self._handle_kem_eviction_sync # Callback needs to be sync or handled
-        )
-
-        self.locks: typing.Dict[str, LockInfoInternal] = {}
-        self.lock_condition = asyncio.Condition() # Changed to asyncio.Condition (uses internal asyncio.Lock)
-
-        self.counters: typing.Dict[str, int] = {}
-        self.counters_lock = asyncio.Lock() # Changed to asyncio.Lock
-
-        self._stop_event = asyncio.Event() # Changed to asyncio.Event
-        self._lock_cleanup_task: Optional[asyncio.Task] = None # For asyncio task
+        logger.info(f"Initializing SWM... Cache: {self.config.CACHE_MAX_SIZE}, IndexedKeys: {self.config.INDEXED_METADATA_KEYS}")
+        self.glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None
+        self.subscribers_lock = asyncio.Lock()
+        self.swm_cache = IndexedLRUCache(self.config.CACHE_MAX_SIZE, self.config.INDEXED_METADATA_KEYS, self._handle_kem_eviction_sync)
+        self.locks: Dict[str, LockInfoInternal] = {}; self.lock_condition = asyncio.Condition()
+        self.counters: Dict[str, int] = {}; self.counters_lock = asyncio.Lock()
+        self._stop_event = asyncio.Event(); self._lock_cleanup_task: Optional[asyncio.Task] = None
         self._lock_cleanup_interval_seconds = getattr(self.config, 'LOCK_CLEANUP_INTERVAL_S', 60)
 
-        # GLM client setup (still synchronous for now, calls will be wrapped)
+        self.subscribers: Dict[str, SubscriberInfo] = {}
+        self.kem_id_to_subscribers: Dict[str, Set[str]] = {}
+        self.metadata_exact_match_to_subscribers: Dict[str, Dict[str, Set[str]]] = {}
+        self.general_kem_event_subscribers: Set[str] = set()
         try:
-            # For now, keep GLM client synchronous. Calls from async methods will need `to_thread`.
             self.sync_glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS)
             self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.sync_glm_channel)
             logger.info(f"GLM client (sync) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}")
-        except Exception as e:
-            logger.error(f"Error initializing synchronous GLM client in SWM: {e}")
-            self.glm_stub = None
+        except Exception as e: logger.error(f"Error initializing sync GLM client in SWM: {e}"); self.glm_stub = None
 
-        # Start background tasks if SWM is fully initialized
-        # self._lock_cleanup_task = asyncio.create_task(self._expired_lock_cleanup_task_async())
-
-
-    # --- Lifecycle Methods for Async Tasks ---
-    async def start_background_tasks(self):
-        """Starts background tasks like lock cleanup."""
+    async def start_background_tasks(self): # ... (implementation as before) ...
         if self._lock_cleanup_task is None or self._lock_cleanup_task.done():
-            self._stop_event.clear()
-            self._lock_cleanup_task = asyncio.create_task(self._expired_lock_cleanup_task_async())
+            self._stop_event.clear(); self._lock_cleanup_task = asyncio.create_task(self._expired_lock_cleanup_task_async())
             logger.info("SWM: Expired lock cleanup task started.")
-
-    async def stop_background_tasks(self):
-        """Stops background tasks."""
+    async def stop_background_tasks(self): # ... (implementation as before) ...
         if self._lock_cleanup_task and not self._lock_cleanup_task.done():
-            logger.info("SWM: Stopping expired lock cleanup task...")
-            self._stop_event.set()
-            try:
-                await asyncio.wait_for(self._lock_cleanup_task, timeout=self._lock_cleanup_interval_seconds + 5)
-                logger.info("SWM: Expired lock cleanup task finished.")
-            except asyncio.TimeoutError:
-                logger.warning("SWM: Expired lock cleanup task did not finish in time.")
-            except asyncio.CancelledError:
-                 logger.info("SWM: Expired lock cleanup task was cancelled during shutdown.")
+            logger.info("SWM: Stopping expired lock cleanup task..."); self._stop_event.set()
+            try: await asyncio.wait_for(self._lock_cleanup_task, timeout=self._lock_cleanup_interval_seconds + 1) # type: ignore
+            except asyncio.TimeoutError: logger.warning("SWM: Expired lock cleanup task did not finish in time.")
+            except asyncio.CancelledError: logger.info("SWM: Expired lock cleanup task was cancelled.")
         self._lock_cleanup_task = None
-
-
-    async def _expired_lock_cleanup_task_async(self):
+    async def _expired_lock_cleanup_task_async(self): # ... (implementation as before) ...
         logger.info("SWM: Async expired lock cleanup task started.")
         while not self._stop_event.is_set():
             try:
-                await asyncio.sleep(self._lock_cleanup_interval_seconds)
+                await asyncio.sleep(self._lock_cleanup_interval_seconds);
                 if self._stop_event.is_set(): break
-
                 logger.debug("SWM: Performing periodic cleanup of expired locks (async)...")
-                async with self.lock_condition: # Acquire the asyncio.Condition's lock
-                    current_time_ms = int(time.time() * 1000)
-                    expired_resource_ids = [
-                        res_id for res_id, lock_info in self.locks.items()
-                        if lock_info.lease_duration_ms > 0 and current_time_ms >= lock_info.lease_expires_at_unix_ms
-                    ]
-
-                    if expired_resource_ids:
-                        cleaned_count = 0
-                        for resource_id in expired_resource_ids:
-                            # Re-check condition as lock might have been released/updated
-                            lock_to_remove = self.locks.get(resource_id)
-                            if lock_to_remove and \
-                               lock_to_remove.lease_duration_ms > 0 and \
-                               current_time_ms >= lock_to_remove.lease_expires_at_unix_ms:
-                                del self.locks[resource_id]
-                                logger.info(f"SWM Cleanup: Expired lock for resource='{lock_to_remove.resource_id}' (agent '{lock_to_remove.agent_id}') removed.")
-                                self.lock_condition.notify_all()
-                                cleaned_count +=1
-                        if cleaned_count > 0:
-                            logger.info(f"SWM Cleanup: Removed {cleaned_count} expired locks.")
-                    else:
-                        logger.debug("SWM Cleanup: No expired locks found.")
-            except asyncio.CancelledError:
-                logger.info("SWM: Lock cleanup task cancelled.")
-                break
-            except Exception as e:
-                logger.error(f"SWM: Error in lock cleanup task: {e}", exc_info=True)
-                await asyncio.sleep(self._lock_cleanup_interval_seconds) # Avoid tight loop on error
-
+                async with self.lock_condition:
+                    now_ms = int(time.time()*1000); expired_ids = [rid for rid, linfo in self.locks.items() if linfo.lease_duration_ms > 0 and now_ms >= linfo.lease_expires_at_unix_ms]
+                    if expired_ids:
+                        cleaned = 0
+                        for rid in expired_ids:
+                            l_rem = self.locks.get(rid)
+                            if l_rem and l_rem.lease_duration_ms>0 and now_ms >= l_rem.lease_expires_at_unix_ms:
+                                del self.locks[rid]; logger.info(f"SWM Cleanup: Expired lock for '{l_rem.resource_id}' (agent '{l_rem.agent_id}') removed."); self.lock_condition.notify_all(); cleaned+=1
+                        if cleaned > 0: logger.info(f"SWM Cleanup: Removed {cleaned} expired locks.")
+                    else: logger.debug("SWM Cleanup: No expired locks found.")
+            except asyncio.CancelledError: logger.info("SWM: Lock cleanup task cancelled."); break
+            except Exception as e: logger.error(f"SWM: Error in lock cleanup task: {e}", exc_info=True); await asyncio.sleep(self._lock_cleanup_interval_seconds) # Prevents tight loop on error
         logger.info("SWM: Async expired lock cleanup task stopped.")
-
-    # Sync GLM calls wrapped for async context
-    async def _glm_retrieve_kems_async(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int = 20) -> glm_service_pb2.RetrieveKEMsResponse:
-        if not self.glm_stub:
-            logger.error("SWM._glm_retrieve_kems_async: GLM stub (sync) not initialized.")
-            raise grpc_aio.AioRpcError(grpc_aio.StatusCode.INTERNAL, "GLM client not available in SWM")
+    async def _glm_retrieve_kems_async(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int = 20) -> glm_service_pb2.RetrieveKEMsResponse: # ... (implementation as before) ...
+        if not self.glm_stub: raise grpc_aio.AioRpcError(grpc_aio.StatusCode.INTERNAL, "GLM client not available") # type: ignore
         return await asyncio.to_thread(self.glm_stub.RetrieveKEMs, request, timeout=timeout)
-
-    async def _glm_store_kem_async(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
-        if not self.glm_stub:
-            logger.error("SWM._glm_store_kem_async: GLM stub (sync) not initialized.")
-            raise grpc_aio.AioRpcError(grpc_aio.StatusCode.INTERNAL, "GLM client not available in SWM")
+    async def _glm_store_kem_async(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse: # ... (implementation as before) ...
+        if not self.glm_stub: raise grpc_aio.AioRpcError(grpc_aio.StatusCode.INTERNAL, "GLM client not available") # type: ignore
         return await asyncio.to_thread(self.glm_stub.StoreKEM, request, timeout=timeout)
-
-    def _handle_kem_eviction_sync(self, evicted_kem: kem_pb2.KEM): # This is called by sync cachetools
-        if evicted_kem:
-            logger.info(f"SWM: KEM ID '{evicted_kem.id}' was evicted from cache. Scheduling notification.")
-            # To call async _notify_subscribers from this sync callback, we need the event loop
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(
-                self._notify_subscribers(evicted_kem, swm_service_pb2.SWMMemoryEvent.EventType.KEM_EVICTED, source_agent_id="SWM_CACHE_EVICTION"),
-                loop
-            )
-
-    async def _put_kem_to_cache_async(self, kem: kem_pb2.KEM) -> None: # For internal async use
-        if not kem or not kem.id:
-            logger.warning("Attempt to add an invalid KEM to SWM cache.")
-            return
-        # cachetools is sync, so wrap its operations if they could block significantly
-        # For simple dict operations, direct call under async lock might be okay if IndexedLRUCache._lock is asyncio.Lock
-        # But IndexedLRUCache uses threading.Lock. So, use to_thread for safety.
+    def _handle_kem_eviction_sync(self, evicted_kem: kem_pb2.KEM): # ... (implementation as before) ...
+        if evicted_kem: logger.info(f"SWM: KEM ID '{evicted_kem.id}' evicted. Scheduling notification.");
+        try: asyncio.run_coroutine_threadsafe(self._notify_subscribers(evicted_kem, swm_service_pb2.SWMMemoryEvent.EventType.KEM_EVICTED, "SWM_CACHE"), asyncio.get_running_loop())
+        except RuntimeError: logger.warning(f"SWM: No running loop for evicted KEM '{evicted_kem.id}' notification.")
+    async def _put_kem_to_cache_async(self, kem: kem_pb2.KEM) -> None: # ... (implementation as before) ...
+        if not kem or not kem.id: logger.warning("Invalid KEM to cache."); return
         was_present = await asyncio.to_thread(self.swm_cache.__contains__, kem.id)
         await asyncio.to_thread(self.swm_cache.__setitem__, kem.id, kem)
-
-        logger.info("KEM ID '{}' added/updated in SWM cache. Cache size: {}/{}".format(
-            kem.id, len(self.swm_cache), self.swm_cache.maxsize))
-        event_type = swm_service_pb2.SWMMemoryEvent.EventType.KEM_UPDATED if was_present else swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED
-        await self._notify_subscribers(kem, event_type) # This is now async
+        logger.info(f"KEM ID '{kem.id}' put/updated in SWM cache. Size: {len(self.swm_cache)}/{self.swm_cache.maxsize}")
+        await self._notify_subscribers(kem, swm_service_pb2.SWMMemoryEvent.EventType.KEM_UPDATED if was_present else swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED)
 
     async def _notify_subscribers(self, kem: kem_pb2.KEM, event_type: swm_service_pb2.SWMMemoryEvent.EventType, source_agent_id: str = "SWM_SERVER"):
-        if not kem or not kem.id:
-            logger.warning("_notify_subscribers called with an invalid KEM.")
-            return
-        logger.info(f"Forming event {swm_service_pb2.SWMMemoryEvent.EventType.Name(event_type)} for KEM ID '{kem.id}'")
-        event_time_proto = Timestamp(); event_time_proto.GetCurrentTime()
+        if not kem or not kem.id: logger.warning("_notify_subscribers called with an invalid KEM."); return
+
         event_to_dispatch = swm_service_pb2.SWMMemoryEvent(
             event_id=str(uuid.uuid4()), event_type=event_type, kem_payload=kem,
-            event_time=event_time_proto, source_agent_id=source_agent_id,
+            event_time=Timestamp(seconds=int(time.time())), # Simplified timestamp
+            source_agent_id=source_agent_id,
             details=f"Event {swm_service_pb2.SWMMemoryEvent.EventType.Name(event_type)} for KEM ID {kem.id}"
         )
 
-        subscribers_to_notify: List[SubscriberInfo] = []
-        async with self.subscribers_lock: # Use asyncio.Lock
-            if not self.subscribers: return
-            # Iterate over a copy if modification during iteration is possible, though less likely with async lock
-            subscribers_to_notify = list(self.subscribers.values())
+        candidate_subscriber_ids: Set[str] = set()
+        async with self.subscribers_lock:
+            candidate_subscriber_ids.update(self.general_kem_event_subscribers)
+            if kem.id in self.kem_id_to_subscribers:
+                candidate_subscriber_ids.update(self.kem_id_to_subscribers[kem.id])
+            if kem.metadata:
+                for meta_key, meta_value in kem.metadata.items():
+                    if meta_key in self.metadata_exact_match_to_subscribers:
+                        if meta_value in self.metadata_exact_match_to_subscribers[meta_key]:
+                            candidate_subscriber_ids.update(self.metadata_exact_match_to_subscribers[meta_key][meta_value])
 
-        if not subscribers_to_notify:
-            logger.debug("No subscribers to notify.")
-            return
+            sub_infos_to_notify: List[SubscriberInfo] = []
+            for sub_id in candidate_subscriber_ids:
+                if sub_id in self.subscribers: # Check if subscriber still exists
+                    sub_info = self.subscribers[sub_id]
+                    # If subscriber is general OR specific filters match (already implicitly handled by being in candidate_subscriber_ids from indexes)
+                    # OR if the subscriber has non-indexable filters that need further checking (not implemented in this simplified indexing)
+                    # For now, if they are in candidate_subscriber_ids, we assume they should get the event based on indexed filters,
+                    # or they are general subscribers. More complex non-indexed filter logic would go here if needed.
+                    if sub_info.subscribes_to_all_kem_lifecycle or \
+                       kem.id in sub_info.parsed_filters.get("kem_id", set()) or \
+                       any(kem.metadata.get(mk.split("metadata.",1)[1]) == mv_set_item
+                           for mk, mv_set in sub_info.parsed_filters.items() if mk.startswith("metadata.")
+                           for mv_set_item in mv_set): # This re-checks, can be optimized
+                         sub_infos_to_notify.append(sub_info)
 
-        logger.debug(f"Checking and dispatching event {event_to_dispatch.event_id} to {len(subscribers_to_notify)} potential subscribers.")
 
-        for sub_info in subscribers_to_notify: # Iterate over the copy
-            should_send = False
-            if not sub_info.topics: should_send = True
-            else:
-                for topic in sub_info.topics:
-                    # ... (filtering logic remains the same) ...
-                    criteria = topic.filter_criteria.strip()
-                    if not criteria: should_send = True; break
-                    if '=' not in criteria:
-                        logger.warning(f"Invalid filter_criteria format '{criteria}' for a subscriber. Skipping filter.")
-                        should_send = True; break
-                    filter_key, filter_value = criteria.split("=", 1)
-                    filter_key = filter_key.strip(); filter_value = filter_value.strip()
-                    if filter_key == "kem_id":
-                        if event_to_dispatch.kem_payload.id == filter_value: should_send = True; break
-                    elif filter_key.startswith("metadata."):
-                        meta_actual_key = filter_key.split("metadata.", 1)[1]
-                        if meta_actual_key in event_to_dispatch.kem_payload.metadata and \
-                           event_to_dispatch.kem_payload.metadata[meta_actual_key] == filter_value:
-                            should_send = True; break
-                    else:
-                        logger.warning(f"Unknown filter key '{filter_key}' for a subscriber. Event will be sent.")
-                        should_send = True; break
-            if should_send:
-                try:
-                    await sub_info.event_queue.put(event_to_dispatch) # Use await for asyncio.Queue
-                except asyncio.QueueFull: # asyncio.QueueFull
-                    logger.warning(f"Subscriber queue is full for an event {event_to_dispatch.event_id}. Event lost.")
-                except Exception as e:
-                    logger.error(f"Unexpected error adding event to a subscriber queue: {e}", exc_info=True)
+        if not sub_infos_to_notify: logger.debug(f"No matching subscribers for event on KEM ID '{kem.id}'."); return
+        logger.debug(f"Dispatching event for KEM ID '{kem.id}' to {len(sub_infos_to_notify)} subscribers.")
 
-    async def PublishKEMToSWM(self, request: swm_service_pb2.PublishKEMToSWMRequest, context) -> swm_service_pb2.PublishKEMToSWMResponse:
-        kem_to_publish = request.kem_to_publish
-        logger.info(f"SWM: PublishKEMToSWM called for KEM ID (suggested): '{kem_to_publish.id}'")
-        kem_id_final = kem_to_publish.id
-        if not kem_id_final:
-            kem_id_final = str(uuid.uuid4()); kem_to_publish.id = kem_id_final
-            logger.info(f"SWM: No ID provided, new ID generated: '{kem_id_final}'")
+        for sub_info in sub_infos_to_notify:
+            try:
+                if sub_info.event_queue.full(): logger.warning(f"Subscriber queue full for event {event_to_dispatch.event_id}. Event lost.")
+                else: await sub_info.event_queue.put(event_to_dispatch)
+            except Exception as e: logger.error(f"Error queueing event for subscriber: {e}", exc_info=True)
 
+    async def PublishKEMToSWM(self, request: swm_service_pb2.PublishKEMToSWMRequest, context) -> swm_service_pb2.PublishKEMToSWMResponse: # ... (implementation as before, uses async helpers) ...
+        kem_to_publish = request.kem_to_publish; logger.info(f"SWM: PublishKEMToSWM for KEM ID (suggested): '{kem_to_publish.id}'")
+        kem_id_final = kem_to_publish.id or str(uuid.uuid4()); kem_to_publish.id = kem_id_final
+        if not request.kem_to_publish.id: logger.info(f"SWM: No ID provided, new ID generated: '{kem_id_final}'")
         ts = Timestamp(); ts.GetCurrentTime()
-        # Accessing self.swm_cache needs to be thread-safe if it's shared and modified by this async method.
-        # IndexedLRUCache uses threading.Lock, so calls to it should be wrapped.
-        existing_kem_in_cache = await asyncio.to_thread(self._get_kem_from_cache, kem_id_final)
-
-        if existing_kem_in_cache and existing_kem_in_cache.HasField("created_at"):
-            kem_to_publish.created_at.CopyFrom(existing_kem_in_cache.created_at)
-        elif not kem_to_publish.HasField("created_at"):
-            kem_to_publish.created_at.CopyFrom(ts)
+        # Use asyncio.to_thread for synchronous cache access
+        existing_kem_dict = await asyncio.to_thread(self.swm_cache.get, kem_id_final)
+        if existing_kem_dict: kem_to_publish.created_at.CopyFrom(kem_pb2.KEM(**existing_kem_dict).created_at)
+        elif not kem_to_publish.HasField("created_at"): kem_to_publish.created_at.CopyFrom(ts)
         kem_to_publish.updated_at.CopyFrom(ts)
-
-        await self._put_kem_to_cache_async(kem_to_publish) # Use async version
-
-        published_to_swm_flag = True; persistence_triggered_flag = False
-        status_msg = f"KEM ID '{kem_id_final}' successfully published to SWM."
-
+        await self._put_kem_to_cache_async(kem_to_publish)
+        published_to_swm_flag=True; persistence_triggered_flag=False; status_msg=f"KEM ID '{kem_id_final}' published to SWM."
         if request.persist_to_glm_if_new_or_updated:
-            if not self.glm_stub:
-                msg_glm = f"GLM service unavailable, KEM ID '{kem_id_final}' will not be persisted."
-                logger.error(msg_glm); status_msg += " " + msg_glm
+            if not self.glm_stub: msg_glm=f"GLM unavailable, KEM '{kem_id_final}' not persisted.";logger.error(msg_glm);status_msg+=" "+msg_glm
             else:
                 try:
-                    logger.info(f"SWM: Initiating persistence of KEM ID '{kem_id_final}' to GLM...")
-                    glm_store_req = glm_service_pb2.StoreKEMRequest(kem=kem_to_publish)
-                    # Using async wrapper for sync GLM client call
-                    glm_store_resp = await self._glm_store_kem_async(glm_store_req, timeout=10)
+                    logger.info(f"SWM: Persisting KEM '{kem_id_final}' to GLM...");glm_req=glm_service_pb2.StoreKEMRequest(kem=kem_to_publish)
+                    glm_resp=await self._glm_store_kem_async(glm_req,timeout=10)
+                    if glm_resp and glm_resp.kem and glm_resp.kem.id:
+                        await self._put_kem_to_cache_async(glm_resp.kem); kem_id_final=glm_resp.kem.id
+                        status_msg+=f" Persisted/updated in GLM with ID '{kem_id_final}'."; persistence_triggered_flag=True
+                    else: msg_glm_err=f"GLM.StoreKEM no/bad response for KEM '{kem_id_final}'.";logger.error(msg_glm_err);status_msg+=" "+msg_glm_err
+                except Exception as e: msg_glm_rpc_err=f"Error persisting KEM '{kem_id_final}' to GLM: {e}";logger.error(msg_glm_rpc_err,exc_info=True);status_msg+=" "+msg_glm_rpc_err
+        return swm_service_pb2.PublishKEMToSWMResponse(kem_id_final,published_to_swm_flag,persistence_triggered_flag,status_msg)
 
-                    if glm_store_resp and glm_store_resp.kem and glm_store_resp.kem.id:
-                        await self._put_kem_to_cache_async(glm_store_resp.kem) # Update SWM cache with GLM's version
-                        kem_id_final = glm_store_resp.kem.id
-                        status_msg += f" Successfully persisted/updated in GLM with ID '{kem_id_final}'."
-                        persistence_triggered_flag = True
-                    else:
-                        msg_glm_err = f"GLM.StoreKEM did not return an expected response for KEM ID '{kem_id_final}'."
-                        logger.error(msg_glm_err); status_msg += " " + msg_glm_err
-                except Exception as e:
-                    msg_glm_rpc_err = f"Error persisting KEM ID '{kem_id_final}' to GLM: {e}"
-                    logger.error(msg_glm_rpc_err, exc_info=True); status_msg += " " + msg_glm_rpc_err
-        return swm_service_pb2.PublishKEMToSWMResponse(
-            kem_id=kem_id_final, published_to_swm=published_to_swm_flag,
-            persistence_triggered_to_glm=persistence_triggered_flag, status_message=status_msg)
+    def _remove_subscriber_from_indexes(self, subscriber_id: str, original_topics: List[swm_service_pb2.SubscriptionTopic]):
+        # Must be called under self.subscribers_lock
+        self.general_kem_event_subscribers.discard(subscriber_id)
+        if original_topics:
+            for topic in original_topics:
+                if topic.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS and \
+                   topic.filter_criteria and '=' in topic.filter_criteria:
+                    key, value = topic.filter_criteria.split("=", 1)
+                    key = key.strip(); value = value.strip()
+                    if key == "kem_id":
+                        if value in self.kem_id_to_subscribers:
+                            self.kem_id_to_subscribers[value].discard(subscriber_id)
+                            if not self.kem_id_to_subscribers[value]: del self.kem_id_to_subscribers[value]
+                    elif key.startswith("metadata."):
+                        meta_actual_key = key.split("metadata.", 1)[1]
+                        if meta_actual_key and meta_actual_key in self.metadata_exact_match_to_subscribers:
+                            if value in self.metadata_exact_match_to_subscribers[meta_actual_key]:
+                                self.metadata_exact_match_to_subscribers[meta_actual_key][value].discard(subscriber_id)
+                                if not self.metadata_exact_match_to_subscribers[meta_actual_key][value]: del self.metadata_exact_match_to_subscribers[meta_actual_key][value]
+                            if not self.metadata_exact_match_to_subscribers[meta_actual_key]: del self.metadata_exact_match_to_subscribers[meta_actual_key]
+        logger.debug(f"SWM: Subscriber '{subscriber_id}' removed from specific filter indexes.")
 
-    async def SubscribeToSWMEvents(self, request: swm_service_pb2.SubscribeToSWMEventsRequest, context: grpc_aio.ServicerContext) -> typing.AsyncGenerator[swm_service_pb2.SWMMemoryEvent, None]:
-        agent_id = request.agent_id
-        logger.info(f"SWM: New subscriber {agent_id} for topics: {request.topics}")
+    async def SubscribeToSWMEvents(self, request: swm_service_pb2.SubscribeToSWMEventsRequest, context: grpc_aio.ServicerContext) -> AsyncGenerator[swm_service_pb2.SWMMemoryEvent, None]:
+        agent_id = request.agent_id; logger.info(f"SWM: New subscriber {agent_id} for topics: {request.topics}")
         subscriber_id = agent_id if agent_id else str(uuid.uuid4())
         event_q = asyncio.Queue(maxsize=100)
+        parsed_filters_for_subscriber: Dict[str, Set[str]] = {}; subscribes_to_all_kem_lifecycle_for_subscriber = False
+        has_any_kem_lifecycle_topic = any(t.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS for t in request.topics)
+        has_specific_indexable_filter = False
+        if not request.topics and has_any_kem_lifecycle_topic: subscribes_to_all_kem_lifecycle_for_subscriber = True # Should not happen if topics is empty
+        elif request.topics:
+            is_general_candidate = False
+            for topic in request.topics:
+                if topic.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS:
+                    is_general_candidate = True # At least one KEM_LIFECYCLE topic
+                    if not topic.filter_criteria: subscribes_to_all_kem_lifecycle_for_subscriber = True; break
+                    if '=' in topic.filter_criteria:
+                        key, value = topic.filter_criteria.split("=", 1); key = key.strip(); value = value.strip()
+                        parsed_filters_for_subscriber.setdefault(key, set()).add(value)
+                        if key == "kem_id" or (key.startswith("metadata.") and key.split("metadata.",1)[1]): has_specific_indexable_filter = True
+            if is_general_candidate and not has_specific_indexable_filter and not subscribes_to_all_kem_lifecycle_for_subscriber : subscribes_to_all_kem_lifecycle_for_subscriber = True
 
-        subscriber_info = SubscriberInfo(event_queue=event_q, topics=list(request.topics))
+        subscriber_info = SubscriberInfo(event_q, list(request.topics), parsed_filters_for_subscriber, subscribes_to_all_kem_lifecycle_for_subscriber)
         async with self.subscribers_lock:
-            if subscriber_id in self.subscribers:
-                logger.warning(f"Subscriber with ID '{subscriber_id}' already exists. Old subscription will be replaced.")
+            if subscriber_id in self.subscribers: logger.warning(f"Sub ID '{subscriber_id}' exists. Removing old indexes."); self._remove_subscriber_from_indexes(subscriber_id, self.subscribers[subscriber_id].topics)
             self.subscribers[subscriber_id] = subscriber_info
-            logger.info(f"SWM: New subscriber '{subscriber_id}' registered. Total: {len(self.subscribers)}")
-
+            if subscribes_to_all_kem_lifecycle_for_subscriber: self.general_kem_event_subscribers.add(subscriber_id)
+            else:
+                for kem_id_val in parsed_filters_for_subscriber.get("kem_id", set()): self.kem_id_to_subscribers.setdefault(kem_id_val, set()).add(subscriber_id)
+                for meta_key_filter, meta_values_set in parsed_filters_for_subscriber.items():
+                    if meta_key_filter.startswith("metadata."):
+                        actual_meta_key = meta_key_filter.split("metadata.",1)[1]
+                        if actual_meta_key: key_idx = self.metadata_exact_match_to_subscribers.setdefault(actual_meta_key, {}); [key_idx.setdefault(mvf, set()).add(subscriber_id) for mvf in meta_values_set]
+            logger.info(f"SWM: Sub '{subscriber_id}' reg/upd. Total: {len(self.subscribers)}. Gen KEM subs: {len(self.general_kem_event_subscribers)}")
+        active_sub = True
         try:
-            while True: # context.is_active() is not available for async generators in grpc.aio like this
-                       # Instead, rely on client closing the stream or server shutting down.
+            while active_sub:
                 try:
-                    event_to_send = await asyncio.wait_for(event_q.get(), timeout=5.0) # Wait with timeout
-                    yield event_to_send
-                    event_q.task_done() # Mark as processed
+                    evt = await asyncio.wait_for(event_q.get(), timeout=1.0)
+                    if not context.is_active(): active_sub=False; break # type: ignore
+                    yield evt; event_q.task_done()
                 except asyncio.TimeoutError:
-                    # Check if client is still connected. gRPC AIO handles this by raising RpcError on disconnect.
-                    # A more robust way to check client connection status might be needed if this becomes an issue.
-                    # For now, this timeout allows the loop to periodically check for external cancellation.
-                    pass
-                except grpc_aio.AioRpcError as rpc_error: # type: ignore
-                    logger.info(f"SWM: RPC error for subscriber '{subscriber_id}': {rpc_error.code()} - {rpc_error.details()}. Terminating stream.")
-                    break
-                except Exception as e: # Catch any other exception during get or yield
-                    logger.error(f"SWM: Error in event stream for subscriber '{subscriber_id}': {e}", exc_info=True)
-                    break
-        except asyncio.CancelledError:
-             logger.info(f"SWM: Event stream for subscriber '{subscriber_id}' cancelled.")
+                    if not context.is_active(): active_sub=False; break # type: ignore
+                except Exception as e: logger.error(f"SWM stream error for '{subscriber_id}': {e}",exc_info=True); active_sub=False; break
+        except asyncio.CancelledError: logger.info(f"SWM stream for '{subscriber_id}' cancelled.")
         finally:
+            logger.info(f"SWM: Cleaning up sub for '{subscriber_id}' (active: {active_sub})")
             async with self.subscribers_lock:
                 removed_info = self.subscribers.pop(subscriber_id, None)
-                if removed_info:
-                    logger.info(f"SWM: Subscriber '{subscriber_id}' removed. Remaining: {len(self.subscribers)}")
-                    # Clear its queue if needed, though it will be garbage collected.
-                else:
-                    logger.warning(f"SWM: Attempted to remove non-existent subscriber '{subscriber_id}'.")
+                if removed_info: logger.info(f"SWM: Sub '{subscriber_id}' removed. Rem: {len(self.subscribers)}"); self._remove_subscriber_from_indexes(subscriber_id, removed_info.topics)
+                else: logger.warning(f"SWM: Attempt to remove non-existent sub '{subscriber_id}'.")
 
-    async def QuerySWM(self, request: swm_service_pb2.QuerySWMRequest, context) -> swm_service_pb2.QuerySWMResponse:
-        query = request.query
-        logger.info(f"SWM: QuerySWM called with KEMQuery: {query}")
-        if query.embedding_query or query.text_query:
-            msg = "Vector or text search is not supported directly in SWM cache. Use GLM."
-            logger.warning(msg); await context.abort(grpc_aio.StatusCode.INVALID_ARGUMENT, msg) # type: ignore
-
-        # All cache operations are sync, so run them in a thread
-        def _sync_query_swm():
-            page_size = request.page_size if request.page_size > 0 else self.config.DEFAULT_PAGE_SIZE
-            offset = 0
+    async def QuerySWM(self, request: swm_service_pb2.QuerySWMRequest, context) -> swm_service_pb2.QuerySWMResponse: # ... (implementation as before, using to_thread for sync cache logic) ...
+        query = request.query; logger.info(f"SWM: QuerySWM called with KEMQuery: {query}")
+        if query.embedding_query or query.text_query: msg = "Vector/text search not in SWM cache."; logger.warning(msg); await context.abort(grpc_aio.StatusCode.INVALID_ARGUMENT, msg); return swm_service_pb2.QuerySWMResponse() # type: ignore
+        def _sync_query_swm_logic():
+            pg_sz = request.page_size if request.page_size > 0 else self.config.DEFAULT_PAGE_SIZE; offset = 0
             if request.page_token:
                 try: offset = int(request.page_token)
-                except ValueError: logger.warning(f"Invalid page_token for QuerySWM: '{request.page_token}', using offset=0.")
+                except ValueError: logger.warning(f"Invalid page_token for QuerySWM: '{request.page_token}', using 0.")
+            kems_l:List[kem_pb2.KEM]=[]; final_ids:Optional[Set[str]]=None; idx_meta_q:Dict[str,str]={}; unidx_meta_q:Dict[str,str]={}
+            if query.metadata_filters:
+                for k,v in query.metadata_filters.items():
+                    if k in self.swm_cache._indexed_keys: idx_meta_q[k]=v
+                    else: unidx_meta_q[k]=v
+            if idx_meta_q:
+                intersect_ids:Optional[Set[str]]=None
+                for k,v in idx_meta_q.items():
+                    ids_idx=self.swm_cache.get_ids_by_metadata_filter(k,v)
+                    if intersect_ids is None: intersect_ids=ids_idx if ids_idx is not None else set()
+                    else: intersect_ids.intersection_update(ids_idx if ids_idx is not None else set())
+                    if not intersect_ids: break
+                if not intersect_ids: return [],""
+                final_ids=intersect_ids
+            if final_ids is not None: [ (_k:=self.swm_cache.get(k_id)) and kems_l.append(_k) for k_id in final_ids]
+            else: kems_l=self.swm_cache.values()
+            if query.ids: ids_s=set(query.ids); kems_l=[k for k in kems_l if k.id in ids_s]
+            if unidx_meta_q:
+                tmp_kems=[]; [ (all(k.metadata.get(mk)==mv for mk,mv in unidx_meta_q.items())) and tmp_kems.append(k) for k in kems_l]; kems_l=tmp_kems
+            def chk_dt(k_ts,s_ts,e_ts)->bool:
+                if s_ts.seconds and k_ts.ToNanoseconds()<s_ts.ToNanoseconds():return False
+                if e_ts.seconds and k_ts.ToNanoseconds()>e_ts.ToNanoseconds():return False
+                return True
+            if query.HasField("created_at_start") or query.HasField("created_at_end"): kems_l=[k for k in kems_l if chk_dt(k.created_at,query.created_at_start,query.created_at_end)]
+            if query.HasField("updated_at_start") or query.HasField("updated_at_end"): kems_l=[k for k in kems_l if chk_dt(k.updated_at,query.updated_at_start,query.updated_at_end)]
+            k_pg=kems_l[offset:offset+pg_sz]; n_tok=str(offset+pg_sz) if len(kems_l)>offset+pg_sz else ""
+            return k_pg, n_tok
+        k_p_sync,n_t_sync = await asyncio.to_thread(_sync_query_swm_logic)
+        logger.info(f"QuerySWM: Returning {len(k_p_sync)} KEMs."); return swm_service_pb2.QuerySWMResponse(kems=k_p_sync,next_page_token=n_t_sync) # type: ignore
 
-            processed_kems_list: typing.List[kem_pb2.KEM] = []
-            # ... (rest of the synchronous filtering logic from the original QuerySWM) ...
-            # This includes calls to self.swm_cache which uses threading.Lock
-            # For brevity, I'm not copying the entire filtering logic here, but it would be:
-            # 1. Apply indexed filters
-            # 2. Apply ID filters
-            # 3. Apply non-indexed filters
-            # 4. Apply date filters
-            # 5. Paginate
-            # For this example, assume it returns a list of KEMs and next_page_token
-            # This is a placeholder for the actual synchronous filtering logic:
-            temp_kems = self.swm_cache.values() # Example: gets all values
-            kems_on_page = temp_kems[offset : offset + page_size]
-            next_page_token_str = str(offset + page_size) if len(temp_kems) > offset + page_size else ""
-            return kems_on_page, next_page_token_str
-
-        kems_on_page_sync, next_page_token_str_sync = await asyncio.to_thread(_sync_query_swm)
-
-        logger.info(f"QuerySWM: Returning {len(kems_on_page_sync)} KEMs.")
-        return swm_service_pb2.QuerySWMResponse(kems=kems_on_page_sync, next_page_token=next_page_token_str_sync)
-
-    async def LoadKEMsFromGLM(self, request: swm_service_pb2.LoadKEMsFromGLMRequest, context) -> swm_service_pb2.LoadKEMsFromGLMResponse:
-        logger.info(f"SWM: LoadKEMsFromGLM called with query: {request.query_for_glm}")
-        if not self.glm_stub:
-            msg = "GLM service is unavailable to SWM (client not initialized)."
-            logger.error(msg); await context.abort(grpc_aio.StatusCode.INTERNAL, msg) # type: ignore
-
-        glm_retrieve_request = glm_service_pb2.RetrieveKEMsRequest(query=request.query_for_glm)
-        loaded_kems_count = 0; loaded_ids = []; kems_from_glm_for_stats = 0
+    async def LoadKEMsFromGLM(self, request: swm_service_pb2.LoadKEMsFromGLMRequest, context) -> swm_service_pb2.LoadKEMsFromGLMResponse: # ... (implementation as before, using async helpers) ...
+        logger.info(f"SWM: LoadKEMsFromGLM query: {request.query_for_glm}");
+        if not self.glm_stub: msg="GLM client N/A";logger.error(msg);await context.abort(grpc_aio.StatusCode.INTERNAL,msg); return swm_service_pb2.LoadKEMsFromGLMResponse() # type: ignore
+        req=glm_service_pb2.RetrieveKEMsRequest(query=request.query_for_glm);load_c=0;load_ids_l=[];glm_qc=0
         try:
-            logger.info(f"SWM: Requesting GLM.RetrieveKEMs (async wrapper): {glm_retrieve_request}")
-            glm_response = await self._glm_retrieve_kems_async(glm_retrieve_request, timeout=20)
+            logger.info(f"SWM: Req GLM.RetrieveKEMs(async): {req}"); resp=await self._glm_retrieve_kems_async(req,timeout=20)
+            if resp and resp.kems:
+                glm_qc=len(resp.kems);[await self._put_kem_to_cache_async(k) or load_ids_l.append(k.id) for k in resp.kems]
+                load_c=len(load_ids_l); msg=f"Loaded {load_c} KEMs."
+            else: msg="GLM no KEMs.";logger.info(msg)
+            return swm_service_pb2.LoadKEMsFromGLMResponse(glm_qc,load_c,load_ids_l,msg)
+        except grpc.RpcError as e:msg=f"gRPC err GLM: {e.details()}";logger.error(msg);await context.abort(e.code(),msg); return swm_service_pb2.LoadKEMsFromGLMResponse() # type: ignore
+        except Exception as e:msg=f"Err LoadKEMs: {e}";logger.error(msg,exc_info=True);await context.abort(grpc_aio.StatusCode.INTERNAL,msg); return swm_service_pb2.LoadKEMsFromGLMResponse() # type: ignore
 
-            if glm_response and glm_response.kems:
-                kems_from_glm_for_stats = len(glm_response.kems)
-                for kem_from_glm in glm_response.kems:
-                    await self._put_kem_to_cache_async(kem_from_glm) # Use async version
-                    loaded_ids.append(kem_from_glm.id)
-                loaded_kems_count = len(loaded_ids)
-                status_msg = f"Loaded {loaded_kems_count} KEMs."
-                logger.info(f"SWM: {status_msg}")
-            else:
-                status_msg = "GLM returned no KEMs for the query."; logger.info(status_msg)
-
-            return swm_service_pb2.LoadKEMsFromGLMResponse(
-                kems_queried_in_glm_count=kems_from_glm_for_stats, kems_loaded_to_swm_count=loaded_kems_count,
-                loaded_kem_ids=loaded_ids, status_message=status_msg )
-        except grpc.RpcError as e: # This might be caught by retry_grpc_call if it's used on _glm_retrieve_kems_async
-            msg = f"SWM: gRPC error calling GLM.RetrieveKEMs: code={e.code()}, details={e.details()}"
-            logger.error(msg); await context.abort(e.code(), msg) # type: ignore
-        except Exception as e:
-            msg = f"SWM: Unexpected error in LoadKEMsFromGLM while working with GLM: {e}"
-            logger.error(msg, exc_info=True); await context.abort(grpc_aio.StatusCode.INTERNAL, msg) # type: ignore
-        # Fallback response, though abort should prevent reaching here.
-        return swm_service_pb2.LoadKEMsFromGLMResponse(status_message="Error loading from GLM")
-
-    # --- RPC Lock Implementations (Async) ---
-    async def AcquireLock(self, request: swm_service_pb2.AcquireLockRequest, context) -> swm_service_pb2.AcquireLockResponse:
-        resource_id = request.resource_id; agent_id = request.agent_id
-        timeout_ms = request.timeout_ms; lease_duration_ms = request.lease_duration_ms
-        logger.info(f"SWM: AcquireLock request for resource='{resource_id}' by agent='{agent_id}', timeout={timeout_ms}ms, lease={lease_duration_ms}ms")
-        start_time_monotonic = time.monotonic()
-
-        async with self.lock_condition: # Acquire asyncio.Condition's lock
+    async def AcquireLock(self, request: swm_service_pb2.AcquireLockRequest, context) -> swm_service_pb2.AcquireLockResponse: # ... (implementation as before) ...
+        rid,aid,t_ms,l_ms=request.resource_id,request.agent_id,request.timeout_ms,request.lease_duration_ms
+        logger.info(f"SWM: AcquireLock '{rid}' by '{aid}', t={t_ms}, l={l_ms}");s_mono=time.monotonic()
+        async with self.lock_condition:
             while True:
-                current_time_ms = int(time.time() * 1000)
-                existing_lock = self.locks.get(resource_id)
-                if existing_lock and existing_lock.lease_duration_ms > 0 and \
-                   current_time_ms >= existing_lock.lease_expires_at_unix_ms:
-                    logger.info(f"SWM: Existing lock for resource='{resource_id}' by agent '{existing_lock.agent_id}' has expired. Removing.")
-                    del self.locks[resource_id]; existing_lock = None
-                    self.lock_condition.notify_all()
-
-                if not existing_lock:
-                    new_lock_id = str(uuid.uuid4()); acquired_at = current_time_ms
-                    expires_at = acquired_at + lease_duration_ms if lease_duration_ms > 0 else 0
-                    new_lock_info = LockInfoInternal(resource_id, agent_id, new_lock_id, acquired_at, lease_duration_ms, expires_at)
-                    self.locks[resource_id] = new_lock_info
-                    logger.info(f"SWM: Resource '{resource_id}' successfully locked by agent '{agent_id}'. Lock ID: {new_lock_id}, Lease expires at: {expires_at if expires_at > 0 else 'never'}")
-                    return swm_service_pb2.AcquireLockResponse(resource_id=resource_id, agent_id=agent_id, status=swm_service_pb2.LockStatusValue.ACQUIRED, lock_id=new_lock_id, acquired_at_unix_ms=acquired_at, lease_expires_at_unix_ms=expires_at, message="Lock successfully acquired.")
-
-                if existing_lock.agent_id == agent_id:
-                    logger.info(f"SWM: Resource '{resource_id}' is already locked by the same agent '{agent_id}'.")
-                    if lease_duration_ms > 0:
-                        existing_lock.lease_expires_at_unix_ms = current_time_ms + lease_duration_ms
-                        existing_lock.lease_duration_ms = lease_duration_ms
-                        logger.info(f"SWM: Lease for '{resource_id}' updated. Expires at: {existing_lock.lease_expires_at_unix_ms}")
-                    elif lease_duration_ms == 0 and existing_lock.lease_duration_ms > 0 :
-                         existing_lock.lease_expires_at_unix_ms = 0; existing_lock.lease_duration_ms = 0
-                         logger.info(f"SWM: Lease for '{resource_id}' removed (now held until explicit release).")
-                    return swm_service_pb2.AcquireLockResponse(resource_id=resource_id, agent_id=agent_id, status=swm_service_pb2.LockStatusValue.ALREADY_HELD_BY_YOU, lock_id=existing_lock.lock_id, acquired_at_unix_ms=existing_lock.acquired_at_unix_ms, lease_expires_at_unix_ms=existing_lock.lease_expires_at_unix_ms, message="Lock already held by you.")
-
-                if timeout_ms == 0:
-                    logger.info(f"SWM: Resource '{resource_id}' is locked by agent '{existing_lock.agent_id}'. timeout_ms=0, denying for '{agent_id}'.")
-                    return swm_service_pb2.AcquireLockResponse(resource_id=resource_id, agent_id=agent_id, status=swm_service_pb2.LockStatusValue.NOT_AVAILABLE, message=f"Resource is locked by agent {existing_lock.agent_id}.")
-
-                elapsed_monotonic_ms = (time.monotonic() - start_time_monotonic) * 1000
-                wait_timeout_sec: typing.Optional[float]
-                if timeout_ms < 0: wait_timeout_sec = None
-                else:
-                    remaining_timeout_ms = timeout_ms - elapsed_monotonic_ms
-                    if remaining_timeout_ms <= 0:
-                        logger.info(f"SWM: Overall timeout ({timeout_ms}ms) expired for resource='{resource_id}', agent '{agent_id}'.")
-                        return swm_service_pb2.AcquireLockResponse(resource_id=resource_id, agent_id=agent_id, status=swm_service_pb2.LockStatusValue.TIMEOUT, message="Lock acquisition timed out.")
-                    wait_timeout_sec = remaining_timeout_ms / 1000.0
-
-                logger.debug(f"SWM: Agent '{agent_id}' waiting for lock on '{resource_id}'. Wait timeout sec: {wait_timeout_sec}")
-                try:
-                    await asyncio.wait_for(self.lock_condition.wait(), timeout=wait_timeout_sec) # type: ignore
-                except asyncio.TimeoutError:
-                    logger.info(f"SWM: Condition wait timeout ({wait_timeout_sec}s) for resource='{resource_id}', agent '{agent_id}'.")
-                logger.debug(f"SWM: Agent '{agent_id}' awakened for lock on '{resource_id}'. Re-checking...")
-
-
-    async def ReleaseLock(self, request: swm_service_pb2.ReleaseLockRequest, context) -> swm_service_pb2.ReleaseLockResponse:
-        resource_id = request.resource_id; agent_id = request.agent_id; lock_id_from_request = request.lock_id
-        logger.info(f"SWM: ReleaseLock request for resource='{resource_id}' by agent='{agent_id}', lock_id_req='{lock_id_from_request}'")
+                now=int(time.time()*1000);lock=self.locks.get(rid)
+                if lock and lock.lease_duration_ms>0 and now>=lock.lease_expires_at_unix_ms: logger.info(f"SWM: Lock '{rid}' by '{lock.agent_id}' expired.");del self.locks[rid];lock=None;self.lock_condition.notify_all()
+                if not lock:
+                    lid=str(uuid.uuid4());acq_at=now;exp_at=acq_at+l_ms if l_ms>0 else 0
+                    self.locks[rid]=LockInfoInternal(rid,aid,lid,acq_at,l_ms,exp_at);logger.info(f"SWM: Lock '{rid}' acquired by '{aid}'.ID:{lid}.Exp:{exp_at or 'never'}")
+                    return swm_service_pb2.AcquireLockResponse(rid,aid,swm_service_pb2.LockStatusValue.ACQUIRED,lid,acq_at,exp_at,"Acquired.")
+                if lock.agent_id==aid:
+                    logger.info(f"SWM: Lock '{rid}' already held by '{aid}'.")
+                    if l_ms>0:lock.lease_expires_at_unix_ms=now+l_ms;lock.lease_duration_ms=l_ms;logger.info(f"SWM: Lease for '{rid}' updated.Exp:{lock.lease_expires_at_unix_ms}")
+                    elif l_ms==0 and lock.lease_duration_ms>0:lock.lease_expires_at_unix_ms=0;lock.lease_duration_ms=0;logger.info(f"SWM: Lease for '{rid}' indefinite.")
+                    return swm_service_pb2.AcquireLockResponse(rid,aid,swm_service_pb2.LockStatusValue.ALREADY_HELD_BY_YOU,lock.lock_id,lock.acquired_at_unix_ms,lock.lease_expires_at_unix_ms,"Held.")
+                if t_ms==0:logger.info(f"SWM: Lock '{rid}' by '{lock.agent_id}'.No wait for '{aid}'.");return swm_service_pb2.AcquireLockResponse(rid,aid,swm_service_pb2.LockStatusValue.NOT_AVAILABLE,message=f"Locked by {lock.agent_id}.")
+                el_ms=(time.monotonic()-s_mono)*1000;wait_s:Optional[float]=None
+                if t_ms>0:
+                    rem_ms=t_ms-el_ms
+                    if rem_ms<=0:logger.info(f"SWM: Timeout({t_ms}ms) for '{rid}',ag '{aid}'.");return swm_service_pb2.AcquireLockResponse(rid,aid,swm_service_pb2.LockStatusValue.TIMEOUT,message="Timeout.")
+                    wait_s=rem_ms/1000.0
+                logger.debug(f"SWM: Ag '{aid}' waits for '{rid}'.Wait_s:{wait_s}")
+                try:await asyncio.wait_for(self.lock_condition.wait(),timeout=wait_s)
+                except asyncio.TimeoutError:logger.info(f"SWM: Cond wait timeout({wait_s}s) for '{rid}',ag '{aid}'.")
+                logger.debug(f"SWM: Ag '{aid}' awakened for '{rid}'.Re-check...")
+    async def ReleaseLock(self, request: swm_service_pb2.ReleaseLockRequest, context) -> swm_service_pb2.ReleaseLockResponse: # ... (implementation as before) ...
+        rid,ag_id,req_lid=request.resource_id,request.agent_id,request.lock_id;logger.info(f"SWM: ReleaseLock '{rid}' by '{ag_id}',req_lid='{req_lid}'")
         async with self.lock_condition:
-            existing_lock = self.locks.get(resource_id)
-            if not existing_lock:
-                logger.warning(f"SWM: Attempt to release a non-existent lock for resource='{resource_id}'.")
-                return swm_service_pb2.ReleaseLockResponse(resource_id=resource_id, status=swm_service_pb2.ReleaseStatusValue.NOT_HELD, message="Lock for resource not found.")
-            current_time_ms = int(time.time() * 1000)
-            if existing_lock.lease_duration_ms > 0 and current_time_ms >= existing_lock.lease_expires_at_unix_ms:
-                logger.info(f"SWM: Lock for resource='{resource_id}' (agent '{existing_lock.agent_id}') already expired. Removing.")
-                del self.locks[resource_id]; self.lock_condition.notify_all()
-                return swm_service_pb2.ReleaseLockResponse(resource_id=resource_id, status=swm_service_pb2.ReleaseStatusValue.NOT_HELD, message="Lock expired before release attempt.")
-            if existing_lock.agent_id != agent_id:
-                logger.warning(f"SWM: Agent '{agent_id}' attempting to release lock for resource='{resource_id}' held by agent '{existing_lock.agent_id}'. Denied.")
-                return swm_service_pb2.ReleaseLockResponse(resource_id=resource_id, status=swm_service_pb2.ReleaseStatusValue.ERROR_RELEASING, message="Lock held by another agent.")
-            if lock_id_from_request and existing_lock.lock_id != lock_id_from_request:
-                logger.warning(f"SWM: Invalid lock_id ('{lock_id_from_request}') for ReleaseLock on resource='{resource_id}' (expected '{existing_lock.lock_id}'). Denied.")
-                return swm_service_pb2.ReleaseLockResponse(resource_id=resource_id, status=swm_service_pb2.ReleaseStatusValue.INVALID_LOCK_ID, message="Invalid lock ID.")
-            del self.locks[resource_id]
-            logger.info(f"SWM: Lock for resource='{resource_id}' successfully released by agent '{agent_id}'. Notifying waiters.")
-            self.lock_condition.notify_all()
-            return swm_service_pb2.ReleaseLockResponse(resource_id=resource_id, status=swm_service_pb2.ReleaseStatusValue.RELEASED, message="Lock successfully released.")
-
-    async def GetLockInfo(self, request: swm_service_pb2.GetLockInfoRequest, context) -> swm_service_pb2.LockInfo:
-        resource_id = request.resource_id
-        logger.debug(f"SWM: GetLockInfo request for resource='{resource_id}'")
+            lock=self.locks.get(rid)
+            if not lock:logger.warning(f"SWM: Release non-exist lock '{rid}'.");return swm_service_pb2.ReleaseLockResponse(rid,swm_service_pb2.ReleaseStatusValue.NOT_HELD,"Not found.")
+            now=int(time.time()*1000)
+            if lock.lease_duration_ms>0 and now>=lock.lease_expires_at_unix_ms:logger.info(f"SWM: Lock '{rid}' by '{lock.agent_id}' expired.Rem.");del self.locks[rid];self.lock_condition.notify_all();return swm_service_pb2.ReleaseLockResponse(rid,swm_service_pb2.ReleaseStatusValue.NOT_HELD,"Expired.")
+            if lock.agent_id!=ag_id:logger.warning(f"SWM: Ag '{ag_id}' tries release lock '{rid}' held by '{lock.agent_id}'.Denied.");return swm_service_pb2.ReleaseLockResponse(rid,swm_service_pb2.ReleaseStatusValue.ERROR_RELEASING,"Held by other.")
+            if req_lid and lock.lock_id!=req_lid:logger.warning(f"SWM: Invalid lock_id ('{req_lid}') for ReleaseLock '{rid}'.Exp '{lock.lock_id}'.Denied.");return swm_service_pb2.ReleaseLockResponse(rid,swm_service_pb2.ReleaseStatusValue.INVALID_LOCK_ID,"Invalid lock ID.")
+            del self.locks[rid];logger.info(f"SWM: Lock '{rid}' released by '{ag_id}'.Notifying.");self.lock_condition.notify_all()
+            return swm_service_pb2.ReleaseLockResponse(resource_id=rid,status=swm_service_pb2.ReleaseStatusValue.RELEASED,message="Released.")
+    async def GetLockInfo(self, request: swm_service_pb2.GetLockInfoRequest, context) -> swm_service_pb2.LockInfo: # ... (implementation as before) ...
+        rid=request.resource_id;logger.debug(f"SWM: GetLockInfo for '{rid}'")
         async with self.lock_condition:
-            current_time_ms = int(time.time() * 1000)
-            lock_data = self.locks.get(resource_id)
-            if lock_data:
-                if lock_data.lease_duration_ms > 0 and current_time_ms >= lock_data.lease_expires_at_unix_ms:
-                    logger.info(f"SWM (GetLockInfo): Lock for resource='{resource_id}' (agent '{lock_data.agent_id}') has expired. Removing.")
-                    del self.locks[resource_id]; lock_data = None; self.lock_condition.notify_all()
-            if lock_data:
-                return swm_service_pb2.LockInfo(resource_id=resource_id, is_locked=True, current_holder_agent_id=lock_data.agent_id, lock_id=lock_data.lock_id, acquired_at_unix_ms=lock_data.acquired_at_unix_ms, lease_expires_at_unix_ms=lock_data.lease_expires_at_unix_ms if lock_data.lease_duration_ms > 0 else 0)
-            else:
-                return swm_service_pb2.LockInfo(resource_id=resource_id, is_locked=False)
+            now=int(time.time()*1000);lock=self.locks.get(rid)
+            if lock and lock.lease_duration_ms>0 and now>=lock.lease_expires_at_unix_ms:logger.info(f"SWM: Lock '{rid}' by '{lock.agent_id}' expired.Rem.");del self.locks[rid];lock=None;self.lock_condition.notify_all()
+            if lock:return swm_service_pb2.LockInfo(rid,True,lock.agent_id,lock.lock_id,lock.acquired_at_unix_ms,lock.lease_expires_at_unix_ms if lock.lease_duration_ms>0 else 0)
+            else:return swm_service_pb2.LockInfo(resource_id=rid,is_locked=False)
+    async def IncrementCounter(self, request: swm_service_pb2.IncrementCounterRequest, context) -> swm_service_pb2.CounterValueResponse: # ... (implementation as before) ...
+        cid,inc_by=request.counter_id,request.increment_by;logger.info(f"SWM: IncCounter '{cid}', by {inc_by}")
+        if not cid:await context.abort(grpc_aio.StatusCode.INVALID_ARGUMENT,"counter_id empty.");return swm_service_pb2.CounterValueResponse() # type: ignore
+        async with self.counters_lock:cur_val=self.counters.get(cid,0);new_val=cur_val+inc_by;self.counters[cid]=new_val;logger.info(f"SWM: Counter '{cid}' upd. Old:{cur_val},New:{new_val}");return swm_service_pb2.CounterValueResponse(cid,new_val,"Updated.")
+    async def GetCounter(self, request: swm_service_pb2.DistributedCounterRequest, context) -> swm_service_pb2.CounterValueResponse: # ... (implementation as before) ...
+        cid=request.counter_id;logger.info(f"SWM: GetCounter for '{cid}'")
+        if not cid:await context.abort(grpc_aio.StatusCode.INVALID_ARGUMENT,"counter_id empty.");return swm_service_pb2.CounterValueResponse() # type: ignore
+        async with self.counters_lock:cur_val=self.counters.get(cid)
+        if cur_val is None:logger.warning(f"SWM: Counter '{cid}' not found.");return swm_service_pb2.CounterValueResponse(cid,0,f"Counter '{cid}' not found, default 0.")
+        else:logger.info(f"SWM: Counter '{cid}', val: {cur_val}");return swm_service_pb2.CounterValueResponse(cid,cur_val,"Retrieved.")
 
-    async def IncrementCounter(self, request: swm_service_pb2.IncrementCounterRequest, context) -> swm_service_pb2.CounterValueResponse:
-        counter_id = request.counter_id; increment_by = request.increment_by
-        logger.info(f"SWM: IncrementCounter request for counter_id='{counter_id}', increment_by={increment_by}")
-        if not counter_id: await context.abort(grpc_aio.StatusCode.INVALID_ARGUMENT, "counter_id cannot be empty.") # type: ignore
-        async with self.counters_lock: # Use asyncio.Lock
-            current_value = self.counters.get(counter_id, 0)
-            new_value = current_value + increment_by
-            self.counters[counter_id] = new_value
-            logger.info(f"SWM: Counter '{counter_id}' updated. Old value: {current_value}, New value: {new_value}")
-            return swm_service_pb2.CounterValueResponse(counter_id=counter_id, current_value=new_value, status_message="Counter successfully updated.")
-
-    async def GetCounter(self, request: swm_service_pb2.DistributedCounterRequest, context) -> swm_service_pb2.CounterValueResponse:
-        counter_id = request.counter_id
-        logger.info(f"SWM: GetCounter request for counter_id='{counter_id}'")
-        if not counter_id: await context.abort(grpc_aio.StatusCode.INVALID_ARGUMENT, "counter_id cannot be empty.") # type: ignore
-        async with self.counters_lock: # Use asyncio.Lock
-            current_value = self.counters.get(counter_id)
-            if current_value is None:
-                logger.warning(f"SWM: Counter '{counter_id}' not found.")
-                return swm_service_pb2.CounterValueResponse(counter_id=counter_id, current_value=0, status_message=f"Counter '{counter_id}' not found, returned default value 0.")
-            else:
-                logger.info(f"SWM: Counter '{counter_id}', current value: {current_value}")
-                return swm_service_pb2.CounterValueResponse(counter_id=counter_id, current_value=current_value, status_message="Counter value successfully retrieved.")
-
-async def serve():
-    server = grpc_aio.server()
-    servicer_instance = SharedWorkingMemoryServiceImpl()
-    swm_service_pb2_grpc.add_SharedWorkingMemoryServiceServicer_to_server(servicer_instance, server)
-
-    # Start background tasks after servicer is initialized
-    await servicer_instance.start_background_tasks()
-
-    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting SWM (Shared Working Memory Service) asynchronously on {config.GRPC_LISTEN_ADDRESS}...")
-    await server.start()
-    logger.info(f"SWM started and listening asynchronously on {config.GRPC_LISTEN_ADDRESS}.")
-    try:
-        await server.wait_for_termination()
-    except KeyboardInterrupt:
-        logger.info("Stopping SWM (KeyboardInterrupt)...")
-    except asyncio.CancelledError:
-        logger.info("SWM server task cancelled.")
+async def serve(): # ... (implementation as before) ...
+    server=grpc_aio.server();servicer=SharedWorkingMemoryServiceImpl()
+    swm_service_pb2_grpc.add_SharedWorkingMemoryServiceServicer_to_server(servicer,server)
+    await servicer.start_background_tasks()
+    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS);logger.info(f"Starting SWM async on {config.GRPC_LISTEN_ADDRESS}...");await server.start()
+    logger.info(f"SWM started async on {config.GRPC_LISTEN_ADDRESS}.")
+    try:await server.wait_for_termination()
+    except KeyboardInterrupt:logger.info("Stopping SWM (KeyboardInterrupt)...")
+    except asyncio.CancelledError:logger.info("SWM server task cancelled.")
     finally:
-        logger.info("SWM: Initiating graceful shutdown...")
-        await servicer_instance.stop_background_tasks()
-        await server.stop(grace=5)
-        logger.info("SWM stopped.")
+        logger.info("SWM: Initiating graceful shutdown...");await servicer.stop_background_tasks();await server.stop(grace=5);logger.info("SWM stopped.")
 
-if __name__ == '__main__':
-    try:
-        asyncio.run(serve())
-    except KeyboardInterrupt:
-        logger.info("SWM main process interrupted by user.")
-    except Exception as e:
-        logger.critical(f"SWM main process encountered an unhandled exception: {e}", exc_info=True)
+if __name__=='__main__':
+    try:asyncio.run(serve())
+    except KeyboardInterrupt:logger.info("SWM main process interrupted.")
+    except Exception as e:logger.critical(f"SWM main unhandled exception: {e}",exc_info=True)
 
 ```
