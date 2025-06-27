@@ -9,202 +9,172 @@ import grpc
 from .generated_grpc_code import kem_pb2
 from .generated_grpc_code import glm_service_pb2
 from .generated_grpc_code import glm_service_pb2_grpc
-from google.protobuf.json_format import MessageToDict, ParseDict
-from google.protobuf import empty_pb2 # Для DeleteKEM
+# from google.protobuf.json_format import MessageToDict, ParseDict # Replaced by utils
+from google.protobuf import empty_pb2 # For DeleteKEM
+from dcs_memory.common.grpc_utils import retry_grpc_call
+from .proto_utils import kem_dict_to_proto, kem_proto_to_dict
+
+import logging
+logger = logging.getLogger(__name__)
+
 
 class GLMClient:
-    def __init__(self, server_address='localhost:50051'):
+    def __init__(self, server_address='localhost:50051',
+                 retry_max_attempts=3,
+                 retry_initial_delay_s=1.0,
+                 retry_backoff_factor=2.0):
         self.server_address = server_address
         self.channel = None
         self.stub = None
-        # Отложенное создание канала и заглушки до первого вызова или явного connect()
-        # self.connect() # Можно вызвать здесь или сделать отдельный метод connect()
+        self.retry_max_attempts = retry_max_attempts
+        self.retry_initial_delay_s = retry_initial_delay_s
+        self.retry_backoff_factor = retry_backoff_factor
+        # self.connect() # Connection is now typically managed by __enter__ or _ensure_connected
 
     def connect(self):
         if not self.channel:
             self.channel = grpc.insecure_channel(self.server_address)
             self.stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.channel)
-            print(f"GLMClient подключен к: {self.server_address}")
+            logger.info(f"GLMClient connected to: {self.server_address}")
 
     def _ensure_connected(self):
         if not self.stub:
             self.connect()
 
-    def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
-        kem_data_copy = kem_data.copy()
-        # ParseDict не очень хорошо работает с вложенными Timestamp, если они не строки RFC 3339.
-        # Очистим их, если они не строки, чтобы избежать ошибок. Сервер должен управлять ими.
-        if 'created_at' in kem_data_copy and not isinstance(kem_data_copy['created_at'], str):
-            del kem_data_copy['created_at']
-        if 'updated_at' in kem_data_copy and not isinstance(kem_data_copy['updated_at'], str):
-            del kem_data_copy['updated_at']
+    # _kem_dict_to_proto and _kem_proto_to_dict are now imported from proto_utils
 
-        # content должен быть bytes
-        if 'content' in kem_data_copy and isinstance(kem_data_copy['content'], str):
-            kem_data_copy['content'] = kem_data_copy['content'].encode('utf-8')
-
-        return ParseDict(kem_data_copy, kem_pb2.KEM(), ignore_unknown_fields=True)
-
-    def _kem_proto_to_dict(self, kem_proto: kem_pb2.KEM) -> dict:
-        # Конвертируем content bytes в строку, если это возможно (предполагаем UTF-8)
-        # Это для удобства, но может быть не всегда желаемым поведением.
-        kem_dict = MessageToDict(kem_proto, preserving_proto_field_name=True, including_default_value_fields=False)
-        if 'content' in kem_dict and isinstance(kem_dict['content'], bytes):
-            try:
-                kem_dict['content'] = kem_dict['content'].decode('utf-8')
-            except UnicodeDecodeError:
-                # Если не UTF-8, оставляем как есть (base64 строка от MessageToDict) или можно придумать другую логику
-                pass
-        return kem_dict
-
-    def store_kems(self, kems_data: list[dict]) -> tuple[list[str] | None, int | None, list[str] | None]:
+    @retry_grpc_call
+    def batch_store_kems(self, kems_data: list[dict]) -> tuple[list[dict] | None, list[str] | None, str | None]:
+        """Stores a batch of KEMs and returns a list of successfully stored KEMs (as dicts) and errors."""
         self._ensure_connected()
-        try:
-            proto_kems = [self._kem_dict_to_proto(data) for data in kems_data]
-            request = glm_service_pb2.StoreKEMsRequest(kems=proto_kems)
-            response = self.stub.StoreKEMs(request, timeout=10) # Добавлен таймаут
-            return list(response.stored_kem_ids), response.success_count, list(response.error_messages)
-        except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове StoreKEMs: {e.code()} - {e.details()}")
-            return None, 0, [e.details()]
-        except Exception as e:
-            print(f"Ошибка при подготовке запроса StoreKEMs: {e}")
-            import traceback
-            traceback.print_exc()
-            return None, 0, [str(e)]
+        proto_kems = [kem_dict_to_proto(data) for data in kems_data]
+        request = glm_service_pb2.BatchStoreKEMsRequest(kems=proto_kems)
+        response = self.stub.BatchStoreKEMs(request, timeout=20) # type: ignore
+        successfully_stored_kems_as_dicts = [kem_proto_to_dict(k) for k in response.successfully_stored_kems]
+        return successfully_stored_kems_as_dicts, list(response.failed_kem_references), response.overall_error_message
 
+    @retry_grpc_call
     def retrieve_kems(self, text_query: str = None, embedding_query: list[float] = None,
-                      metadata_filters: dict = None, limit: int = 10) -> list[dict] | None:
+                      metadata_filters: dict = None, ids_filter: list[str] = None,
+                      page_size: int = 10, page_token: str = None) -> tuple[list[dict] | None, str | None]:
         self._ensure_connected()
-        try:
-            query_proto = glm_service_pb2.KEMQuery()
-            if text_query:
-                query_proto.text_query = text_query
-            if embedding_query:
-                query_proto.embedding_query.extend(embedding_query)
-            if metadata_filters:
-                for key, value in metadata_filters.items():
-                    query_proto.metadata_filters[key] = str(value)
+        query_proto = glm_service_pb2.KEMQuery()
+        if text_query:
+            query_proto.text_query = text_query
+        if embedding_query:
+            query_proto.embedding_query.extend(embedding_query)
+        if metadata_filters:
+            for key, value in metadata_filters.items():
+                query_proto.metadata_filters[key] = str(value) # Ensure value is string for proto
+        if ids_filter:
+            query_proto.ids.extend(ids_filter)
+        request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, page_size=page_size, page_token=page_token if page_token else "")
+        response = self.stub.RetrieveKEMs(request, timeout=10) # type: ignore
+        kems_as_dicts = [kem_proto_to_dict(kem) for kem in response.kems]
+        return kems_as_dicts, response.next_page_token
 
-            request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, limit=limit)
-            response = self.stub.RetrieveKEMs(request, timeout=10) # Добавлен таймаут
-            return [self._kem_proto_to_dict(kem) for kem in response.kems]
-        except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове RetrieveKEMs: {e.code()} - {e.details()}")
-            return None
-        except Exception as e:
-            print(f"Ошибка при подготовке запроса RetrieveKEMs: {e}")
-            return None
-
+    @retry_grpc_call
     def update_kem(self, kem_id: str, kem_data_update: dict) -> dict | None:
         self._ensure_connected()
-        try:
-            kem_proto_update = self._kem_dict_to_proto(kem_data_update)
-            request = glm_service_pb2.UpdateKEMRequest(kem_id=kem_id, kem_data_update=kem_proto_update)
-            response_kem_proto = self.stub.UpdateKEM(request, timeout=10) # Добавлен таймаут
-            return self._kem_proto_to_dict(response_kem_proto)
-        except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове UpdateKEM: {e.code()} - {e.details()}")
-            return None
-        except Exception as e:
-            print(f"Ошибка при подготовке запроса UpdateKEM: {e}")
-            return None
+        kem_proto_update = kem_dict_to_proto(kem_data_update)
+        request = glm_service_pb2.UpdateKEMRequest(kem_id=kem_id, kem_data_update=kem_proto_update)
+        response_kem_proto = self.stub.UpdateKEM(request, timeout=10) # type: ignore
+        return kem_proto_to_dict(response_kem_proto)
 
+    @retry_grpc_call
     def delete_kem(self, kem_id: str) -> bool:
         self._ensure_connected()
-        try:
-            request = glm_service_pb2.DeleteKEMRequest(kem_id=kem_id)
-            self.stub.DeleteKEM(request, timeout=10) # Добавлен таймаут
-            return True
-        except grpc.RpcError as e:
-            print(f"gRPC ошибка при вызове DeleteKEM: {e.code()} - {e.details()}")
-            return False
-        except Exception as e:
-            print(f"Ошибка при подготовке запроса DeleteKEM: {e}")
-            return False
+        request = glm_service_pb2.DeleteKEMRequest(kem_id=kem_id)
+        self.stub.DeleteKEM(request, timeout=10) # type: ignore
+        return True
 
     def close(self):
         if self.channel:
             self.channel.close()
             self.channel = None
             self.stub = None
-            print("Канал GLMClient закрыт.")
+            logger.info("GLMClient channel closed.")
 
     def __enter__(self):
-        self.connect() # Подключаемся при входе в контекстный менеджер
+        self.connect() # Connect on entering context manager
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
 if __name__ == '__main__':
-    # Этот блок кода выполняется только при запуске файла напрямую (python glm_client.py)
-    # Он не будет выполняться при импорте GLMClient из другого модуля.
-    # Для запуска этого примера требуется, чтобы GLM сервер был запущен на localhost:50051
+    # This block executes only when the file is run directly (python glm_client.py)
+    # It will not run when GLMClient is imported from another module.
+    # Requires GLM server to be running on localhost:50051 for this example.
 
-    # Добавляем родительскую директорию в sys.path, чтобы можно было запустить этот файл напрямую
-    # для демонстрации, и чтобы импорты generated_grpc_code работали.
     import os
     import sys
-    # sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    # Это не совсем правильно, если generated_grpc_code не является устанавливаемым пакетом.
-    # Проще всего запускать пример из корневой директории SDK, добавив ее в PYTHONPATH,
-    # или убедившись, что generated_grpc_code устанавливается как часть пакета.
+    # Add parent directory to sys.path to allow direct execution for demonstration
+    # and to make generated_grpc_code imports work.
+    # This is not ideal if generated_grpc_code is not an installable package.
+    # Easiest to run example from SDK root, adding it to PYTHONPATH,
+    # or ensure generated_grpc_code is installed as part of the package.
 
-    print("Запуск примера использования GLMClient (требуется запущенный GLM сервер на localhost:50051)")
-    print("Этот пример не будет выполнен автоматически при выполнении subtask.")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger.info("Running GLMClient example (requires GLM server on localhost:50051)")
+    logger.info("This example will not run automatically during automated tasks.")
 
-    if os.getenv("RUN_GLM_CLIENT_EXAMPLE"): # Запускать пример только если установлена переменная окружения
+    if os.getenv("RUN_GLM_CLIENT_EXAMPLE") == "true": # Run example only if env var is set
         try:
             with GLMClient() as client:
                 # 1. Store KEMs
-                print("\n--- Тест StoreKEMs ---")
+                logger.info("\n--- Testing batch_store_kems ---")
                 kems_to_store = [
                     {"id": "kem_sdk_001", "content_type": "text/plain", "content": "KEM 1 from SDK.", "metadata": {"sdk_source": "python_glm_client", "topic": "sdk_test"}},
                     {"id": "kem_sdk_002", "content_type": "application/json", "content": '{"data_key": "data_value"}', "metadata": {"sdk_source": "python_glm_client", "status": "draft"}, "embeddings": [0.4, 0.5, 0.6]}
                 ]
-                stored_ids, success_count, errors = client.store_kems(kems_to_store)
-                if stored_ids is not None:
-                    print(f"Успешно сохранены КЕП с ID: {stored_ids} (Всего: {success_count})")
-                if errors and any(e for e in errors if e): # Проверка, что ошибки не пустые строки или None
-                    print(f"Ошибки при сохранении: {errors}")
+                successful_kems, failed_refs, error_msg = client.batch_store_kems(kems_to_store) # Corrected method name
+
+                if successful_kems:
+                    logger.info(f"Successfully stored KEMs: {[k['id'] for k in successful_kems]} (Total: {len(successful_kems)})")
+                if failed_refs:
+                    logger.error(f"Failed to store KEMs (references): {failed_refs}")
+                if error_msg:
+                    logger.error(f"Overall error from batch_store_kems: {error_msg}")
 
                 # 2. Retrieve KEMs
-                print("\n--- Тест RetrieveKEMs (по метаданным) ---")
-                retrieved_kems_meta = client.retrieve_kems(metadata_filters={"sdk_source": "python_glm_client"}, limit=5)
+                logger.info("\n--- Testing retrieve_kems (by metadata) ---")
+                retrieved_kems_tuple = client.retrieve_kems(metadata_filters={"sdk_source": "python_glm_client"}, page_size=5) # Corrected parameter name
+                retrieved_kems_meta = retrieved_kems_tuple[0] if retrieved_kems_tuple else None
+
                 if retrieved_kems_meta is not None:
-                    print(f"Извлечено {len(retrieved_kems_meta)} КЕП по метаданным:")
+                    logger.info(f"Retrieved {len(retrieved_kems_meta)} KEMs by metadata:")
                     for k in retrieved_kems_meta:
                         content_preview = k.get('content', '')[:30] if isinstance(k.get('content'), str) else 'N/A'
-                        print(f"  ID: {k.get('id')}, Content: {content_preview}...")
+                        logger.info(f"  ID: {k.get('id')}, Content: {content_preview}...")
                 else:
-                    print("Не удалось извлечь КЕП по метаданным.")
+                    logger.warning("Could not retrieve KEMs by metadata.")
 
-                # 3. Update KEM (предполагаем, что kem_sdk_001 существует)
-                print("\n--- Тест UpdateKEM ---")
-                if stored_ids and "kem_sdk_001" in stored_ids:
+                # 3. Update KEM (assuming kem_sdk_001 exists)
+                logger.info("\n--- Testing update_kem ---")
+                if successful_kems and any(k_dict.get('id') == "kem_sdk_001" for k_dict in successful_kems): # Check against successful_kems
                     updated_data = {"metadata": {"sdk_source": "python_glm_client_v2", "status": "final"}}
                     updated_kem = client.update_kem("kem_sdk_001", updated_data)
                     if updated_kem:
-                        print(f"КЕП kem_sdk_001 обновлена: {updated_kem.get('metadata')}")
+                        logger.info(f"KEM kem_sdk_001 updated: {updated_kem.get('metadata')}")
                     else:
-                        print("Не удалось обновить КЕП kem_sdk_001")
+                        logger.error("Failed to update KEM kem_sdk_001")
                 else:
-                    print("Пропуск теста UpdateKEM, т.к. kem_sdk_001 не был сохранен или ID не получен.")
+                    logger.info("Skipping UpdateKEM test as kem_sdk_001 was not successfully stored or ID not found.")
 
-                # 4. Delete KEM (предполагаем, что kem_sdk_002 существует)
-                print("\n--- Тест DeleteKEM ---")
-                if stored_ids and "kem_sdk_002" in stored_ids:
+                # 4. Delete KEM (assuming kem_sdk_002 exists)
+                logger.info("\n--- Testing delete_kem ---")
+                if successful_kems and any(k_dict.get('id') == "kem_sdk_002" for k_dict in successful_kems): # Check against successful_kems
                     delete_success = client.delete_kem("kem_sdk_002")
                     if delete_success:
-                        print("КЕП kem_sdk_002 успешно удалена.")
+                        logger.info("KEM kem_sdk_002 successfully deleted.")
                     else:
-                        print("Не удалось удалить КЕП kem_sdk_002.")
+                        logger.error("Failed to delete KEM kem_sdk_002.")
                 else:
-                    print("Пропуск теста DeleteKEM, т.к. kem_sdk_002 не был сохранен или ID не получен.")
+                    logger.info("Skipping DeleteKEM test as kem_sdk_002 was not successfully stored or ID not found.")
         except Exception as e:
-            print(f"Произошла ошибка во время выполнения примера: {e}")
+            logger.error(f"An error occurred during the example run: {e}", exc_info=True)
             import traceback
             traceback.print_exc()
     else:
-        print("Переменная окружения RUN_GLM_CLIENT_EXAMPLE не установлена, пример не выполняется.")
+        logger.info("Environment variable RUN_GLM_CLIENT_EXAMPLE not set to 'true', example will not run.")

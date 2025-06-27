@@ -11,7 +11,7 @@ echo "Генерация gRPC кода для SWM сервиса..."
 echo "Источник .proto файлов: $CENTRAL_PROTO_PATH_FROM_SCRIPT"
 echo "Выходная директория для сгенерированного кода: $GENERATED_OUTPUT_DIR"
 
-PYTHON_EXE=$(python3 -c "import sys; print(sys.executable)")
+PYTHON_EXE="python3" # Используем python3 из активированного venv
 
 # Проверяем наличие proto файлов перед компиляцией
 echo "Проверка наличия общих proto файлов в $CENTRAL_PROTO_PATH_FROM_SCRIPT:"

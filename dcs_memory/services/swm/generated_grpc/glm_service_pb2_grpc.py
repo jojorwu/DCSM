@@ -7,7 +7,7 @@ import glm_service_pb2 as glm__service__pb2
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 import kem_pb2 as kem__pb2
 
-GRPC_GENERATED_VERSION = '1.73.0'
+GRPC_GENERATED_VERSION = '1.73.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -56,6 +56,11 @@ class GlobalLongTermMemoryStub(object):
                 request_serializer=glm__service__pb2.DeleteKEMRequest.SerializeToString,
                 response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
                 _registered_method=True)
+        self.BatchStoreKEMs = channel.unary_unary(
+                '/dcsm.GlobalLongTermMemory/BatchStoreKEMs',
+                request_serializer=glm__service__pb2.BatchStoreKEMsRequest.SerializeToString,
+                response_deserializer=glm__service__pb2.BatchStoreKEMsResponse.FromString,
+                _registered_method=True)
 
 
 class GlobalLongTermMemoryServicer(object):
@@ -91,6 +96,13 @@ class GlobalLongTermMemoryServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def BatchStoreKEMs(self, request, context):
+        """Пакетное сохранение КЕП
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_GlobalLongTermMemoryServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -113,6 +125,11 @@ def add_GlobalLongTermMemoryServicer_to_server(servicer, server):
                     servicer.DeleteKEM,
                     request_deserializer=glm__service__pb2.DeleteKEMRequest.FromString,
                     response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
+            ),
+            'BatchStoreKEMs': grpc.unary_unary_rpc_method_handler(
+                    servicer.BatchStoreKEMs,
+                    request_deserializer=glm__service__pb2.BatchStoreKEMsRequest.FromString,
+                    response_serializer=glm__service__pb2.BatchStoreKEMsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -223,6 +240,33 @@ class GlobalLongTermMemory(object):
             '/dcsm.GlobalLongTermMemory/DeleteKEM',
             glm__service__pb2.DeleteKEMRequest.SerializeToString,
             google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BatchStoreKEMs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dcsm.GlobalLongTermMemory/BatchStoreKEMs',
+            glm__service__pb2.BatchStoreKEMsRequest.SerializeToString,
+            glm__service__pb2.BatchStoreKEMsResponse.FromString,
             options,
             channel_credentials,
             insecure,

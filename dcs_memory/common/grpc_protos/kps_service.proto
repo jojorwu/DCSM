@@ -2,31 +2,31 @@ syntax = "proto3";
 
 package dcsm;
 
-import "kem.proto"; // KEM будет результатом обработки и может быть частью ответа
+import "kem.proto"; // KEM will be the result of processing and may be part of the response.
 
-option go_package = "github.com/your_org/dcsm_protos/gen/go/kps;kps_service_pb";
+option go_package = "github.com/your_org/dcsm_protos/gen/go/kps;kps_service_pb"; // Example Go package option
 
-// Сервис Обработки Знаний (Knowledge Processor Service)
+// Knowledge Processor Service (KPS)
 service KnowledgeProcessorService {
-  // Обрабатывает сырые данные, генерирует эмбеддинги (если применимо),
-  // формирует КЕП и инициирует ее сохранение в GLM.
+  // Processes raw data, generates embeddings (if applicable),
+  // forms a KEM, and initiates its storage in GLM.
   rpc ProcessRawData(ProcessRawDataRequest) returns (ProcessRawDataResponse);
 }
 
 message ProcessRawDataRequest {
-  string data_id = 1; // Опциональный уникальный ID для отслеживания исходных данных или для идемпотентности
-  string content_type = 2; // MIME-тип контента, например, "text/plain", "application/pdf", "text/markdown"
-  bytes raw_content = 3;    // Сырое содержимое данных
-  map<string, string> initial_metadata = 4; // Начальные метаданные, которые нужно ассоциировать с КЕП
-                                            // (например, источник URL, имя файла, теги от пользователя)
-  // Можно добавить поле для явного указания модели эмбеддингов, если KPS поддерживает несколько
+  string data_id = 1; // Optional unique ID for tracking source data or for idempotency.
+  string content_type = 2; // MIME type of the content, e.g., "text/plain", "application/pdf", "text/markdown".
+  bytes raw_content = 3;    // Raw content of the data.
+  map<string, string> initial_metadata = 4; // Initial metadata to associate with the KEM
+                                            // (e.g., source URL, filename, user-provided tags).
+  // A field could be added for explicit specification of an embedding model if KPS supports multiple.
   // string embedding_model_id = 5;
 }
 
 message ProcessRawDataResponse {
-  string kem_id = 1;        // ID созданной и сохраненной КЕП в GLM
-  bool success = 2;         // Статус успешности всей операции
-  string status_message = 3; // Сообщение о статусе (например, "КЕП успешно создана и сохранена ID:xxx" или описание ошибки)
-  // KEM created_kem = 4;   // Пока не возвращаем полную КЕП, чтобы не дублировать данные.
-                            // Клиент может запросить ее из GLM по kem_id, если нужно.
+  string kem_id = 1;        // ID of the created and stored KEM in GLM.
+  bool success = 2;         // Status of the overall operation's success.
+  string status_message = 3; // Status message (e.g., "KEM successfully created and stored with ID:xxx" or error description).
+  // KEM created_kem = 4;   // Currently not returning the full KEM to avoid data duplication.
+                            // The client can request it from GLM by kem_id if needed.
 }
