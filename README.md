@@ -2,6 +2,8 @@
 
 **An Intelligent Memory System for Modern AI Agents and Large Language Models (LLMs)**
 
+> **Note:** DCSM is currently under active development. While the core components are functional, APIs may evolve, and features are continuously being refined. Users should anticipate potential changes and are encouraged to check back for updates or contribute to the development.
+
 ## Introduction
 
 Dynamic Contextualized Shared Memory (DCSM) is an advanced knowledge management system designed for efficient operation in complex, multi-agent AI systems and for augmenting the capabilities of LLMs. DCSM evolves ideas from approaches like Cache-Augmented Generation (CAG) and Retrieval-Augmented Generation (RAG), focusing on dynamic, distributed, and deeply contextualized access to information.
@@ -75,6 +77,36 @@ For a more detailed description of the architecture, data formats, and component
 *   **Efficient Search**: Integration with the Qdrant vector database in GLM provides powerful capabilities for semantic search and finding conceptually similar KEMs. `IndexedLRUCache` in SWM and LAM also speeds up metadata-based searches within caches.
 *   **Support for Collaborative Work**: SWM acts as a shared workspace where agents can publish new knowledge and subscribe to updates from other agents, fostering synergy in multi-agent systems.
 *   **Coordination Primitives**: SWM offers distributed locks and counters, facilitating coordination and synchronization tasks among multiple agents.
+
+## Integrating DCSM with AI Agents and LLMs
+
+DCSM is designed to be a versatile memory backbone for various AI applications, particularly those involving autonomous agents or Large Language Models (LLMs). Here are some conceptual ways to integrate DCSM:
+
+*   **Retrieval Augmented Generation (RAG) for LLMs**:
+    *   Before an LLM generates a response, an agent can query DCSM (specifically GLM via SWM or the Agent SDK) using semantic search (vector search on embeddings) or metadata filters to retrieve relevant KEMs.
+    *   The content of these KEMs can then be injected into the LLM's prompt as context, enabling more informed and accurate generation.
+    *   The KPS service can be used to process source documents into KEMs with embeddings, populating the knowledge base GLM uses.
+
+*   **Persistent Memory for Agents**:
+    *   Agents can store their observations, experiences, learned knowledge, or conversation histories as KEMs.
+    *   This allows agents to maintain state and knowledge across sessions or power cycles.
+    *   KEMs can be structured with rich metadata (e.g., task ID, observation type, timestamps) to facilitate later retrieval and reasoning.
+    *   Agents can use the Agent SDK to easily store and retrieve these KEMs from GLM, with SWM and LAM providing caching for frequently accessed information.
+
+*   **Collaborative Knowledge Building in Multi-Agent Systems**:
+    *   Agents can publish new KEMs (discoveries, processed information) to SWM.
+    *   Other agents can subscribe to relevant topics or KEM changes in SWM, allowing them to dynamically receive and incorporate new knowledge shared by their peers.
+    *   This fosters a shared understanding and collaborative problem-solving environment.
+
+*   **Context-Aware Agent Behavior**:
+    *   Agents can query SWM or LAM for KEMs relevant to their current task or environment.
+    *   This allows agents to adapt their behavior based on the most current and relevant information available in the shared memory system.
+
+*   **Task-Specific Knowledge Bases**:
+    *   KEMs can be organized using metadata (e.g., `project_id`, `domain`) to create logical knowledge bases within the larger GLM.
+    *   Agents can then focus their queries on specific subsets of knowledge relevant to their current operational context.
+
+The Python Agent SDK (`dcsm_agent_sdk_python`) provides the primary tools for agents to interact with SWM and GLM, simplifying these integration patterns. It includes functionalities for storing, retrieving, and querying KEMs, as well as interacting with SWM's Pub/Sub and coordination features.
 
 ## Getting Started
 
