@@ -18,20 +18,24 @@ class SWMConfig(BaseServiceConfig):
     CACHE_MAX_SIZE: int = 200
     DEFAULT_PAGE_SIZE: int = 20 # DEFAULT_SWM_PAGE_SIZE в старом коде
 
-    # SWM_INDEXED_METADATA_KEYS был списком строк, получаемым через split(',')
-    # Pydantic может автоматически преобразовывать строку в список, если указать тип List[str]
-    # и если переменная окружения будет строкой с разделителями (запятая по умолчанию для pydantic-settings, если не указано иное)
-    # Или можно использовать Field с json_loads, если переменная окружения будет JSON-строкой списка
-    # Или оставить как строку и парсить в main.py при передаче в IndexedLRUCache.
-    # Для простоты оставим как строку, которую нужно будет парсить.
-    # Либо, pydantic-settings может сам распарсить 'val1,val2' в List[str]
-    # Проверим документацию pydantic-settings для CSV. Да, он это умеет для простых типов.
-    INDEXED_METADATA_KEYS: List[str] = [] # Например, SWM_INDEXED_METADATA_KEYS="type,source"
+    # SWM_INDEXED_METADATA_KEYS was a list of strings, obtained via split(',')
+    # Pydantic can automatically convert a comma-separated string to a List[str]
+    # if List[str] type hint is used and the env var is a comma-separated string.
+    # pydantic-settings handles this for simple types.
+    INDEXED_METADATA_KEYS: List[str] = Field(
+        default_factory=list, # Default to an empty list if not provided
+        description="Comma-separated list of KEM metadata keys to be indexed by SWM's internal cache. E.g., 'type,source'"
+    )
 
-    # Параметры Retry для GLM клиента внутри SWM
-    GLM_RETRY_MAX_ATTEMPTS: int = Field(default=3, alias="SWM_GLM_RETRY_MAX_ATTEMPTS") # Используем alias, если хотим другое имя env var
+    # Retry parameters for the GLM client within SWM
+    GLM_RETRY_MAX_ATTEMPTS: int = Field(default=3, alias="SWM_GLM_RETRY_MAX_ATTEMPTS") # Using alias if a different env var name is preferred
     GLM_RETRY_INITIAL_DELAY_S: float = Field(default=1.0, alias="SWM_GLM_RETRY_INITIAL_DELAY_S")
     GLM_RETRY_BACKOFF_FACTOR: float = Field(default=2.0, alias="SWM_GLM_RETRY_BACKOFF_FACTOR")
+
+    LOCK_CLEANUP_INTERVAL_S: int = Field(
+        default=60,
+        description="Interval in seconds for the background task that cleans up expired distributed locks."
+    )
 
 
 if __name__ == '__main__':
