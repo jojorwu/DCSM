@@ -546,29 +546,27 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 final_created_at_proto = Timestamp()
                 is_new_kem_in_db_check_needed = True # Assume we need to check, can be optimized if client guarantees new IDs
 
-                # We'll handle SQLite first, then Qdrant batching.
-                # For now, we prepare data structures for both.
-                kems_for_sqlite_processing.append({'proto': current_kem_to_process, 'original_ref': original_client_ref, 'final_created_at': final_created_at_proto, 'current_time': current_time_proto, 'is_new_check_needed': is_new_kem_in_db_check_needed})
-
-                # Prepare Qdrant point if embeddings exist
+                # Check for Qdrant viability BEFORE adding to SQLite processing list if embeddings are present
                 if current_kem_to_process.embeddings:
                     if not self.qdrant_client:
-                        logger.error(f"BatchStoreKEMs: Qdrant client not available. KEM ID '{kem_id}' (ref: {original_client_ref}) with embeddings cannot be processed for Qdrant.")
-                        # This KEM will fail if SQLite part succeeds due to qdrant_persisted_this_op remaining False later.
-                        # Add to failed_kem_references_list early? Or let the later logic handle it.
-                        # For now, let SQLite attempt proceed, and the rollback logic will handle it.
-                        continue # Qdrant point not prepared, will cause rollback if SQLite succeeds
+                        logger.error(f"BatchStoreKEMs: Qdrant client not available. KEM ID '{kem_id}' (ref: {original_client_ref}) with embeddings cannot be stored.")
+                        failed_kem_references_list.append(original_client_ref)
+                        continue # Skip this KEM entirely, do not attempt SQLite persistence
 
                     if len(current_kem_to_process.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
                         logger.error(f"BatchStoreKEMs: Invalid embedding dimension for KEM ID '{kem_id}' (ref: {original_client_ref}). Expected {self.config.DEFAULT_VECTOR_SIZE}, got {len(current_kem_to_process.embeddings)}.")
                         failed_kem_references_list.append(original_client_ref) # Early fail for this KEM
                         continue # Skip this KEM entirely
 
-                    qdrant_payload = {"kem_id_ref": kem_id}
-                    if current_kem_to_process.metadata:
-                        for k, v_str in current_kem_to_process.metadata.items(): qdrant_payload[f"md_{k}"] = v_str
-                    # Timestamps for Qdrant payload will be set after SQLite processing ensures correct created_at
-                    qdrant_points_to_upsert.append({'id': kem_id, 'vector': list(current_kem_to_process.embeddings), 'payload_kem_proto_ref': current_kem_to_process, 'original_ref': original_client_ref})
+                # If all checks passed (or no embeddings), add to SQLite processing list
+                kems_for_sqlite_processing.append({'proto': current_kem_to_process, 'original_ref': original_client_ref, 'final_created_at': final_created_at_proto, 'current_time': current_time_proto, 'is_new_check_needed': is_new_kem_in_db_check_needed})
+
+                # If it has embeddings (and passed checks), also add to Qdrant list
+                if current_kem_to_process.embeddings:
+                    # qdrant_payload construction is deferred until after SQLite success confirms final timestamps
+                    qdrant_points_to_upsert.append({'id': kem_id, 'vector': list(current_kem_to_process.embeddings),
+                                                    'payload_kem_proto_ref': current_kem_to_process, # Will be updated by SQLite step
+                                                    'original_ref': original_client_ref})
 
             # Step 2: Batch persist to SQLite
             # This needs to be done carefully to associate failures with original KEMs
