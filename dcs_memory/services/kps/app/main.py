@@ -1,10 +1,9 @@
 import grpc
 from concurrent import futures
-import time # Required for _ONE_DAY_IN_SECONDS, though not directly used for sleeps
 import sys
 import os
-# import uuid # Not used directly in this file
-import logging
+import logging # uuid was already removed, SentenceTransformer is used.
+import typing # Added back for Optional type hint
 from sentence_transformers import SentenceTransformer
 
 # Import configuration
@@ -38,8 +37,6 @@ from generated_grpc import kps_service_pb2_grpc # For KPS server
 # Import retry decorator
 from dcs_memory.common.grpc_utils import retry_grpc_call
 # --- End gRPC Code Import Block ---
-
-_ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
 class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServiceServicer):
     def __init__(self):
@@ -85,9 +82,10 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
     @retry_grpc_call
     def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
         if not self.glm_stub:
-            logger.error("KPS._glm_store_kem_with_retry: GLM stub is not initialized.")
-            # This indicates a setup/configuration problem.
-            raise grpc.RpcError("GLM stub not available in KPS for storing KEM.")
+            logger.error("KPS._glm_store_kem_with_retry: GLM stub is not initialized. This is a KPS internal configuration error.")
+            # This indicates a setup/configuration problem within KPS.
+            # Raising RuntimeError as it's an internal state issue, not a gRPC communication failure at this point.
+            raise RuntimeError("KPS Internal Error: GLM client stub not available for storing KEM.")
         return self.glm_stub.StoreKEM(request, timeout=timeout)
 
     def ProcessRawData(self, request: kps_service_pb2.ProcessRawDataRequest, context) -> kps_service_pb2.ProcessRawDataResponse:
