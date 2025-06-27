@@ -1,71 +1,71 @@
 #!/bin/bash
 
-# --- Базовая настройка среды и навигация ---
-# set -e: Немедленный выход при ошибке.
-# set -u: Выход при использовании неопределенной переменной.
-# set -x: Печатать команды и их аргументы по мере их выполнения (для отладки).
+# --- Basic environment setup and navigation ---
+# set -e: Exit immediately if a command exits with a non-zero status.
+# set -u: Treat unset variables as an error when substituting.
+# set -x: Print commands and their arguments as they are executed (for debugging).
 set -eux
 
-# Переход в корневой каталог проекта
+# Navigate to the project root directory (assuming this script is run from a context where /app is the root)
 cd /app
 
-# --- 1. Настройка Python окружения ---
-echo "--- Настройка Python окружения ---"
+# --- 1. Python Environment Setup ---
+echo "--- Setting up Python environment ---"
 
-# Создание и активация виртуального окружения для изоляции зависимостей
+# Create and activate a virtual environment for dependency isolation
 python3 -m venv venv
 source venv/bin/activate
 
-# Переменная для изоляции pip от системных пакетов
+# Variable to isolate pip from system packages (useful in some environments)
 export PIP_BREAK_SYSTEM_PACKAGES=1
 
-# Поиск и установка Python зависимостей из всех файлов requirements.txt
-# (Поиск в текущем каталоге и на один уровень вглубь)
-echo "Поиск и установка Python зависимостей из requirements.txt..."
+# Find and install Python dependencies from all requirements.txt files
+# (Searches in the current directory and one level deep)
+echo "Searching for and installing Python dependencies from requirements.txt files..."
 files=$(find . -maxdepth 2 -type f -wholename "*requirements*.txt")
 
-# Проверяем, найдены ли файлы requirements.txt, и устанавливаем зависимости
+# Check if requirements.txt files were found and install dependencies
 if [ -n "$files" ]; then
-    python -m pip install $(echo "$files" | xargs -I {{}} echo -r {{}}) || { echo "Ошибка при установке Python зависимостей. Проверьте requirements.txt"; exit 1; }
+    python -m pip install $(echo "$files" | xargs -I {{}} echo -r {{}}) || { echo "Error installing Python dependencies. Check requirements.txt files."; exit 1; }
 else
-    echo "Файлы 'requirements.txt' не найдены. Пропуск установки Python зависимостей."
+    echo "'requirements.txt' files not found. Skipping Python dependency installation."
 fi
 
-# --- 2. Настройка Node.js окружения (если папка 'dcs_memory_node' существует) ---
+# --- 2. Node.js Environment Setup (if 'dcs_memory_node' folder exists) ---
 echo ""
-echo "--- Настройка Node.js окружения (если папка 'dcs_memory_node' существует) ---"
+echo "--- Setting up Node.js environment (if 'dcs_memory_node' folder exists) ---"
 
-# Проверяем наличие папки для Node.js компонентов
+# Check for the Node.js components folder
 if [ -d "dcs_memory_node" ]; then
-    echo "Переход в 'dcs_memory_node' для установки Node.js зависимостей..."
+    echo "Navigating to 'dcs_memory_node' to install Node.js dependencies..."
     cd dcs_memory_node
 
-    # Инициализация Node.js проекта, если еще не инициализирован (npm init -y)
-    # Используем '|| true' чтобы не прерывать скрипт, если package.json уже есть
+    # Initialize Node.js project if not already initialized (npm init -y)
+    # Use '|| true' to prevent script interruption if package.json already exists
     npm init -y || true
 
-    echo "Установка Node.js зависимостей..."
-    npm install || { echo "Ошибка при установке Node.js зависимостей. Проверьте package.json в dcs_memory_node"; exit 1; }
+    echo "Installing Node.js dependencies..."
+    npm install || { echo "Error installing Node.js dependencies. Check package.json in dcs_memory_node."; exit 1; }
 
-    echo "Возвращение в корневой каталог проекта..."
+    echo "Returning to the project root directory..."
     cd ..
 else
-    echo "Папка 'dcs_memory_node' не найдена. Пропуск установки Node.js зависимостей."
+    echo "'dcs_memory_node' folder not found. Skipping Node.js dependency installation."
 fi
 
-# --- 3. Генерация gRPC Кода ---
+# --- 3. gRPC Code Generation ---
 echo ""
-echo "--- Генерация gRPC кода для Python и Node.js ---"
+echo "--- Generating gRPC code for Python (and Node.js if applicable) ---"
 
 if [ -f "./generate_grpc_code.sh" ]; then
-    ./generate_grpc_code.sh || { echo "Ошибка при генерации gRPC кода с помощью generate_grpc_code.sh. Убедитесь, что `protoc` установлен и скрипт работает корректно."; exit 1; }
+    ./generate_grpc_code.sh || { echo "Error generating gRPC code with generate_grpc_code.sh. Ensure 'protoc' is installed and the script works correctly."; exit 1; }
 else
-    echo "Скрипт 'generate_grpc_code.sh' не найден. Пропуск генерации gRPC кода."
+    echo "Script 'generate_grpc_code.sh' not found. Skipping gRPC code generation."
 fi
 
 echo ""
 echo "--------------------------------------------------------"
-echo "Инициализация среды разработки DCSM завершена!"
-echo "Теперь venv создано и зависимости установлены."
-echo "НЕ БЫЛИ ВЫПОЛНЕНЫ команды очистки из оригинального setup_environment.sh."
+echo "DCSM development environment initialization complete!"
+echo "Virtual environment 'venv' created and dependencies installed."
+echo "Cleanup commands from the original setup_environment.sh WERE NOT EXECUTED."
 echo "--------------------------------------------------------"

@@ -129,48 +129,53 @@ if __name__ == '__main__':
                     {"id": "kem_sdk_001", "content_type": "text/plain", "content": "KEM 1 from SDK.", "metadata": {"sdk_source": "python_glm_client", "topic": "sdk_test"}},
                     {"id": "kem_sdk_002", "content_type": "application/json", "content": '{"data_key": "data_value"}', "metadata": {"sdk_source": "python_glm_client", "status": "draft"}, "embeddings": [0.4, 0.5, 0.6]}
                 ]
-                stored_ids, success_count, errors = client.store_kems(kems_to_store)
-                if stored_ids is not None:
-                    print(f"Успешно сохранены КЕП с ID: {stored_ids} (Всего: {success_count})")
-                if errors and any(e for e in errors if e): # Проверка, что ошибки не пустые строки или None
-                    print(f"Ошибки при сохранении: {errors}")
+                successful_kems, failed_refs, error_msg = client.batch_store_kems(kems_to_store) # Corrected method name
+
+                if successful_kems:
+                    logger.info(f"Successfully stored KEMs: {[k['id'] for k in successful_kems]} (Total: {len(successful_kems)})")
+                if failed_refs:
+                    logger.error(f"Failed to store KEMs (references): {failed_refs}")
+                if error_msg:
+                    logger.error(f"Overall error from batch_store_kems: {error_msg}")
 
                 # 2. Retrieve KEMs
-                print("\n--- Тест RetrieveKEMs (по метаданным) ---")
-                retrieved_kems_meta = client.retrieve_kems(metadata_filters={"sdk_source": "python_glm_client"}, limit=5)
+                logger.info("\n--- Testing retrieve_kems (by metadata) ---")
+                retrieved_kems_tuple = client.retrieve_kems(metadata_filters={"sdk_source": "python_glm_client"}, page_size=5) # Corrected parameter name
+                retrieved_kems_meta = retrieved_kems_tuple[0] if retrieved_kems_tuple else None
+
                 if retrieved_kems_meta is not None:
-                    print(f"Извлечено {len(retrieved_kems_meta)} КЕП по метаданным:")
+                    logger.info(f"Retrieved {len(retrieved_kems_meta)} KEMs by metadata:")
                     for k in retrieved_kems_meta:
                         content_preview = k.get('content', '')[:30] if isinstance(k.get('content'), str) else 'N/A'
-                        print(f"  ID: {k.get('id')}, Content: {content_preview}...")
+                        logger.info(f"  ID: {k.get('id')}, Content: {content_preview}...")
                 else:
-                    print("Не удалось извлечь КЕП по метаданным.")
+                    logger.warning("Could not retrieve KEMs by metadata.")
 
-                # 3. Update KEM (предполагаем, что kem_sdk_001 существует)
-                print("\n--- Тест UpdateKEM ---")
-                if stored_ids and "kem_sdk_001" in stored_ids:
+                # 3. Update KEM (assuming kem_sdk_001 exists)
+                logger.info("\n--- Testing update_kem ---")
+                if successful_kems and any(k_dict.get('id') == "kem_sdk_001" for k_dict in successful_kems): # Check against successful_kems
                     updated_data = {"metadata": {"sdk_source": "python_glm_client_v2", "status": "final"}}
                     updated_kem = client.update_kem("kem_sdk_001", updated_data)
                     if updated_kem:
-                        print(f"КЕП kem_sdk_001 обновлена: {updated_kem.get('metadata')}")
+                        logger.info(f"KEM kem_sdk_001 updated: {updated_kem.get('metadata')}")
                     else:
-                        print("Не удалось обновить КЕП kem_sdk_001")
+                        logger.error("Failed to update KEM kem_sdk_001")
                 else:
-                    print("Пропуск теста UpdateKEM, т.к. kem_sdk_001 не был сохранен или ID не получен.")
+                    logger.info("Skipping UpdateKEM test as kem_sdk_001 was not successfully stored or ID not found.")
 
-                # 4. Delete KEM (предполагаем, что kem_sdk_002 существует)
-                print("\n--- Тест DeleteKEM ---")
-                if stored_ids and "kem_sdk_002" in stored_ids:
+                # 4. Delete KEM (assuming kem_sdk_002 exists)
+                logger.info("\n--- Testing delete_kem ---")
+                if successful_kems and any(k_dict.get('id') == "kem_sdk_002" for k_dict in successful_kems): # Check against successful_kems
                     delete_success = client.delete_kem("kem_sdk_002")
                     if delete_success:
-                        print("КЕП kem_sdk_002 успешно удалена.")
+                        logger.info("KEM kem_sdk_002 successfully deleted.")
                     else:
-                        print("Не удалось удалить КЕП kem_sdk_002.")
+                        logger.error("Failed to delete KEM kem_sdk_002.")
                 else:
-                    print("Пропуск теста DeleteKEM, т.к. kem_sdk_002 не был сохранен или ID не получен.")
+                    logger.info("Skipping DeleteKEM test as kem_sdk_002 was not successfully stored or ID not found.")
         except Exception as e:
-            print(f"Произошла ошибка во время выполнения примера: {e}")
+            logger.error(f"An error occurred during the example run: {e}", exc_info=True)
             import traceback
             traceback.print_exc()
     else:
-        print("Переменная окружения RUN_GLM_CLIENT_EXAMPLE не установлена, пример не выполняется.")
+        logger.info("Environment variable RUN_GLM_CLIENT_EXAMPLE not set to 'true', example will not run.")

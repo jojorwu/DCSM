@@ -1,32 +1,32 @@
 #!/bin/bash
-SCRIPT_DIR=$(dirname "$0") # Директория, где находится сам скрипт (dcs_memory/services/kps)
-cd "$SCRIPT_DIR" || exit 1 # Переходим в директорию скрипта
+SCRIPT_DIR=$(dirname "$0") # Directory where the script itself is located (dcs_memory/services/kps)
+cd "$SCRIPT_DIR" || exit 1 # Change to the script's directory
 
-echo "Текущая директория для генерации KPS кода: $(pwd)"
+echo "Current directory for KPS code generation: $(pwd)"
 
-CENTRAL_PROTO_PATH_FROM_SCRIPT="../../common/grpc_protos" # Путь к общим proto
-GENERATED_OUTPUT_DIR="./generated_grpc" # Локальная директория для сгенерированного кода
+CENTRAL_PROTO_PATH_FROM_SCRIPT="../../common/grpc_protos" # Path to common proto files
+GENERATED_OUTPUT_DIR="./generated_grpc" # Local directory for generated code
 
-echo "Генерация gRPC кода для KPS сервиса..."
-echo "Источник .proto файлов: $CENTRAL_PROTO_PATH_FROM_SCRIPT"
-echo "Выходная директория для сгенерированного кода: $GENERATED_OUTPUT_DIR"
+echo "Generating gRPC code for KPS service..."
+echo "Source .proto files from: $CENTRAL_PROTO_PATH_FROM_SCRIPT"
+echo "Output directory for generated code: $GENERATED_OUTPUT_DIR"
 
-PYTHON_EXE="python3" # Используем python3 из активированного venv
+PYTHON_EXE="python3" # Using python3 from the activated venv
 
-# Проверяем наличие proto файлов перед компиляцией
-echo "Проверка наличия общих proto файлов в $CENTRAL_PROTO_PATH_FROM_SCRIPT:"
+# Check for common proto files before compilation
+echo "Checking for common proto files in $CENTRAL_PROTO_PATH_FROM_SCRIPT:"
 if [ ! -d "$CENTRAL_PROTO_PATH_FROM_SCRIPT" ]; then
-    echo "Ошибка: Директория с общими proto файлами '$CENTRAL_PROTO_PATH_FROM_SCRIPT' не найдена!"
-    # exit 1 # Закомментировано для subtask, но в реальности должно быть
+    echo "Error: Directory with common proto files '$CENTRAL_PROTO_PATH_FROM_SCRIPT' not found!"
+    # exit 1 # Commented out for subtask, but should be active in reality
 fi
 ls -l "$CENTRAL_PROTO_PATH_FROM_SCRIPT"
 
-# Создаем выходную директорию, если ее нет
+# Create the output directory if it doesn't exist
 mkdir -p "$GENERATED_OUTPUT_DIR"
 
-# Компилируем kem.proto, glm_service.proto (для клиента GLM) и kps_service.proto (для сервера KPS)
-# Путь -I должен указывать на директорию, где лежат импортируемые файлы.
-# Все наши proto файлы лежат в одной общей директории.
+# Compile kem.proto, glm_service.proto (for GLM client), and kps_service.proto (for KPS server)
+# The -I path should point to the directory containing imported files.
+# All our proto files are in one common directory.
 $PYTHON_EXE -m grpc_tools.protoc \
     -I"$CENTRAL_PROTO_PATH_FROM_SCRIPT" \
     --python_out="$GENERATED_OUTPUT_DIR" \
@@ -35,12 +35,12 @@ $PYTHON_EXE -m grpc_tools.protoc \
     "$CENTRAL_PROTO_PATH_FROM_SCRIPT/glm_service.proto" \
     "$CENTRAL_PROTO_PATH_FROM_SCRIPT/kps_service.proto"
 
-# Создаем __init__.py в generated_grpc, чтобы сделать его пакетом
+# Create __init__.py in generated_grpc to make it a package
 touch "$GENERATED_OUTPUT_DIR/__init__.py"
-# Также создадим __init__.py в родительской директории сгенерированного кода, если она используется как часть пути импорта
-# Например, если generated_grpc содержит поддиректории по именам proto.
-# В нашем случае все генерируется плоско в generated_grpc.
+# Also create __init__.py in the parent directory of the generated code if it's used as part of the import path.
+# For example, if generated_grpc contains subdirectories named after protos.
+# In our case, everything is generated flat into generated_grpc.
 
-echo "Содержимое сгенерированной директории $GENERATED_OUTPUT_DIR:"
+echo "Contents of the generated directory $GENERATED_OUTPUT_DIR:"
 ls -l "$GENERATED_OUTPUT_DIR"
-echo "Генерация кода для KPS сервиса завершена."
+echo "gRPC code generation for KPS service complete."

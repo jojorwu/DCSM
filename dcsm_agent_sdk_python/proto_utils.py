@@ -30,9 +30,8 @@ def kem_dict_to_proto(kem_data: dict) -> kem_pb2.KEM:
             kem_data_copy['embeddings'] = [float(e) for e in kem_data_copy['embeddings']]
         except (ValueError, TypeError):
             # Handle cases where conversion to float might fail, e.g. by removing or logging.
-            # For now, let it raise an error if conversion fails, or clear it.
-            del kem_data_copy['embeddings'] # Or log an error
-            # logger.warning("Failed to convert embeddings to float, removing from KEM dict.")
+            # For now, if conversion fails, remove the embeddings field.
+            del kem_data_copy['embeddings']
 
     # Ensure metadata is map<string, string>.
     if 'metadata' in kem_data_copy and isinstance(kem_data_copy['metadata'], dict):
