@@ -7,9 +7,9 @@ import uuid
 import logging
 import threading
 import asyncio
-import queue as sync_queue
+# import queue as sync_queue # Unused
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass # field is unused
 from cachetools import LRUCache, Cache
 from google.protobuf.timestamp_pb2 import Timestamp
 import typing
@@ -120,8 +120,8 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         logger.setLevel(self.config.get_log_level_int()) # Set logger level from this instance's config
 
         logger.info(f"Initializing SharedWorkingMemoryServiceImpl... Cache size: {self.config.CACHE_MAX_SIZE}, Indexed keys: {self.config.INDEXED_METADATA_KEYS}")
-        self.glm_channel: Optional[grpc_aio.Channel] = None
-        self.glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None
+        # self.glm_channel: Optional[grpc_aio.Channel] = None # This async channel was unused
+        self.glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None # This is for the sync stub
 
         self.retry_max_attempts = self.config.GLM_RETRY_MAX_ATTEMPTS
         self.retry_initial_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
@@ -228,12 +228,19 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
     async def PublishKEMToSWM(self, request: swm_service_pb2.PublishKEMToSWMRequest, context) -> swm_service_pb2.PublishKEMToSWMResponse:
         kem_to_publish = request.kem_to_publish; logger.info(f"SWM: PublishKEMToSWM for KEM ID (suggested): '{kem_to_publish.id}'")
         kem_id_final = kem_to_publish.id or str(uuid.uuid4()); kem_to_publish.id = kem_id_final
-        if not request.kem_to_publish.id: logger.info(f"SWM: No ID provided, new ID generated: '{kem_id_final}'")
+        # The original kem_to_publish.id (from request.kem_to_publish.id) might be empty.
+        # We log the final ID used (kem_id_final). If it was generated, the original was empty.
+        if not request.kem_to_publish.id and kem_id_final: # Check if ID was generated
+             logger.info(f"SWM: No ID provided by client, new ID generated: '{kem_id_final}'")
         ts = Timestamp(); ts.GetCurrentTime()
-        existing_kem_dict = await asyncio.to_thread(self.swm_cache.get, kem_id_final)
-        if existing_kem_dict: kem_to_publish.created_at.CopyFrom(kem_pb2.KEM(**existing_kem_dict).created_at)
-        elif not kem_to_publish.HasField("created_at"): kem_to_publish.created_at.CopyFrom(ts)
-        kem_to_publish.updated_at.CopyFrom(ts); await self._put_kem_to_cache_async(kem_to_publish)
+        existing_kem_in_cache = await asyncio.to_thread(self.swm_cache.get, kem_id_final) # This is a kem_pb2.KEM object
+        if existing_kem_in_cache: # If KEM already exists in cache, preserve its created_at
+            kem_to_publish.created_at.CopyFrom(existing_kem_in_cache.created_at)
+        elif not kem_to_publish.HasField("created_at"): # If new and no created_at provided, set it
+            kem_to_publish.created_at.CopyFrom(ts)
+        # Always update/set updated_at
+        kem_to_publish.updated_at.CopyFrom(ts)
+        await self._put_kem_to_cache_async(kem_to_publish) # This notifies subscribers too
         published_to_swm_flag=True; persistence_triggered_flag=False; status_msg=f"KEM ID '{kem_id_final}' published to SWM."
         if request.persist_to_glm_if_new_or_updated:
             if not self.glm_stub: msg_glm=f"GLM unavailable, KEM '{kem_id_final}' not persisted.";logger.error(msg_glm);status_msg+=" "+msg_glm

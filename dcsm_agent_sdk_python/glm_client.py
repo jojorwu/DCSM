@@ -9,12 +9,11 @@ import grpc
 from .generated_grpc_code import kem_pb2
 from .generated_grpc_code import glm_service_pb2
 from .generated_grpc_code import glm_service_pb2_grpc
-# from google.protobuf.json_format import MessageToDict, ParseDict # Заменены утилитами
-from google.protobuf import empty_pb2 # Для DeleteKEM
+# from google.protobuf.json_format import MessageToDict, ParseDict # Replaced by utils
+from google.protobuf import empty_pb2 # For DeleteKEM
 from dcs_memory.common.grpc_utils import retry_grpc_call
-from .proto_utils import kem_dict_to_proto, kem_proto_to_dict # <--- Новый импорт
+from .proto_utils import kem_dict_to_proto, kem_proto_to_dict
 
-# Нужно добавить logger для GLMClient
 import logging
 logger = logging.getLogger(__name__)
 

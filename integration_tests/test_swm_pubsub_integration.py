@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import MagicMock # For mocking context in subscriber thread
 import uuid
 import time
 import threading

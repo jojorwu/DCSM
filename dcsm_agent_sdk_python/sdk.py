@@ -2,6 +2,7 @@
 from .glm_client import GLMClient
 from .swm_client import SWMClient
 from .local_memory import LocalAgentMemory
+from .proto_utils import kem_proto_to_dict # For SWM event handling
 import typing
 from typing import Optional, List, Tuple, Callable # Added Callable
 from datetime import datetime # For date parsing in KEMQuery helper

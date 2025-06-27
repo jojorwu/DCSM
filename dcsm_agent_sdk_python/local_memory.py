@@ -175,23 +175,13 @@ class LocalAgentMemory:
             # This is the potentially inefficient part if the cache is large.
             candidate_kems = self.cache.values()
 
-        # Stage 3: Filter by IDs if not already implicitly handled by indexed search results
-        # (e.g., if indexed search was skipped, or if IDs are a further refinement)
-        if ids and not (indexed_metadata_queries and final_candidate_ids is not None): # final_candidate_ids is not defined here
-                                                                                        # This condition needs rethink if we want to combine ID filter with indexed results
-            # If indexed filters were applied, candidate_kems already respects them.
-            # If no indexed filters, candidate_kems might be all cache values or filtered by ID (if ids was the entry point).
-            # This re-filtering by IDs might be redundant or incorrect depending on previous path.
-            # Let's simplify: if IDs are provided, they act as a primary filter if no indexed results are used.
-            # If indexed results are used, IDs can be an additional AND filter.
-
-            # Corrected logic:
-            # If candidate_kems was populated by indexed search, further filter by IDs.
-            # If candidate_kems was populated by initial ID filter, this is redundant.
-            # If candidate_kems is all values, filter by IDs.
+        # Stage 3: Filter by IDs if specific IDs are provided.
+        # If candidate_kems was populated by indexed search (Stage 1), this acts as an AND filter.
+        # If candidate_kems was populated by initial ID load (Stage 2, because no indexed queries), this is redundant but harmless.
+        # If candidate_kems is all cache items (Stage 2, because no indexed and no initial ID load), this filters by ID.
+        if ids:
             ids_set = set(ids)
             candidate_kems = [k for k in candidate_kems if k.get('id') in ids_set]
-
 
         # Stage 4: Filter by unindexed metadata
         if unindexed_metadata_queries:
