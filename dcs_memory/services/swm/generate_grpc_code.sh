@@ -1,31 +1,31 @@
 #!/bin/bash
-SCRIPT_DIR=$(dirname "$0") # Директория, где находится сам скрипт (dcs_memory/services/swm)
-cd "$SCRIPT_DIR" || exit 1 # Переходим в директорию скрипта
+SCRIPT_DIR=$(dirname "$0") # Directory where the script itself is located (dcs_memory/services/swm)
+cd "$SCRIPT_DIR" || exit 1 # Change to the script's directory
 
-echo "Текущая директория для генерации SWM кода: $(pwd)"
+echo "Current directory for SWM code generation: $(pwd)"
 
-CENTRAL_PROTO_PATH_FROM_SCRIPT="../../common/grpc_protos" # Путь к общим proto
-GENERATED_OUTPUT_DIR="./generated_grpc" # Локальная директория для сгенерированного кода
+CENTRAL_PROTO_PATH_FROM_SCRIPT="../../common/grpc_protos" # Path to common protos
+GENERATED_OUTPUT_DIR="./generated_grpc" # Local directory for generated code
 
-echo "Генерация gRPC кода для SWM сервиса..."
-echo "Источник .proto файлов: $CENTRAL_PROTO_PATH_FROM_SCRIPT"
-echo "Выходная директория для сгенерированного кода: $GENERATED_OUTPUT_DIR"
+echo "Generating gRPC code for SWM service..."
+echo "Source .proto files from: $CENTRAL_PROTO_PATH_FROM_SCRIPT"
+echo "Output directory for generated code: $GENERATED_OUTPUT_DIR"
 
-PYTHON_EXE="python3" # Используем python3 из активированного venv
+PYTHON_EXE="python3" # Using python3 from the activated venv
 
-# Проверяем наличие proto файлов перед компиляцией
-echo "Проверка наличия общих proto файлов в $CENTRAL_PROTO_PATH_FROM_SCRIPT:"
+# Check for common proto files before compilation
+echo "Checking for common proto files in $CENTRAL_PROTO_PATH_FROM_SCRIPT:"
 if [ ! -d "$CENTRAL_PROTO_PATH_FROM_SCRIPT" ]; then
-    echo "Ошибка: Директория с общими proto файлами '$CENTRAL_PROTO_PATH_FROM_SCRIPT' не найдена!"
-    # exit 1 # Закомментировано для subtask
+    echo "Error: Directory with common proto files '$CENTRAL_PROTO_PATH_FROM_SCRIPT' not found!"
+    # exit 1 # Commented out for subtask, should be active for standalone execution
 fi
 ls -l "$CENTRAL_PROTO_PATH_FROM_SCRIPT"
 
-# Создаем выходную директорию, если ее нет
+# Create the output directory if it doesn't exist
 mkdir -p "$GENERATED_OUTPUT_DIR"
 
-# Компилируем kem.proto, glm_service.proto (для клиента GLM) и swm_service.proto (для сервера SWM)
-# kps_service.proto пока не нужен для SWM.
+# Compile kem.proto, glm_service.proto (for GLM client) and swm_service.proto (for SWM server)
+# kps_service.proto is not currently needed by SWM.
 $PYTHON_EXE -m grpc_tools.protoc \
     -I"$CENTRAL_PROTO_PATH_FROM_SCRIPT" \
     --python_out="$GENERATED_OUTPUT_DIR" \
@@ -34,9 +34,9 @@ $PYTHON_EXE -m grpc_tools.protoc \
     "$CENTRAL_PROTO_PATH_FROM_SCRIPT/glm_service.proto" \
     "$CENTRAL_PROTO_PATH_FROM_SCRIPT/swm_service.proto"
 
-# Создаем __init__.py в generated_grpc, чтобы сделать его пакетом
+# Create __init__.py in generated_grpc to make it a package
 touch "$GENERATED_OUTPUT_DIR/__init__.py"
 
-echo "Содержимое сгенерированной директории $GENERATED_OUTPUT_DIR:"
+echo "Contents of the generated directory $GENERATED_OUTPUT_DIR:"
 ls -l "$GENERATED_OUTPUT_DIR"
-echo "Генерация кода для SWM сервиса завершена."
+echo "gRPC code generation for SWM service complete."

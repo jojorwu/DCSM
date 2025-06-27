@@ -55,33 +55,36 @@ fi
 
 # --- 3. gRPC Code Generation ---
 echo ""
-echo "--- Generating gRPC code for Python (and Node.js if applicable) ---"
+echo "--- Generating gRPC code for Python services and SDK ---"
 
-# It is assumed that your generate_grpc_code.sh script handles generation for both languages if needed.
-# Ensure `protoc` (Protocol Buffers compiler) is installed and available in PATH.
-# If `generate_grpc_code.sh` doesn't work or needs setup,
-# here are examples of manual generation (commented out):
-#
-# # For Python:
-# python3 -m grpc_tools.protoc -I. --python_out=generated_grpc --grpc_python_out=generated_grpc dcs_memory/common/grpc_protos/*.proto
-#
-# # For Node.js (if `dcs_memory_node` exists and has `grpc-tools` in devDependencies):
-# if [ -d "dcs_memory_node" ]; then
-#     cd dcs_memory_node
-#     ./node_modules/.bin/grpc_tools_node_protoc \
-#         --plugin=protoc-gen-grpc=`which grpc_tools_node_protoc_plugin` \
-#         --js_out=import_style=commonjs,binary:./generated_protos \
-#         --grpc_out=grpc_js:./generated_protos \
-#         -I../dcs_memory/common/grpc_protos \
-#         ../dcs_memory/common/grpc_protos/*.proto
-#     cd ..
+# Define an array of paths to the individual generation scripts
+declare -a grpc_scripts=(
+    "dcs_memory/services/glm/generate_grpc_code.sh"
+    "dcs_memory/services/kps/generate_grpc_code.sh"
+    "dcs_memory/services/swm/generate_grpc_code.sh"
+    "dcsm_agent_sdk_python/generate_grpc_code.sh"
+)
+
+# Loop through the array and execute each script
+for script_path in "${grpc_scripts[@]}"; do
+    if [ -f "$script_path" ]; then
+        echo "Running $script_path ..."
+        # Execute the script from its own directory to ensure relative paths within it work correctly
+        (cd "$(dirname "$script_path")" && bash "$(basename "$script_path")") || {
+            echo "Error running $script_path. Aborting."
+            exit 1
+        }
+    else
+        echo "Warning: Script '$script_path' not found. Skipping."
+    fi
+done
+
+# The root generate_grpc_code.sh (outputs to temp_generated_grpc_code) can be run if needed for other purposes,
+# but is not essential for the services/SDK to function if their local scripts ran successfully.
+# echo "Running root generate_grpc_code.sh (optional, outputs to temp_generated_grpc_code)..."
+# if [ -f "./generate_grpc_code.sh" ]; then
+#     ./generate_grpc_code.sh
 # fi
-
-if [ -f "./generate_grpc_code.sh" ]; then
-    ./generate_grpc_code.sh || { echo "Error generating gRPC code with generate_grpc_code.sh. Ensure 'protoc' is installed and the script works correctly."; exit 1; }
-else
-    echo "Script 'generate_grpc_code.sh' not found. Skipping gRPC code generation."
-fi
 
 echo ""
 echo "--------------------------------------------------------"

@@ -6,10 +6,10 @@ import os
 import uuid
 import logging
 import threading
-import asyncio
+import asyncio # asyncio was imported twice, removing one
 # import queue as sync_queue # Unused
 
-from dataclasses import dataclass # field is unused
+from dataclasses import dataclass, field # field is now imported
 from cachetools import LRUCache, Cache
 from google.protobuf.timestamp_pb2 import Timestamp
 import typing
