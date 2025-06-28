@@ -1,4 +1,5 @@
 import asyncio
+import threading # Import threading for the internal lock
 from cachetools import LRUCache
 import functools # For functools.wraps if creating decorators, or partial
 from typing import TypeVar, Callable, Any, Optional
@@ -10,72 +11,96 @@ class AsyncLRUCache:
     """
     A wrapper around cachetools.LRUCache to make its operations asynchronous
     by running them in a separate thread using asyncio.to_thread.
+    This wrapper also ensures thread-safety for the underlying synchronous
+    LRUCache instance, as cachetools.LRUCache itself is not thread-safe.
     """
     def __init__(self, maxsize: int, getsizeof: Optional[Callable[[Any], Any]] = None):
         # Initialize the synchronous LRUCache
         self._cache = LRUCache(maxsize=maxsize, getsizeof=getsizeof)
+        # Internal lock to ensure thread-safe access to self._cache
+        self._sync_lock = threading.Lock()
 
     async def get(self, key: K, default: Optional[Any] = None) -> Optional[V]:
         """Asynchronously get an item from the cache."""
-        return await asyncio.to_thread(self._cache.get, key, default)
+        def _sync_operation():
+            with self._sync_lock:
+                return self._cache.get(key, default)
+        return await asyncio.to_thread(_sync_operation)
 
     async def set(self, key: K, value: V) -> None:
         """Asynchronously set an item in the cache."""
-        # cachetools.LRUCache.__setitem__ doesn't return a value.
-        await asyncio.to_thread(self._cache.__setitem__, key, value)
+        def _sync_operation():
+            with self._sync_lock:
+                self._cache[key] = value # Use __setitem__
+        await asyncio.to_thread(_sync_operation)
 
     async def pop(self, key: K, default: Optional[Any] = object()) -> Optional[V]:
         """Asynchronously pop an item from the cache.
         If key is not found, default is returned if given, otherwise KeyError is raised.
         Note: object() is a sentinel to distinguish from None as a default.
         """
-        # cachetools.LRUCache.pop can raise KeyError
+        def _sync_operation():
+            with self._sync_lock:
+                if default is object(): # No default provided by user
+                    return self._cache.pop(key)
+                else:
+                    return self._cache.pop(key, default)
+
         try:
-            if default is object(): # No default provided by user
-                return await asyncio.to_thread(self._cache.pop, key)
-            else:
-                return await asyncio.to_thread(self._cache.pop, key, default)
+            return await asyncio.to_thread(_sync_operation)
         except KeyError:
-            # This should only happen if default was the sentinel and key was not found
+             # This should only happen if default was the sentinel and key was not found by _sync_operation
             if default is object():
                 raise
+            # This path should ideally not be reached if pop with default handles it,
+            # but as a safeguard if _sync_operation raises KeyError even with default (which it shouldn't for cachetools.pop)
             return default
 
 
     async def __contains__(self, key: K) -> bool:
         """Asynchronously check if a key is in the cache."""
-        return await asyncio.to_thread(self._cache.__contains__, key)
+        def _sync_operation():
+            with self._sync_lock:
+                return key in self._cache
+        return await asyncio.to_thread(_sync_operation)
 
     async def __len__(self) -> int:
         """Asynchronously get the number of items in the cache."""
-        return await asyncio.to_thread(self._cache.__len__)
+        def _sync_operation():
+            with self._sync_lock:
+                return len(self._cache)
+        return await asyncio.to_thread(_sync_operation)
 
     @property
     async def maxsize(self) -> int:
         """Asynchronously get the maximum size of the cache."""
-        # Accessing property via to_thread if it's not a simple attribute
-        # For cachetools.LRUCache, maxsize is a simple property.
-        # However, to be safe and consistent, or if it involved computation:
-        # return await asyncio.to_thread(lambda: self._cache.maxsize)
-        # For a direct attribute like this, direct access is fine, but methods are safer.
-        # Let's assume it could be more complex and use to_thread for consistency.
-        return await asyncio.to_thread(getattr, self._cache, 'maxsize')
+        def _sync_operation():
+            with self._sync_lock:
+                return self._cache.maxsize
+        return await asyncio.to_thread(_sync_operation)
 
     @property
     async def currsize(self) -> int:
         """Asynchronously get the current size of the cache."""
-        return await asyncio.to_thread(getattr, self._cache, 'currsize')
+        def _sync_operation():
+            with self._sync_lock:
+                return self._cache.currsize
+        return await asyncio.to_thread(_sync_operation)
 
-    # SWM uses `self.swm_cache.values()` in QuerySWM
     async def values(self) -> list[V]:
         """Asynchronously get all values in the cache.
         Note: This can be a potentially expensive operation for large caches.
         It also returns a list copy, so modifications to it won't affect the cache.
         """
-        return await asyncio.to_thread(list, self._cache.values())
+        def _sync_operation():
+            with self._sync_lock:
+                return list(self._cache.values())
+        return await asyncio.to_thread(_sync_operation)
 
     # SWM uses `self.swm_cache.get(kem_id)` which is covered by `get`.
     # SWM uses `self.swm_cache[kem.id] = kem` which is covered by `set`.
+    # Note: direct __setitem__ like `cache[key] = value` won't be async.
+    # Users of AsyncLRUCache must use `await cache.set(key, value)`.
     # SWM uses `kem_id in self.swm_cache` which is covered by `__contains__`.
     # SWM uses `self.swm_cache.pop(kem_id)` which is covered by `pop`.
     # SWM uses `len(self.swm_cache)` which is covered by `__len__`.

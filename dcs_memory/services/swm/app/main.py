@@ -389,53 +389,65 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                 self.subscribers.pop(agent_id, None)
             logger.info(f"Агент {agent_id} удален из списка подписчиков.")
 
-
-    def __del__(self): # __del__ cannot be async
+    async def shutdown(self):
+        """Gracefully shutdown service resources."""
+        logger.info("SWM Service shutting down resources...")
         if self.glm_channel:
-            self.glm_channel.close()
-                fake_kem = kem_pb2.KEM(id=f"heartbeat_kem_{event_count}_{agent_id}", metadata={"subscriber": agent_id})
-                event = swm_service_pb2.SWMMemoryEvent(
-                    event_id=str(uuid.uuid4()),
-                    event_type=swm_service_pb2.SWMMemoryEvent.EventType.KEM_PUBLISHED,
-                    kem_payload=fake_kem, event_time=evt_time, details="Heartbeat/Test Event"
-                )
-                # In grpc.aio, you yield directly to send stream responses.
-                yield event
-                event_count += 1
-                logger.debug(f"Отправлено тестовое событие {event_count} подписчику {agent_id}")
-        except grpc.aio.AioRpcError as e: # Catch AioRpcError for stream issues like client disconnect
-            logger.warning(f"Ошибка gRPC stream для подписчика {agent_id}: {e.code()} - {e.details()}")
-        except Exception as e:
-            logger.error(f"Непредвиденная ошибка в SubscribeToSWMEvents для {agent_id}: {e}", exc_info=True)
-        finally:
-            logger.info(f"SWM: Стрим для подписчика {agent_id} завершен.")
+            logger.info("Closing GLM channel...")
+            # For a synchronous channel, close() is synchronous.
+            # If it were an async channel (e.g., from grpc.aio.secure_channel),
+            # it would be: await self.glm_channel.close(grace=None)
+            # For now, assuming self.glm_channel is a standard sync channel:
+            # Running synchronous close in a thread to prevent blocking shutdown if it hangs.
+            try:
+                await asyncio.to_thread(self.glm_channel.close)
+                logger.info("GLM channel closed.")
+            except Exception as e:
+                logger.error(f"Error closing GLM channel: {e}", exc_info=True)
+        # Add any other async cleanup here if needed in the future.
+        logger.info("SWM Service resources shut down.")
 
 
-    def __del__(self): # __del__ cannot be async
-        if self.glm_channel:
-            self.glm_channel.close()
-            logger.info("Канал GLM клиента в SWM закрыт.")
+    # __del__ can be kept as a fallback, but explicit shutdown is preferred.
+    # def __del__(self):
+    #     if self.glm_channel:
+    #         # This might not always be called, or called in a sensitive context.
+    #         # self.glm_channel.close()
+    #         # logger.info("GLM channel closed via __del__.")
+    #         pass
+
 
 async def serve_async(): # Renamed to serve_async and made async
-    # server = grpc.server(futures.ThreadPoolExecutor(max_workers=10)) # Old synchronous server
-    server = grpc.aio.server() # New asynchronous server from grpc.aio
+    server = grpc.aio.server()
 
+    servicer = SharedWorkingMemoryServiceImpl() # Create instance of servicer
     swm_service_pb2_grpc.add_SharedWorkingMemoryServiceServicer_to_server(
-        SharedWorkingMemoryServiceImpl(), server
+        servicer, server # Pass the instance
     )
     server.add_insecure_port(SWM_GRPC_LISTEN_ADDRESS_CONFIG)
 
     logger.info(f"Запуск SWM (Shared Working Memory Service) асинхронно на {SWM_GRPC_LISTEN_ADDRESS_CONFIG}...")
-    await server.start() # await server.start()
+    await server.start()
     logger.info(f"SWM (асинхронный) запущен и ожидает соединений на {SWM_GRPC_LISTEN_ADDRESS_CONFIG}.")
 
     try:
-        await server.wait_for_termination() # await server.wait_for_termination()
+        await server.wait_for_termination()
     except KeyboardInterrupt:
-        logger.info("Остановка SWM (асинхронного)...")
+        logger.info("Остановка SWM (асинхронного) по KeyboardInterrupt...")
+    except Exception as e:
+        logger.error(f"SWM (асинхронный) ошибка во время работы: {e}", exc_info=True)
     finally:
-        await server.stop(None) # await server.stop(grace_period_seconds)
-        logger.info("SWM (асинхронный) остановлен.")
+        logger.info("SWM (асинхронный) начинает процедуру остановки...")
+        if 'servicer' in locals() and hasattr(servicer, 'shutdown'):
+            await servicer.shutdown() # Call the explicit shutdown method
+
+        # Graceful stop for the server itself
+        # server.stop(grace_period_seconds) returns a threading.Event in sync gRPC
+        # grpc.aio.Server.stop() is a coroutine
+        grace_period = 5.0 # seconds
+        logger.info(f"Остановка gRPC сервера с grace периодом {grace_period}s...")
+        await server.stop(grace_period)
+        logger.info("SWM (асинхронный) gRPC сервер остановлен.")
 
 if __name__ == '__main__':
     # asyncio.run(serve()) # Run the async function
