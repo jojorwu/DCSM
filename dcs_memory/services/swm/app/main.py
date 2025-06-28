@@ -1,4 +1,3 @@
-import grpc
 import grpc.aio as grpc_aio
 import asyncio
 import time
@@ -8,13 +7,11 @@ import uuid
 import logging
 import threading
 import asyncio # asyncio was imported twice, removing one
-import random # For jitter in retry logic
 # import queue as sync_queue # Unused
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field # field is now imported
 from cachetools import LRUCache, Cache
 from google.protobuf.timestamp_pb2 import Timestamp
-from readerwriterlock import rwlock # Предполагаем наличие этой библиотеки
 import typing
 from typing import Optional, List, Set, Dict, Callable, AsyncGenerator, Tuple
 
@@ -60,19 +57,13 @@ class IndexedLRUCache(Cache):
         self._lru = LRUCache(maxsize=maxsize)
         self._indexed_keys = set(indexed_keys)
         self._metadata_indexes: typing.Dict[str, typing.Dict[str, typing.Set[str]]] = {key: {} for key in self._indexed_keys}
-        self._rw_lock = rwlock.RWLockFair() # Using RWLockFair for fairness between readers and writers
+        self._lock = threading.Lock()
         self._on_evict_callback = on_evict_callback
-
     def _add_to_metadata_indexes(self, kem: kem_pb2.KEM):
-        # This method is internal and should be called under a write lock
         if not kem or not kem.id: return
         for meta_key in self._indexed_keys:
-            if meta_key in kem.metadata:
-                value = kem.metadata[meta_key]
-                self._metadata_indexes.setdefault(meta_key, {}).setdefault(value, set()).add(kem.id)
-
+            if meta_key in kem.metadata: value = kem.metadata[meta_key]; self._metadata_indexes.setdefault(meta_key, {}).setdefault(value, set()).add(kem.id)
     def _remove_from_metadata_indexes(self, kem: kem_pb2.KEM):
-        # This method is internal and should be called under a write lock
         if not kem or not kem.id: return
         for meta_key in self._indexed_keys:
             if meta_key in kem.metadata:
@@ -81,88 +72,42 @@ class IndexedLRUCache(Cache):
                     self._metadata_indexes[meta_key][original_value].discard(kem.id)
                     if not self._metadata_indexes[meta_key][original_value]: del self._metadata_indexes[meta_key][original_value]
                     if not self._metadata_indexes[meta_key]: del self._metadata_indexes[meta_key]
-
     def __setitem__(self, kem_id: str, kem: kem_pb2.KEM):
-        with self._rw_lock.gen_wlock(): # Acquire write lock
+        with self._lock:
             evicted_kem = None
-            if kem_id in self._lru:
-                old_kem = self._lru[kem_id] # Get old KEM before it's replaced in LRU
-                self._remove_from_metadata_indexes(old_kem)
+            if kem_id in self._lru: old_kem = self._lru[kem_id]; self._remove_from_metadata_indexes(old_kem)
             elif len(self._lru) >= self._lru.maxsize:
-                _evicted_id, evicted_kem = self._lru.popitem() # LRU eviction
+                _evicted_id, evicted_kem = self._lru.popitem()
                 if evicted_kem:
                     self._remove_from_metadata_indexes(evicted_kem)
                     if self._on_evict_callback:
-                        try:
-                            # Callback might do I/O or take time, consider if it should be outside the lock
-                            # or made async and scheduled if this becomes a bottleneck.
-                            # For now, keeping it simple as it was with threading.Lock.
-                            self._on_evict_callback(evicted_kem)
-                        except Exception as e_cb:
-                            logger.error(f"Error in on_evict_callback for KEM ID '{_evicted_id}': {e_cb}", exc_info=True)
-
-            self._lru[kem_id] = kem # Actual update in LRU cache
-            self._add_to_metadata_indexes(kem)
-
+                        try: self._on_evict_callback(evicted_kem)
+                        except Exception as e_cb: logger.error(f"Error in on_evict_callback for KEM ID '{_evicted_id}': {e_cb}", exc_info=True)
+            self._lru[kem_id] = kem; self._add_to_metadata_indexes(kem)
     def __getitem__(self, kem_id: str) -> kem_pb2.KEM:
-        with self._rw_lock.gen_rlock(): # Acquire read lock
-            return self._lru[kem_id]
-
+        with self._lock: return self._lru[kem_id]
     def __delitem__(self, kem_id: str):
-        with self._rw_lock.gen_wlock(): # Acquire write lock
-            if kem_id in self._lru:
-                kem_to_remove = self._lru.pop(kem_id)
-                self._remove_from_metadata_indexes(kem_to_remove)
-            else:
-                raise KeyError(kem_id)
-
+        with self._lock:
+            if kem_id in self._lru: kem_to_remove = self._lru.pop(kem_id); self._remove_from_metadata_indexes(kem_to_remove)
+            else: raise KeyError(kem_id)
     def get(self, kem_id: str, default=None) -> typing.Optional[kem_pb2.KEM]:
-        with self._rw_lock.gen_rlock(): # Acquire read lock
-            return self._lru.get(kem_id, default)
-
+        with self._lock: return self._lru.get(kem_id, default)
     def pop(self, kem_id: str, default=object()) -> kem_pb2.KEM:
-        with self._rw_lock.gen_wlock(): # Acquire write lock
-            if kem_id in self._lru:
-                kem = self._lru.pop(kem_id)
-                self._remove_from_metadata_indexes(kem)
-                return kem
-            elif default is not object():
-                return default # type: ignore
-            else:
-                raise KeyError(kem_id)
-
-    def __len__(self) -> int:
-        with self._rw_lock.gen_rlock(): # Acquire read lock
-            return len(self._lru)
-
-    def __contains__(self, kem_id: str) -> bool:
-        with self._rw_lock.gen_rlock(): # Acquire read lock
-            return kem_id in self._lru
-
-    def values(self) -> List[kem_pb2.KEM]:
-        with self._rw_lock.gen_rlock(): # Acquire read lock
-            return list(self._lru.values())
-
-    def items(self) -> List[Tuple[str, kem_pb2.KEM]]:
-        with self._rw_lock.gen_rlock(): # Acquire read lock
-            return list(self._lru.items())
-
+        with self._lock:
+            if kem_id in self._lru: kem = self._lru.pop(kem_id); self._remove_from_metadata_indexes(kem); return kem
+            elif default is not object(): return default # type: ignore
+            else: raise KeyError(kem_id)
+    def __len__(self) -> int: with self._lock: return len(self._lru)
+    def __contains__(self, kem_id: str) -> bool: with self._lock: return kem_id in self._lru
+    def values(self) -> List[kem_pb2.KEM]: with self._lock: return list(self._lru.values())
+    def items(self) -> List[Tuple[str, kem_pb2.KEM]]: with self._lock: return list(self._lru.items())
     def clear(self):
-        with self._rw_lock.gen_wlock(): # Acquire write lock
-            self._lru.clear()
-            self._metadata_indexes.clear()
-            self._metadata_indexes = {key: {} for key in self._indexed_keys}
-
+        with self._lock: self._lru.clear(); self._metadata_indexes.clear(); self._metadata_indexes = {key: {} for key in self._indexed_keys}
     @property
-    def maxsize(self):
-        # maxsize is immutable for cachetools.LRUCache, so no lock needed for reading this property
-        return self._lru.maxsize
-
+    def maxsize(self): return self._lru.maxsize
     def get_ids_by_metadata_filter(self, meta_key: str, meta_value: str) -> typing.Set[str]:
-        if meta_key not in self._indexed_keys:
-            return set()
-        with self._rw_lock.gen_rlock(): # Acquire read lock
-            return self._metadata_indexes.get(meta_key, {}).get(meta_value, set()).copy()
+        if meta_key not in self._indexed_keys: return set()
+        with self._lock: return self._metadata_indexes.get(meta_key, {}).get(meta_value, set()).copy()
 
 @dataclass
 class LockInfoInternal:
@@ -175,17 +120,12 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         logger.setLevel(self.config.get_log_level_int()) # Set logger level from this instance's config
 
         logger.info(f"Initializing SharedWorkingMemoryServiceImpl... Cache size: {self.config.CACHE_MAX_SIZE}, Indexed keys: {self.config.INDEXED_METADATA_KEYS}")
+        # self.glm_channel: Optional[grpc_aio.Channel] = None # This async channel was unused
+        self.glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None # This is for the sync stub
 
-        self.aio_glm_channel: Optional[grpc_aio.Channel] = None
-        self.aio_glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None
-
-        # Retry parameters will be taken from self.config directly in the methods
-        self.retryable_error_codes = (
-            grpc.StatusCode.UNAVAILABLE,
-            grpc.StatusCode.DEADLINE_EXCEEDED,
-            grpc.StatusCode.INTERNAL,
-            grpc.StatusCode.RESOURCE_EXHAUSTED
-        )
+        self.retry_max_attempts = self.config.GLM_RETRY_MAX_ATTEMPTS
+        self.retry_initial_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
+        self.retry_backoff_factor = self.config.GLM_RETRY_BACKOFF_FACTOR
 
         self.subscribers_lock = asyncio.Lock()
         self.swm_cache = IndexedLRUCache(
@@ -195,14 +135,8 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         )
         self.locks: Dict[str, LockInfoInternal] = {}; self.lock_condition = asyncio.Condition()
         self.counters: Dict[str, int] = {}; self.counters_lock = asyncio.Lock()
-        self._stop_event = asyncio.Event()
-        self._lock_cleanup_task: Optional[asyncio.Task] = None
-        self._glm_persistence_worker_task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event(); self._lock_cleanup_task: Optional[asyncio.Task] = None
         self._lock_cleanup_interval_seconds = self.config.LOCK_CLEANUP_INTERVAL_S
-
-        self.glm_persistence_queue: asyncio.Queue[kem_pb2.KEM] = asyncio.Queue(
-            maxsize=self.config.GLM_PERSISTENCE_QUEUE_MAX_SIZE
-        )
 
         self.subscribers: Dict[str, SubscriberInfo] = {}
         self.kem_id_to_subscribers: Dict[str, Set[str]] = {}
@@ -210,69 +144,25 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         self.general_kem_event_subscribers: Set[str] = set()
 
         try:
-            # Initialize asynchronous GLM client
-            self.aio_glm_channel = grpc_aio.insecure_channel(self.config.GLM_SERVICE_ADDRESS)
-            self.aio_glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.aio_glm_channel)
-            logger.info(f"GLM client (async) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}")
+            self.sync_glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS) # Use self.config
+            self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.sync_glm_channel)
+            logger.info(f"GLM client (sync) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}")
         except Exception as e:
-            logger.error(f"Error initializing asynchronous GLM client in SWM: {e}", exc_info=True)
-            self.aio_glm_stub = None
-            if self.aio_glm_channel:
-                try:
-                    # This is problematic in a non-async __init__.
-                    # The channel should ideally be closed in an async cleanup method.
-                    # For now, just log and it will be handled in stop_background_tasks.
-                    logger.warning("SWM: GLM async channel was created but stub initialization failed. Channel will be closed on shutdown.")
-                except Exception as close_e:
-                    logger.error(f"SWM: Exception while trying to handle GLM channel close during __init__ failure: {close_e}", exc_info=True)
+            logger.error(f"Error initializing synchronous GLM client in SWM: {e}")
+            self.glm_stub = None
 
     async def start_background_tasks(self):
         if self._lock_cleanup_task is None or self._lock_cleanup_task.done():
-            self._stop_event.clear() # Clear stop event for all tasks
-            self._lock_cleanup_task = asyncio.create_task(self._expired_lock_cleanup_task_async())
+            self._stop_event.clear(); self._lock_cleanup_task = asyncio.create_task(self._expired_lock_cleanup_task_async())
             logger.info("SWM: Expired lock cleanup task started.")
 
-        if self._glm_persistence_worker_task is None or self._glm_persistence_worker_task.done():
-            # self._stop_event should already be cleared or clear it again if tasks are managed independently for stop
-            self._glm_persistence_worker_task = asyncio.create_task(self._glm_persistence_worker())
-            logger.info("SWM: GLM persistence worker task started.")
-
     async def stop_background_tasks(self):
-        logger.info("SWM: Stopping background tasks...")
-        self._stop_event.set() # Signal all tasks to stop
-
         if self._lock_cleanup_task and not self._lock_cleanup_task.done():
-            logger.info("SWM: Waiting for expired lock cleanup task to stop...")
-            try: await asyncio.wait_for(self._lock_cleanup_task, timeout=self._lock_cleanup_interval_seconds + 2) # type: ignore
-            except asyncio.TimeoutError: logger.warning("SWM: Expired lock cleanup task did not finish in time during shutdown.")
-            except asyncio.CancelledError: logger.info("SWM: Expired lock cleanup task cancelled during shutdown.")
+            logger.info("SWM: Stopping expired lock cleanup task..."); self._stop_event.set()
+            try: await asyncio.wait_for(self._lock_cleanup_task, timeout=self._lock_cleanup_interval_seconds + 1) # type: ignore
+            except asyncio.TimeoutError: logger.warning("SWM: Expired lock cleanup task did not finish in time.")
+            except asyncio.CancelledError: logger.info("SWM: Expired lock cleanup task was cancelled.")
         self._lock_cleanup_task = None
-
-        if self._glm_persistence_worker_task and not self._glm_persistence_worker_task.done():
-            logger.info("SWM: Waiting for GLM persistence worker task to stop...")
-            try:
-                # Attempt to process remaining items in the queue before fully stopping
-                # This is a simple way; a more robust way might involve a special sentinel or flushing.
-                await asyncio.wait_for(self._glm_persistence_worker_task, timeout=self.config.GLM_PERSISTENCE_FLUSH_INTERVAL_S + 5)
-            except asyncio.TimeoutError:
-                logger.warning("SWM: GLM persistence worker task did not finish processing queue in time during shutdown.")
-                self._glm_persistence_worker_task.cancel() # Force cancel if timeout
-                try:
-                    await self._glm_persistence_worker_task
-                except asyncio.CancelledError:
-                    logger.info("SWM: GLM persistence worker task was cancelled during shutdown after timeout.")
-            except asyncio.CancelledError: # If it was cancelled by stop_event already
-                 logger.info("SWM: GLM persistence worker task was cancelled by stop_event.")
-        self._glm_persistence_worker_task = None
-
-        if self.aio_glm_channel:
-            logger.info("SWM: Closing GLM client (async) channel.")
-            try:
-                await self.aio_glm_channel.close()
-            except Exception as e:
-                logger.error(f"SWM: Error closing GLM async channel: {e}", exc_info=True)
-            self.aio_glm_channel = None
-            self.aio_glm_stub = None
 
     async def _expired_lock_cleanup_task_async(self):
         logger.info("SWM: Async expired lock cleanup task started.")
@@ -296,196 +186,77 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         logger.info("SWM: Async expired lock cleanup task stopped.")
 
     async def _glm_retrieve_kems_async(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int = 20) -> glm_service_pb2.RetrieveKEMsResponse:
-        if not self.aio_glm_stub:
-            logger.error("SWM: GLM async client not available for RetrieveKEMs.")
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM client not available")
+        if not self.glm_stub:
+            logger.error("SWM._glm_retrieve_kems_async: GLM stub not initialized.")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available.") # type: ignore
 
         current_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
         for attempt in range(1, self.config.GLM_RETRY_MAX_ATTEMPTS + 1):
             try:
-                logger.debug(f"Attempt {attempt} to call GLM RetrieveKEMs (async).")
-                return await self.aio_glm_stub.RetrieveKEMs(request, timeout=timeout)
-            except grpc_aio.AioRpcError as e:
-                if e.code() in self.retryable_error_codes:
+                return await asyncio.to_thread(self.glm_stub.RetrieveKEMs, request, timeout=timeout)
+            except grpc.RpcError as e:
+                rpc_code = e.code()
+                if rpc_code in retry_grpc_call.RETRYABLE_ERROR_CODES: # Accessing RETRYABLE_ERROR_CODES from imported decorator module
                     if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS:
-                        logger.error(f"GLM call RetrieveKEMs failed after {self.config.GLM_RETRY_MAX_ATTEMPTS} attempts. Last error: {e.code()} - {e.details()}", exc_info=False)
-                        raise
+                        logger.error(f"SWM: GLM RetrieveKEMs failed after {attempt} attempts. Last error: {e.details()}")
+                        raise # Re-raise the last RpcError
 
-                    jitter_fraction = 0.1
-                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                    actual_delay_s = max(0, current_delay_s + jitter_value)
+                    jitter_value = random.uniform(-self.config.RETRY_JITTER_FRACTION, self.config.RETRY_JITTER_FRACTION) * current_delay_s
+                    actual_delay_s = max(0.1, current_delay_s + jitter_value) # Ensure some minimal delay
 
-                    logger.warning(f"GLM call RetrieveKEMs failed (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}) with status {e.code()}. Retrying in {actual_delay_s:.2f}s. Details: {e.details()}", exc_info=False)
+                    logger.warning(f"SWM: GLM RetrieveKEMs failed (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}) with {rpc_code}. Retrying in {actual_delay_s:.2f}s.")
                     await asyncio.sleep(actual_delay_s)
                     current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
                 else:
-                    logger.error(f"GLM call RetrieveKEMs failed with non-retryable status {e.code()}. Details: {e.details()}", exc_info=True)
-                    raise
-            except Exception as e_generic:
-                logger.error(f"A non-gRPC error occurred during GLM call RetrieveKEMs (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}): {e_generic}", exc_info=True)
-                if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS: raise
-                jitter_fraction = 0.1
-                jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                actual_delay_s = max(0, current_delay_s + jitter_value)
-                logger.info(f"Retrying GLM RetrieveKEMs after non-gRPC error in {actual_delay_s:.2f}s.")
+                    logger.error(f"SWM: GLM RetrieveKEMs failed with non-retryable status {rpc_code}: {e.details()}")
+                    raise # Re-raise non-retryable RpcError
+            except Exception as e_generic: # Catch other potential exceptions during the threaded call
+                logger.error(f"SWM: Non-gRPC error during GLM RetrieveKEMs (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}): {e_generic}", exc_info=True)
+                if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS:
+                    raise # Re-raise if this is the last attempt
+                # Apply similar delay logic before retrying for non-gRPC errors
+                jitter_value = random.uniform(-self.config.RETRY_JITTER_FRACTION, self.config.RETRY_JITTER_FRACTION) * current_delay_s
+                actual_delay_s = max(0.1, current_delay_s + jitter_value)
                 await asyncio.sleep(actual_delay_s)
                 current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
-        logger.error("GLM RetrieveKEMs exhausted attempts unexpectedly without raising an error.")
-        raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM RetrieveKEMs exhausted attempts unexpectedly.")
+        # Should not be reached if max_attempts >=1
+        raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM RetrieveKEMs exhausted retries unexpectedly.") # type: ignore
 
 
     async def _glm_store_kem_async(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
-        if not self.aio_glm_stub:
-            logger.error("SWM: GLM async client not available for StoreKEM.")
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM client not available")
+        if not self.glm_stub:
+            logger.error("SWM._glm_store_kem_async: GLM stub not initialized.")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available.") # type: ignore
 
         current_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
         for attempt in range(1, self.config.GLM_RETRY_MAX_ATTEMPTS + 1):
             try:
-                logger.debug(f"Attempt {attempt} to call GLM StoreKEM (async).")
-                return await self.aio_glm_stub.StoreKEM(request, timeout=timeout)
-            except grpc_aio.AioRpcError as e:
-                if e.code() in self.retryable_error_codes:
+                return await asyncio.to_thread(self.glm_stub.StoreKEM, request, timeout=timeout)
+            except grpc.RpcError as e:
+                rpc_code = e.code()
+                if rpc_code in retry_grpc_call.RETRYABLE_ERROR_CODES:
                     if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS:
-                        logger.error(f"GLM call StoreKEM failed after {self.config.GLM_RETRY_MAX_ATTEMPTS} attempts. Last error: {e.code()} - {e.details()}", exc_info=False)
+                        logger.error(f"SWM: GLM StoreKEM failed after {attempt} attempts. Last error: {e.details()}")
                         raise
 
-                    jitter_fraction = 0.1
-                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                    actual_delay_s = max(0, current_delay_s + jitter_value)
+                    jitter_value = random.uniform(-self.config.RETRY_JITTER_FRACTION, self.config.RETRY_JITTER_FRACTION) * current_delay_s
+                    actual_delay_s = max(0.1, current_delay_s + jitter_value)
 
-                    logger.warning(f"GLM call StoreKEM failed (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}) with status {e.code()}. Retrying in {actual_delay_s:.2f}s. Details: {e.details()}", exc_info=False)
+                    logger.warning(f"SWM: GLM StoreKEM failed (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}) with {rpc_code}. Retrying in {actual_delay_s:.2f}s.")
                     await asyncio.sleep(actual_delay_s)
                     current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
                 else:
-                    logger.error(f"GLM call StoreKEM failed with non-retryable status {e.code()}. Details: {e.details()}", exc_info=True)
+                    logger.error(f"SWM: GLM StoreKEM failed with non-retryable status {rpc_code}: {e.details()}")
                     raise
             except Exception as e_generic:
-                logger.error(f"A non-gRPC error occurred during GLM call StoreKEM (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}): {e_generic}", exc_info=True)
-                if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS: raise
-                jitter_fraction = 0.1
-                jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                actual_delay_s = max(0, current_delay_s + jitter_value)
-                logger.info(f"Retrying GLM StoreKEM after non-gRPC error in {actual_delay_s:.2f}s.")
+                logger.error(f"SWM: Non-gRPC error during GLM StoreKEM (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}): {e_generic}", exc_info=True)
+                if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS:
+                    raise
+                jitter_value = random.uniform(-self.config.RETRY_JITTER_FRACTION, self.config.RETRY_JITTER_FRACTION) * current_delay_s
+                actual_delay_s = max(0.1, current_delay_s + jitter_value)
                 await asyncio.sleep(actual_delay_s)
                 current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
-        logger.error("GLM StoreKEM exhausted attempts unexpectedly without raising an error.")
-        raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM StoreKEM exhausted attempts unexpectedly.")
-
-    async def _glm_batch_store_kems_async(self, kems_batch: List[kem_pb2.KEM], timeout: int = 30) -> Optional[glm_service_pb2.BatchStoreKEMsResponse]:
-        if not self.aio_glm_stub:
-            logger.error("SWM: GLM async client not available for BatchStoreKEMs.")
-            # Do not raise here, allow worker to handle this potentially by requeueing or logging failure
-            return None
-        if not kems_batch:
-            return None
-
-        request = glm_service_pb2.BatchStoreKEMsRequest(kems=kems_batch)
-
-        # Using a simplified retry logic for batch, as partial success/failure is complex with retries
-        # For a more robust solution, individual KEM failures from BatchStoreKEMsResponse
-        # might need to be re-queued or handled specifically.
-        try:
-            logger.info(f"SWM: Calling GLM BatchStoreKEMs with {len(kems_batch)} KEMs.")
-            response = await self.aio_glm_stub.BatchStoreKEMs(request, timeout=timeout)
-            if response.failed_kem_references:
-                logger.warning(f"SWM: GLM BatchStoreKEMs reported {len(response.failed_kem_references)} failures. Refs: {response.failed_kem_references}")
-            logger.info(f"SWM: GLM BatchStoreKEMs processed. Success: {len(response.successfully_stored_kems)}, Failures: {len(response.failed_kem_references)}")
-            return response
-        except grpc_aio.AioRpcError as e:
-            logger.error(f"SWM: gRPC error during GLM BatchStoreKEMs: {e.code()} - {e.details()}", exc_info=True)
-            # TODO: Consider re-queueing the entire batch or individual KEMs upon certain retryable errors.
-            # For now, the batch is considered failed on gRPC error.
-        except Exception as e_generic:
-            logger.error(f"SWM: Non-gRPC error during GLM BatchStoreKEMs: {e_generic}", exc_info=True)
-        return None # Indicate failure or no response
-
-    async def _glm_persistence_worker(self):
-        logger.info("SWM: GLM Persistence Worker started.")
-        while not self._stop_event.is_set():
-            batch_to_persist: List[kem_pb2.KEM] = []
-            try:
-                # Wait for the first item or timeout
-                first_kem = await asyncio.wait_for(
-                    self.glm_persistence_queue.get(),
-                    timeout=self.config.GLM_PERSISTENCE_FLUSH_INTERVAL_S
-                )
-                batch_to_persist.append(first_kem)
-                self.glm_persistence_queue.task_done()
-
-                # Try to fill the rest of the batch without waiting too long
-                while len(batch_to_persist) < self.config.GLM_PERSISTENCE_BATCH_SIZE:
-                    try:
-                        kem = self.glm_persistence_queue.get_nowait()
-                        batch_to_persist.append(kem)
-                        self.glm_persistence_queue.task_done()
-                    except asyncio.QueueEmpty:
-                        break # Queue is empty, flush what we have
-
-            except asyncio.TimeoutError:
-                # Flush interval reached, but queue might have been empty.
-                # No items in batch_to_persist yet if timeout occurred on first_kem.
-                pass # Continue to see if batch_to_persist has items from previous non-blocking gets (unlikely here)
-            except asyncio.CancelledError:
-                logger.info("SWM: GLM Persistence Worker cancelled during queue get.")
-                break # Exit if worker is cancelled
-            except Exception as e_q_get:
-                logger.error(f"SWM: GLM Persistence Worker error getting from queue: {e_q_get}", exc_info=True)
-                await asyncio.sleep(1) # Brief pause before retrying queue operations
-                continue
-
-
-            if batch_to_persist:
-                logger.info(f"SWM: GLM Persistence Worker processing batch of {len(batch_to_persist)} KEMs.")
-                # In a real scenario, you might want to handle the response,
-                # especially failed_kem_references, potentially re-queueing them.
-                # For this initial implementation, we'll just log.
-                # Also, consider what to do if aio_glm_stub is None (GLM connection failed at startup)
-                if self.aio_glm_stub:
-                    glm_response = await self._glm_batch_store_kems_async(batch_to_persist)
-                    if glm_response:
-                        # TODO: Handle successfully_stored_kems if SWM cache needs update from GLM's final version (e.g. server-gen IDs)
-                        # This would require matching response KEMs to originals, which is complex.
-                        # For now, assume SWM's version is what we intended to persist.
-                        pass
-                    else: # _glm_batch_store_kems_async itself logged the error
-                        logger.error(f"SWM: GLM Persistence Worker: Batch of {len(batch_to_persist)} KEMs failed to persist or no response from GLM.")
-                        # Basic re-queue of the whole batch for simplicity. A more robust system
-                        # might have a dead-letter queue or individual KEM retry logic.
-                        # This could lead to infinite retries if GLM is permanently down.
-                        logger.warning(f"SWM: GLM Persistence Worker: Re-queueing {len(batch_to_persist)} KEMs due to GLM processing failure.")
-                        for kem_to_requeue in reversed(batch_to_persist): # Add to front if possible, or just re-add
-                             if not self.glm_persistence_queue.full():
-                                 await self.glm_persistence_queue.put(kem_to_requeue)
-                             else:
-                                 logger.error(f"SWM: GLM Persistence Worker: Failed to re-queue KEM ID '{kem_to_requeue.id}', persistence queue full.")
-                                 break # Stop trying to re-queue this batch
-                else:
-                    logger.error("SWM: GLM Persistence Worker: GLM stub not available. Batch not persisted.")
-                    # Re-queue logic similar to above could be applied here too.
-
-            if self._stop_event.is_set() and self.glm_persistence_queue.empty():
-                 logger.info("SWM: GLM Persistence Worker stopping as stop event is set and queue is empty.")
-                 break
-
-        # Final attempt to clear the queue on shutdown if not empty
-        if not self.glm_persistence_queue.empty():
-            logger.info(f"SWM: GLM Persistence Worker - processing remaining {self.glm_persistence_queue.qsize()} items on shutdown...")
-            final_batch: List[kem_pb2.KEM] = []
-            while not self.glm_persistence_queue.empty():
-                try:
-                    final_batch.append(self.glm_persistence_queue.get_nowait())
-                    self.glm_persistence_queue.task_done()
-                except asyncio.QueueEmpty:
-                    break
-            if final_batch and self.aio_glm_stub:
-                logger.info(f"SWM: GLM Persistence Worker - sending final batch of {len(final_batch)} KEMs to GLM.")
-                await self._glm_batch_store_kems_async(final_batch)
-            elif final_batch:
-                 logger.error(f"SWM: GLM Persistence Worker - GLM stub not available for final batch of {len(final_batch)} KEMs. Data may be lost.")
-
-
-        logger.info("SWM: GLM Persistence Worker stopped.")
+        raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM StoreKEM exhausted retries unexpectedly.") # type: ignore
 
 
     def _handle_kem_eviction_sync(self, evicted_kem: kem_pb2.KEM):
@@ -513,29 +284,12 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                         targeted_sub_ids.update(self.metadata_exact_match_to_subscribers[mk][mv])
             sub_infos_to_notify = [self.subscribers[sid] for sid in targeted_sub_ids if sid in self.subscribers]
         if not sub_infos_to_notify: logger.debug(f"No subs for KEM '{kem.id}'."); return
-
-        # Need to find subscriber_id to log it.
-        # Create a reverse mapping from queue object to subscriber_id for logging purposes,
-        # or iterate self.subscribers if performance is not critical here.
-        # For simplicity now, will iterate if needed, but ideally, sub_id should be available.
-        # The sub_info objects are SubscriberInfo, they don't store the sub_id key directly.
-        # Let's find sub_id by searching self.subscribers by sub_info object instance or queue.
-
-        logger.debug(f"Dispatching event for KEM '{kem.id}' (event_id: {evt_to_dispatch.event_id}) to {len(sub_infos_to_notify)} subscribers.")
+        logger.debug(f"Dispatching event for KEM '{kem.id}' to {len(sub_infos_to_notify)} subs.")
         for sub_info in sub_infos_to_notify:
-            subscriber_id_for_log = "unknown_subscriber" # Default if not found
-            # This is inefficient, consider adding sub_id to SubscriberInfo if this logging is frequent & critical path
-            for sid, s_info_iter in self.subscribers.items():
-                if s_info_iter is sub_info:
-                    subscriber_id_for_log = sid
-                    break
             try:
-                if sub_info.event_queue.full():
-                    logger.warning(f"Subscriber queue full for subscriber_id='{subscriber_id_for_log}', event_id='{evt_to_dispatch.event_id}' (KEM_ID='{kem.id}') lost. Queue size: {sub_info.event_queue.qsize()}/{sub_info.event_queue.maxsize}")
-                else:
-                    await sub_info.event_queue.put(evt_to_dispatch)
-            except Exception as e:
-                logger.error(f"Error queueing event for subscriber_id='{subscriber_id_for_log}', event_id='{evt_to_dispatch.event_id}': {e}", exc_info=True)
+                if sub_info.event_queue.full(): logger.warning(f"Sub queue full for evt {evt_to_dispatch.event_id}. Lost.")
+                else: await sub_info.event_queue.put(evt_to_dispatch)
+            except Exception as e: logger.error(f"Err queueing evt for sub: {e}", exc_info=True)
 
     async def PublishKEMToSWM(self, request: swm_service_pb2.PublishKEMToSWMRequest, context) -> swm_service_pb2.PublishKEMToSWMResponse:
         kem_to_publish = request.kem_to_publish; logger.info(f"SWM: PublishKEMToSWM for KEM ID (suggested): '{kem_to_publish.id}'")
@@ -553,41 +307,19 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         # Always update/set updated_at
         kem_to_publish.updated_at.CopyFrom(ts)
         await self._put_kem_to_cache_async(kem_to_publish) # This notifies subscribers too
-
-        published_to_swm_flag=True
-        persistence_status_message = "Persistence to GLM not requested."
-        # The persistence_triggered_flag might be better named, as it's now async.
-        # It now means "queued for persistence" rather than "attempted direct persistence".
-        queued_for_glm_persistence = False
-
+        published_to_swm_flag=True; persistence_triggered_flag=False; status_msg=f"KEM ID '{kem_id_final}' published to SWM."
         if request.persist_to_glm_if_new_or_updated:
-            if not self.aio_glm_stub: # Check async stub
-                persistence_status_message = f"GLM client not available. KEM ID '{kem_id_final}' not queued for persistence."
-                logger.error(persistence_status_message)
+            if not self.glm_stub: msg_glm=f"GLM unavailable, KEM '{kem_id_final}' not persisted.";logger.error(msg_glm);status_msg+=" "+msg_glm
             else:
                 try:
-                    if self.glm_persistence_queue.full():
-                        persistence_status_message = f"GLM persistence queue is full. KEM ID '{kem_id_final}' not queued."
-                        logger.error(persistence_status_message)
-                    else:
-                        await self.glm_persistence_queue.put(kem_to_publish)
-                        queued_for_glm_persistence = True
-                        persistence_status_message = f"KEM ID '{kem_id_final}' queued for persistence to GLM."
-                        logger.info(persistence_status_message)
-                except Exception as e_queue:
-                    persistence_status_message = f"Error queueing KEM ID '{kem_id_final}' for GLM persistence: {e_queue}"
-                    logger.error(persistence_status_message, exc_info=True)
-
-        status_msg=f"KEM ID '{kem_id_final}' published to SWM. {persistence_status_message}"
-        # Note: kem_id_final might change if GLM generates a new ID and SWM updates its cache from GLM response.
-        # This asynchronous persistence makes it harder to return the *final* GLM ID here.
-        # The current response returns the ID known to SWM at the time of publishing to SWM.
-        return swm_service_pb2.PublishKEMToSWMResponse(
-            kem_id_swm=kem_id_final, # Renamed field to clarify it's the ID known to SWM
-            published_to_swm=published_to_swm_flag,
-            queued_for_glm_persistence=queued_for_glm_persistence, # Renamed field
-            status_message=status_msg
-        )
+                    logger.info(f"SWM: Persisting KEM '{kem_id_final}' to GLM...");glm_req=glm_service_pb2.StoreKEMRequest(kem=kem_to_publish)
+                    glm_resp=await self._glm_store_kem_async(glm_req,timeout=10)
+                    if glm_resp and glm_resp.kem and glm_resp.kem.id:
+                        await self._put_kem_to_cache_async(glm_resp.kem); kem_id_final=glm_resp.kem.id
+                        status_msg+=f" Persisted in GLM, ID '{kem_id_final}'."; persistence_triggered_flag=True
+                    else: msg_err=f"GLM.StoreKEM no/bad resp for KEM '{kem_id_final}'.";logger.error(msg_err);status_msg+=" "+msg_err
+                except Exception as e: msg_rpc_err=f"Err persisting KEM '{kem_id_final}' to GLM: {e}";logger.error(msg_rpc_err,exc_info=True);status_msg+=" "+msg_rpc_err
+        return swm_service_pb2.PublishKEMToSWMResponse(kem_id_final,published_to_swm_flag,persistence_triggered_flag,status_msg)
 
     def _remove_subscriber_from_indexes(self, subscriber_id: str, original_topics: List[swm_service_pb2.SubscriptionTopic]):
         # This method must be called under self.subscribers_lock
@@ -617,9 +349,10 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         # Determine queue size using values from SWMConfig
         requested_q_size = request.requested_queue_size
         if requested_q_size <= 0:
-            actual_q_size = self.config.SUBSCRIBER_DEFAULT_QUEUE_SIZE
+            actual_q_size = self.config.SWM_SUBSCRIBER_DEFAULT_QUEUE_SIZE
         else:
-            actual_q_size = max(self.config.SUBSCRIBER_MIN_QUEUE_SIZE, min(requested_q_size, self.config.SUBSCRIBER_MAX_QUEUE_SIZE))
+            actual_q_size = max(self.config.SWM_SUBSCRIBER_MIN_QUEUE_SIZE,
+                                min(requested_q_size, self.config.SWM_SUBSCRIBER_MAX_QUEUE_SIZE))
 
         logger.info(f"SWM: New subscriber '{sub_id}' (agent_id: '{ag_id}'). Requested Q size: {requested_q_size}, Actual Q size: {actual_q_size}. Topics: {request.topics}")
         q = asyncio.Queue(maxsize=actual_q_size)
@@ -651,38 +384,21 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                         if amk:k_idx=self.metadata_exact_match_to_subscribers.setdefault(amk,{});[k_idx.setdefault(mvf,set()).add(sub_id) for mvf in mvs]
             logger.info(f"SWM: Sub '{sub_id}' reg/upd.Total:{len(self.subscribers)}.Gen KEM:{len(self.general_kem_event_subscribers)}")
         active=True
-        idle_timeouts_count = 0
         try:
             while active:
                 try:
-                    evt=await asyncio.wait_for(q.get(),timeout=self.config.SUBSCRIBER_IDLE_CHECK_INTERVAL_S)
-                    if not context.is_active(): # type: ignore
-                        logger.info(f"SWM stream for '{sub_id}': gRPC context inactive.")
-                        active=False;break
-                    yield evt
-                    q.task_done()
-                    idle_timeouts_count = 0 # Reset on successful get
+                    evt=await asyncio.wait_for(q.get(),timeout=1.0)
+                    if not context.is_active():active=False;break # type: ignore
+                    yield evt;q.task_done()
                 except asyncio.TimeoutError:
-                    if not context.is_active(): # type: ignore
-                        logger.info(f"SWM stream for '{sub_id}': gRPC context inactive during idle check.")
-                        active=False;break
-                    idle_timeouts_count += 1
-                    logger.debug(f"SWM stream for '{sub_id}': idle timeout #{idle_timeouts_count} (threshold: {self.config.SUBSCRIBER_IDLE_TIMEOUT_THRESHOLD}).")
-                    if idle_timeouts_count >= self.config.SUBSCRIBER_IDLE_TIMEOUT_THRESHOLD:
-                        logger.warning(f"SWM stream for '{sub_id}': disconnecting due to inactivity (idle threshold reached).")
-                        active=False;break
-                except Exception as e:
-                    logger.error(f"SWM stream error for subscriber '{sub_id}': {e}",exc_info=True)
-                    active=False;break
-        except asyncio.CancelledError:
-            logger.info(f"SWM stream for subscriber '{sub_id}' cancelled by client or server shutdown.")
+                    if not context.is_active():active=False;break # type: ignore
+                except Exception as e:logger.error(f"SWM stream err for '{sub_id}':{e}",exc_info=True);active=False;break
+        except asyncio.CancelledError:logger.info(f"SWM stream for '{sub_id}' cancelled.")
         finally:
-            logger.info(f"SWM: Cleaning up subscriber '{sub_id}' (final active state: {active}).")
+            logger.info(f"SWM:Cleanup sub for '{sub_id}'(active:{active})")
             async with self.subscribers_lock:
                 rem_info=self.subscribers.pop(sub_id,None)
-                if rem_info:
-                    logger.info(f"SWM: Subscriber '{sub_id}' removed from active list. Remaining subscribers: {len(self.subscribers)}")
-                    self._remove_subscriber_from_indexes(sub_id,rem_info.topics)
+                if rem_info:logger.info(f"SWM:Sub '{sub_id}' rem.Rem:{len(self.subscribers)}");self._remove_subscriber_from_indexes(sub_id,rem_info.topics)
                 else:logger.warning(f"SWM:Attempt remove non-exist sub '{sub_id}'.")
     async def QuerySWM(self, request: swm_service_pb2.QuerySWMRequest, context) -> swm_service_pb2.QuerySWMResponse:
         query = request.query; logger.info(f"SWM: QuerySWM called with KEMQuery: {query}")

@@ -2,7 +2,9 @@ syntax = "proto3";
 
 package dcsm;
 
-import "kem.proto"; // KEM will be the result of processing and may be part of the response.
+// import "kem.proto"; // KEM will be the result of processing and may be part of the response.
+                     // Commented out as KEM type is not directly used in message fields below,
+                     // and was causing an 'unused import' warning. Can be re-added if ProcessRawDataResponse.created_kem is used.
 
 option go_package = "github.com/your_org/dcsm_protos/gen/go/kps;kps_service_pb"; // Example Go package option
 

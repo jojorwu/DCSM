@@ -47,10 +47,10 @@ message PublishKEMToSWMRequest {
 }
 
 message PublishKEMToSWMResponse {
-  string kem_id_swm = 1; // The ID of the KEM as known and stored in SWM's cache.
-  bool published_to_swm = 2; // True if successfully published/updated in SWM's cache.
-  bool queued_for_glm_persistence = 3; // True if KEM was successfully queued for persistence to GLM (if requested).
-  string status_message = 4; // Overall status message, may include info about queueing.
+  string kem_id = 1; // ID of the published KEM (could be GLM-generated if persist_to_glm=true and ID was initially empty).
+  bool published_to_swm = 2; // Whether successfully published to SWM's cache.
+  bool persistence_triggered_to_glm = 3; // Whether a call to GLM was initiated.
+  string status_message = 4; // Additional status message.
 }
 
 // --- Messages for SubscribeToSWMEvents ---
@@ -175,35 +175,35 @@ message GetLockInfoRequest {
 message LockInfo {
   string resource_id = 1;
   bool is_locked = 2;
-  string current_holder_agent_id = 3; // Если is_locked = true
-  string lock_id = 4;                 // Если is_locked = true
-  int64 acquired_at_unix_ms = 5;      // Если is_locked = true
-  int64 lease_expires_at_unix_ms = 6;   // Если is_locked = true and lease_duration_ms > 0
+  string current_holder_agent_id = 3; // If is_locked = true
+  string lock_id = 4;                 // If is_locked = true
+  int64 acquired_at_unix_ms = 5;      // If is_locked = true
+  int64 lease_expires_at_unix_ms = 6;   // If is_locked = true and lease_duration_ms > 0
 }
-// Сервис SharedWorkingMemoryService дополняется новыми RPC
-// ... (в определении service SharedWorkingMemoryService)
+// SharedWorkingMemoryService service is extended with new RPCs
+// ... (in service SharedWorkingMemoryService definition)
 // rpc AcquireLock(AcquireLockRequest) returns (AcquireLockResponse);
 // rpc ReleaseLock(ReleaseLockRequest) returns (ReleaseLockResponse);
 // rpc GetLockInfo(GetLockInfoRequest) returns (LockInfo);
 
-// ----- Сообщения и RPC для распределенных структур данных (начало - счетчик) -----
+// ----- Messages and RPCs for distributed data structures (starting with counter) -----
 
 message DistributedCounterRequest {
-  string counter_id = 1; // Уникальный идентификатор счетчика
+  string counter_id = 1; // Unique identifier for the counter
 }
 
 message IncrementCounterRequest {
   string counter_id = 1;
-  int64 increment_by = 2; // Значение, на которое увеличить счетчик (может быть отрицательным для уменьшения)
+  int64 increment_by = 2; // Value to increment the counter by (can be negative to decrement)
 }
 
 message CounterValueResponse {
   string counter_id = 1;
   int64 current_value = 2;
-  string status_message = 3; // Для ошибок или информации
+  string status_message = 3; // For errors or information
 }
 
-// ... (в определении service SharedWorkingMemoryService)
+// ... (in service SharedWorkingMemoryService definition)
 // rpc IncrementCounter(IncrementCounterRequest) returns (CounterValueResponse);
 // rpc GetCounter(DistributedCounterRequest) returns (CounterValueResponse);
 // rpc DeleteCounter(DistributedCounterRequest) returns (SimpleResponse); // SimpleResponse можно определить или использовать google.protobuf.Empty
