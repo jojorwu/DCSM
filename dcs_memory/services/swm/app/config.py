@@ -37,6 +37,41 @@ class SWMConfig(BaseServiceConfig):
         description="Interval in seconds for the background task that cleans up expired distributed locks."
     )
 
+    # Configuration for subscriber event queues
+    SUBSCRIBER_DEFAULT_QUEUE_SIZE: int = Field(
+        default=100,
+        description="Default queue size for an event subscriber if not specified or out of min/max bounds."
+    )
+    SUBSCRIBER_MIN_QUEUE_SIZE: int = Field(
+        default=10,
+        description="Minimum allowed queue size for an event subscriber."
+    )
+    SUBSCRIBER_MAX_QUEUE_SIZE: int = Field(
+        default=1000,
+        description="Maximum allowed queue size for an event subscriber."
+    )
+    SUBSCRIBER_IDLE_CHECK_INTERVAL_S: float = Field(
+        default=5.0, # Check for activity every 5 seconds
+        description="Interval in seconds for checking subscriber activity. Used as timeout for queue.get()."
+    )
+    SUBSCRIBER_IDLE_TIMEOUT_THRESHOLD: int = Field(
+        default=12, # e.g., 12 * 5s = 1 minute of inactivity
+        description="Number of consecutive idle check intervals after which a subscriber is considered inactive and disconnected."
+    )
+
+    # Configuration for GLM persistence worker (batching from SWM to GLM)
+    GLM_PERSISTENCE_QUEUE_MAX_SIZE: int = Field(
+        default=1000,
+        description="Maximum size of the internal queue for KEMs pending persistence to GLM."
+    )
+    GLM_PERSISTENCE_BATCH_SIZE: int = Field(
+        default=50,
+        description="Number of KEMs to batch together for a single BatchStoreKEMs call to GLM."
+    )
+    GLM_PERSISTENCE_FLUSH_INTERVAL_S: float = Field(
+        default=10.0,
+        description="Maximum interval in seconds to wait before flushing the persistence queue to GLM, even if batch size is not reached."
+    )
 
 if __name__ == '__main__':
     print("--- Тестирование SWMConfig ---")
