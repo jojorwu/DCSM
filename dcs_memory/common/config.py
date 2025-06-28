@@ -81,9 +81,6 @@ class SWMConfig(BaseServiceConfig):
     GLM_RETRY_INITIAL_DELAY_S: float = Field(default=1.0, description="Initial retry delay for SWM's GLM client.")
     GLM_RETRY_BACKOFF_FACTOR: float = Field(default=2.0, description="Retry backoff factor for SWM's GLM client.")
 
-    SWM_SUBSCRIBER_DEFAULT_QUEUE_SIZE: int = Field(default=100, description="Default queue size for SWM event subscribers.")
-    SWM_SUBSCRIBER_MIN_QUEUE_SIZE: int = Field(default=10, description="Minimum allowed queue size for SWM event subscribers.")
-    SWM_SUBSCRIBER_MAX_QUEUE_SIZE: int = Field(default=1000, description="Maximum allowed queue size for SWM event subscribers.")
 
     @field_validator("SWM_INDEXED_METADATA_KEYS", mode="before")
     @classmethod

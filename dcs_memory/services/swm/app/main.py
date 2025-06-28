@@ -218,12 +218,29 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                         targeted_sub_ids.update(self.metadata_exact_match_to_subscribers[mk][mv])
             sub_infos_to_notify = [self.subscribers[sid] for sid in targeted_sub_ids if sid in self.subscribers]
         if not sub_infos_to_notify: logger.debug(f"No subs for KEM '{kem.id}'."); return
-        logger.debug(f"Dispatching event for KEM '{kem.id}' to {len(sub_infos_to_notify)} subs.")
+
+        # Need to find subscriber_id to log it.
+        # Create a reverse mapping from queue object to subscriber_id for logging purposes,
+        # or iterate self.subscribers if performance is not critical here.
+        # For simplicity now, will iterate if needed, but ideally, sub_id should be available.
+        # The sub_info objects are SubscriberInfo, they don't store the sub_id key directly.
+        # Let's find sub_id by searching self.subscribers by sub_info object instance or queue.
+
+        logger.debug(f"Dispatching event for KEM '{kem.id}' (event_id: {evt_to_dispatch.event_id}) to {len(sub_infos_to_notify)} subscribers.")
         for sub_info in sub_infos_to_notify:
+            subscriber_id_for_log = "unknown_subscriber" # Default if not found
+            # This is inefficient, consider adding sub_id to SubscriberInfo if this logging is frequent & critical path
+            for sid, s_info_iter in self.subscribers.items():
+                if s_info_iter is sub_info:
+                    subscriber_id_for_log = sid
+                    break
             try:
-                if sub_info.event_queue.full(): logger.warning(f"Sub queue full for evt {evt_to_dispatch.event_id}. Lost.")
-                else: await sub_info.event_queue.put(evt_to_dispatch)
-            except Exception as e: logger.error(f"Err queueing evt for sub: {e}", exc_info=True)
+                if sub_info.event_queue.full():
+                    logger.warning(f"Subscriber queue full for subscriber_id='{subscriber_id_for_log}', event_id='{evt_to_dispatch.event_id}' (KEM_ID='{kem.id}') lost. Queue size: {sub_info.event_queue.qsize()}/{sub_info.event_queue.maxsize}")
+                else:
+                    await sub_info.event_queue.put(evt_to_dispatch)
+            except Exception as e:
+                logger.error(f"Error queueing event for subscriber_id='{subscriber_id_for_log}', event_id='{evt_to_dispatch.event_id}': {e}", exc_info=True)
 
     async def PublishKEMToSWM(self, request: swm_service_pb2.PublishKEMToSWMRequest, context) -> swm_service_pb2.PublishKEMToSWMResponse:
         kem_to_publish = request.kem_to_publish; logger.info(f"SWM: PublishKEMToSWM for KEM ID (suggested): '{kem_to_publish.id}'")
@@ -283,10 +300,9 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         # Determine queue size using values from SWMConfig
         requested_q_size = request.requested_queue_size
         if requested_q_size <= 0:
-            actual_q_size = self.config.SWM_SUBSCRIBER_DEFAULT_QUEUE_SIZE
+            actual_q_size = self.config.SUBSCRIBER_DEFAULT_QUEUE_SIZE
         else:
-            actual_q_size = max(self.config.SWM_SUBSCRIBER_MIN_QUEUE_SIZE,
-                                min(requested_q_size, self.config.SWM_SUBSCRIBER_MAX_QUEUE_SIZE))
+            actual_q_size = max(self.config.SUBSCRIBER_MIN_QUEUE_SIZE, min(requested_q_size, self.config.SUBSCRIBER_MAX_QUEUE_SIZE))
 
         logger.info(f"SWM: New subscriber '{sub_id}' (agent_id: '{ag_id}'). Requested Q size: {requested_q_size}, Actual Q size: {actual_q_size}. Topics: {request.topics}")
         q = asyncio.Queue(maxsize=actual_q_size)
@@ -318,21 +334,38 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                         if amk:k_idx=self.metadata_exact_match_to_subscribers.setdefault(amk,{});[k_idx.setdefault(mvf,set()).add(sub_id) for mvf in mvs]
             logger.info(f"SWM: Sub '{sub_id}' reg/upd.Total:{len(self.subscribers)}.Gen KEM:{len(self.general_kem_event_subscribers)}")
         active=True
+        idle_timeouts_count = 0
         try:
             while active:
                 try:
-                    evt=await asyncio.wait_for(q.get(),timeout=1.0)
-                    if not context.is_active():active=False;break # type: ignore
-                    yield evt;q.task_done()
+                    evt=await asyncio.wait_for(q.get(),timeout=self.config.SUBSCRIBER_IDLE_CHECK_INTERVAL_S)
+                    if not context.is_active(): # type: ignore
+                        logger.info(f"SWM stream for '{sub_id}': gRPC context inactive.")
+                        active=False;break
+                    yield evt
+                    q.task_done()
+                    idle_timeouts_count = 0 # Reset on successful get
                 except asyncio.TimeoutError:
-                    if not context.is_active():active=False;break # type: ignore
-                except Exception as e:logger.error(f"SWM stream err for '{sub_id}':{e}",exc_info=True);active=False;break
-        except asyncio.CancelledError:logger.info(f"SWM stream for '{sub_id}' cancelled.")
+                    if not context.is_active(): # type: ignore
+                        logger.info(f"SWM stream for '{sub_id}': gRPC context inactive during idle check.")
+                        active=False;break
+                    idle_timeouts_count += 1
+                    logger.debug(f"SWM stream for '{sub_id}': idle timeout #{idle_timeouts_count} (threshold: {self.config.SUBSCRIBER_IDLE_TIMEOUT_THRESHOLD}).")
+                    if idle_timeouts_count >= self.config.SUBSCRIBER_IDLE_TIMEOUT_THRESHOLD:
+                        logger.warning(f"SWM stream for '{sub_id}': disconnecting due to inactivity (idle threshold reached).")
+                        active=False;break
+                except Exception as e:
+                    logger.error(f"SWM stream error for subscriber '{sub_id}': {e}",exc_info=True)
+                    active=False;break
+        except asyncio.CancelledError:
+            logger.info(f"SWM stream for subscriber '{sub_id}' cancelled by client or server shutdown.")
         finally:
-            logger.info(f"SWM:Cleanup sub for '{sub_id}'(active:{active})")
+            logger.info(f"SWM: Cleaning up subscriber '{sub_id}' (final active state: {active}).")
             async with self.subscribers_lock:
                 rem_info=self.subscribers.pop(sub_id,None)
-                if rem_info:logger.info(f"SWM:Sub '{sub_id}' rem.Rem:{len(self.subscribers)}");self._remove_subscriber_from_indexes(sub_id,rem_info.topics)
+                if rem_info:
+                    logger.info(f"SWM: Subscriber '{sub_id}' removed from active list. Remaining subscribers: {len(self.subscribers)}")
+                    self._remove_subscriber_from_indexes(sub_id,rem_info.topics)
                 else:logger.warning(f"SWM:Attempt remove non-exist sub '{sub_id}'.")
     async def QuerySWM(self, request: swm_service_pb2.QuerySWMRequest, context) -> swm_service_pb2.QuerySWMResponse:
         query = request.query; logger.info(f"SWM: QuerySWM called with KEMQuery: {query}")
