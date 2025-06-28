@@ -26,7 +26,7 @@ if _version_not_supported:
 
 
 class KnowledgeProcessorServiceStub(object):
-    """Сервис Обработки Знаний (Knowledge Processor Service)
+    """Knowledge Processor Service (KPS)
     """
 
     def __init__(self, channel):
@@ -43,12 +43,12 @@ class KnowledgeProcessorServiceStub(object):
 
 
 class KnowledgeProcessorServiceServicer(object):
-    """Сервис Обработки Знаний (Knowledge Processor Service)
+    """Knowledge Processor Service (KPS)
     """
 
     def ProcessRawData(self, request, context):
-        """Обрабатывает сырые данные, генерирует эмбеддинги (если применимо),
-        формирует КЕП и инициирует ее сохранение в GLM.
+        """Processes raw data, generates embeddings (if applicable),
+        forms a KEM, and initiates its storage in GLM.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -71,7 +71,7 @@ def add_KnowledgeProcessorServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class KnowledgeProcessorService(object):
-    """Сервис Обработки Знаний (Knowledge Processor Service)
+    """Knowledge Processor Service (KPS)
     """
 
     @staticmethod

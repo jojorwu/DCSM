@@ -121,9 +121,13 @@ class SWMClient:
         return None
 
     def subscribe_to_swm_events(self, topics: Optional[List[swm_service_pb2.SubscriptionTopic]] = None,
-                                agent_id: str = "default_sdk_agent") -> Optional[Generator[swm_service_pb2.SWMMemoryEvent, None, None]]:
+                                agent_id: str = "default_sdk_agent",
+                                requested_queue_size: int = 0) -> Optional[Generator[swm_service_pb2.SWMMemoryEvent, None, None]]:
         self._ensure_connected()
-        request = swm_service_pb2.SubscribeToSWMEventsRequest(agent_id=agent_id)
+        request = swm_service_pb2.SubscribeToSWMEventsRequest(
+            agent_id=agent_id,
+            requested_queue_size=requested_queue_size
+        )
         if topics:
             request.topics.extend(topics)
         logger.info(f"SWMClient: Subscribing to SWM events with request: {request}")

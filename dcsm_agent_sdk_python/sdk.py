@@ -228,10 +228,12 @@ class AgentSDK:
     def handle_swm_events(self, topics: Optional[List[common_swm_pb2.SubscriptionTopic]] = None,
                           event_callback: Optional[Callable[[common_swm_pb2.SWMMemoryEvent], None]] = None,
                           agent_id: str = "default_sdk_agent_handler", auto_update_lpa: bool = False,
+                          requested_queue_size: int = 0, # Added new parameter
                           run_in_background: bool = False) -> Optional[threading.Thread]:
         """
         Subscribes to SWM events and processes them using a callback function.
         Can automatically update LAM based on events.
+        :param requested_queue_size: Optional: Client's requested size for its event queue on SWM server.
         """
         if not self.swm_client: logger.error("AgentSDK: SWMClient not initialized. Cannot subscribe to events."); return None
 
@@ -241,10 +243,14 @@ class AgentSDK:
             logger.error(f"AgentSDK: Cannot subscribe to SWM events, connection failed: {e}")
             return None
 
-        event_stream_generator = self.swm_client.subscribe_to_swm_events(topics=topics, agent_id=agent_id)
+        event_stream_generator = self.swm_client.subscribe_to_swm_events(
+            topics=topics,
+            agent_id=agent_id,
+            requested_queue_size=requested_queue_size # Pass to client
+        )
         if not event_stream_generator: logger.error(f"AgentSDK: Failed to get event stream generator from SWMClient for agent_id {agent_id}."); return None
 
-        logger.info(f"AgentSDK: Starting to listen for SWM events for agent_id {agent_id}...")
+        logger.info(f"AgentSDK: Starting to listen for SWM events for agent_id {agent_id} (req_q_size: {requested_queue_size})...")
         def _process_events():
             try:
                 for event in event_stream_generator: # type: ignore

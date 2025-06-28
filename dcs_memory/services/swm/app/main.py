@@ -277,7 +277,24 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         logger.debug(f"SWM: Subscriber '{subscriber_id}' removed from specific filter indexes.")
 
     async def SubscribeToSWMEvents(self, request: swm_service_pb2.SubscribeToSWMEventsRequest, context: grpc_aio.ServicerContext) -> AsyncGenerator[swm_service_pb2.SWMMemoryEvent, None]:
-        ag_id=request.agent_id; logger.info(f"SWM: New subscriber {ag_id} for topics: {request.topics}"); sub_id=ag_id or str(uuid.uuid4()); q=asyncio.Queue(100)
+        ag_id = request.agent_id
+        sub_id = ag_id or str(uuid.uuid4())
+
+        # Determine queue size
+        # TODO: Make these min/max/default queue sizes configurable in SWMConfig
+        DEFAULT_Q_SIZE = 100
+        MIN_Q_SIZE = 10
+        MAX_Q_SIZE = 1000
+
+        requested_q_size = request.requested_queue_size
+        if requested_q_size <= 0:
+            actual_q_size = DEFAULT_Q_SIZE
+        else:
+            actual_q_size = max(MIN_Q_SIZE, min(requested_q_size, MAX_Q_SIZE))
+
+        logger.info(f"SWM: New subscriber '{sub_id}' (agent_id: '{ag_id}'). Requested Q size: {requested_q_size}, Actual Q size: {actual_q_size}. Topics: {request.topics}")
+        q = asyncio.Queue(maxsize=actual_q_size)
+
         p_filters:Dict[str,Set[str]]={}; sub_all_kem=False; has_kem_topic=any(t.type==swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS for t in request.topics)
         has_spec_idx_filter=False
         if not request.topics and has_kem_topic: sub_all_kem=True

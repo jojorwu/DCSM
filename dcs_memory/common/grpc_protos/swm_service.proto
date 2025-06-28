@@ -69,6 +69,7 @@ message SubscriptionTopic {
 message SubscribeToSWMEventsRequest {
   string agent_id = 1; // Identifier of the subscribing agent (for logging and subscription management).
   repeated SubscriptionTopic topics = 2; // List of topics the agent subscribes to.
+  int32 requested_queue_size = 3; // Optional: Client's requested size for its event queue. Server may apply bounds. Default 0 means server default.
 }
 
 message SWMMemoryEvent {

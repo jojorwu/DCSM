@@ -440,7 +440,10 @@ query_swm_request = swm_service_pb2.QuerySWMRequest(
 # import swm_service_pb2
 
 subscribe_request = swm_service_pb2.SubscribeToSWMEventsRequest(
-    agent_id="my_smart_agent_007"
+    agent_id="my_smart_agent_007",
+    # Optional: Client can suggest a queue size for its events.
+    # Server may apply bounds or use its default if 0 or not provided.
+    # requested_queue_size=50
 )
 
 # Topic 1: KEMs by project_id
