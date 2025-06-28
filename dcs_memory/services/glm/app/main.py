@@ -1,24 +1,25 @@
 import grpc
 from concurrent import futures
-import time
+import time # Keep time for server wait, though not directly used in servicer logic now
 import sys
 import os
 import uuid
 import json
-import sqlite3
+import sqlite3 # Keep for potential direct use in repositories if needed, or for type hints
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.models import PointStruct
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.protobuf.json_format import ParseDict
-import typing
+import typing # Keep for type hints
 import logging
 
 # Import configuration
 from .config import GLMConfig
+from .repositories import SqliteKemRepository, QdrantKemRepository # Import repositories
 
 # --- Start of gRPC code import block ---
 current_script_path = os.path.abspath(__file__)
-app_dir = os.path.dirname(current_script_path)
+app_dir = os.path.dirname(current_script_path) # Used for DB path
 # --- End of app_dir definition ---
 
 # Global configuration instance
@@ -35,9 +36,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # --- End of logging setup ---
 
-service_root_dir = os.path.dirname(app_dir)
-if service_root_dir not in sys.path:
-    sys.path.insert(0, service_root_dir)
+# service_root_dir = os.path.dirname(app_dir) # No longer needed for sys.path manipulation here
+# if service_root_dir not in sys.path:
+#     sys.path.insert(0, service_root_dir)
 
 from generated_grpc import kem_pb2
 from generated_grpc import glm_service_pb2
@@ -45,156 +46,83 @@ from generated_grpc import glm_service_pb2_grpc
 from google.protobuf import empty_pb2
 # --- End of gRPC code import block ---
 
-# _ONE_DAY_IN_SECONDS = 60 * 60 * 24 # Unused variable
-
 class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemoryServicer):
     def __init__(self):
         logger.info("Initializing GlobalLongTermMemoryServicerImpl...")
-        self.qdrant_client = None
         self.config = config
 
-        self.sqlite_db_path = os.path.join(app_dir, self.config.DB_FILENAME)
-
+        db_path = os.path.join(app_dir, self.config.DB_FILENAME)
         try:
-            self.qdrant_client = QdrantClient(host=self.config.QDRANT_HOST, port=self.config.QDRANT_PORT, timeout=10)
-            self.qdrant_client.get_collections() # Test connection
-            logger.info(f"Qdrant client successfully connected to {self.config.QDRANT_HOST}:{self.config.QDRANT_PORT}")
-            self._ensure_qdrant_collection()
-        except Exception as e:
-            logger.error(f"CRITICAL ERROR during Qdrant client initialization: {e}. Service may not work correctly.")
-            self.qdrant_client = None
+            self.sqlite_repo = SqliteKemRepository(db_path, self.config)
+            logger.info("SqliteKemRepository initialized successfully.")
+        except Exception as e_sqlite_init:
+            logger.critical(f"CRITICAL ERROR initializing SqliteKemRepository: {e_sqlite_init}", exc_info=True)
+            raise
 
-        self._init_sqlite()
+        self.qdrant_repo = None
+        try:
+            if self.config.QDRANT_HOST:
+                qdrant_client = QdrantClient(host=self.config.QDRANT_HOST, port=self.config.QDRANT_PORT, timeout=10)
+                qdrant_client.get_collections()
+                logger.info(f"Qdrant client successfully connected to {self.config.QDRANT_HOST}:{self.config.QDRANT_PORT}")
+
+                self.qdrant_repo = QdrantKemRepository(qdrant_client, self.config.QDRANT_COLLECTION, self.config.DEFAULT_VECTOR_SIZE)
+                self.qdrant_repo.ensure_collection()
+                logger.info("QdrantKemRepository initialized successfully.")
+            else:
+                logger.warning("QDRANT_HOST not configured. Qdrant features will be unavailable.")
+        except Exception as e_qdrant_init:
+            logger.error(f"ERROR during Qdrant client/repository initialization: {e_qdrant_init}. Qdrant features will be unavailable.", exc_info=True)
+            self.qdrant_repo = None
+
         logger.info("GLM servicer initialized.")
-
-    def _get_sqlite_conn(self):
-        conn = sqlite3.connect(self.sqlite_db_path, timeout=10)
-        try:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute("PRAGMA synchronous=NORMAL;")
-            cursor.execute("PRAGMA foreign_keys=ON;")
-            cursor.execute("PRAGMA busy_timeout = 7500;")
-        except sqlite3.Error as e:
-            logger.error(f"Error setting SQLite PRAGMA options: {e}", exc_info=True) # Already has exc_info=True
-        return conn
-
-    def _init_sqlite(self):
-        logger.info(f"Initializing SQLite DB at path: {self.sqlite_db_path}")
-        try:
-            with self._get_sqlite_conn() as conn:
-                cursor = conn.cursor()
-                if logger.isEnabledFor(logging.INFO):
-                    jm = cursor.execute("PRAGMA journal_mode;").fetchone()
-                    sm = cursor.execute("PRAGMA synchronous;").fetchone()
-                    fk = cursor.execute("PRAGMA foreign_keys;").fetchone()
-                    bt = cursor.execute("PRAGMA busy_timeout;").fetchone()
-                    logger.info(f"SQLite PRAGMA at initialization: journal_mode={jm}, synchronous={sm}, foreign_keys={fk}, busy_timeout={bt}")
-
-                cursor.execute('''
-                CREATE TABLE IF NOT EXISTS kems (
-                    id TEXT PRIMARY KEY,
-                    content_type TEXT,
-                    content BLOB,
-                    metadata TEXT, /* JSON stored as TEXT */
-                    created_at TEXT, /* ISO 8601 format */
-                    updated_at TEXT  /* ISO 8601 format */
-                )
-                ''')
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_created_at ON kems (created_at);")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_updated_at ON kems (updated_at);")
-
-                # Add JSON indexes for frequently queried metadata fields
-                # NOTE: Requires SQLite version 3.38.0+ for JSON expression indexes.
-                # Example fields: 'type' and 'source_system'
-                # These fields should ideally be defined in a config or as constants.
-                # For now, using hypothetical field names directly.
-                logger.info("Attempting to create JSON indexes on metadata fields (requires SQLite >= 3.38.0)...")
-                try:
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_meta_type ON kems(json_extract(metadata, '$.type'));")
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_meta_source_system ON kems(json_extract(metadata, '$.source_system'));")
-                    logger.info("JSON indexes (meta_type, meta_source_system) creation attempted.")
-                except sqlite3.Error as e_json_idx:
-                    # Older SQLite versions might not support this. Log a warning but continue.
-                    logger.warning(f"Could not create JSON indexes (SQLite < 3.38.0 or other error): {e_json_idx}. "
-                                   "Filtering on these metadata fields might be slower.")
-
-                conn.commit()
-            logger.info("'kems' table and indexes in SQLite successfully initialized.")
-        except Exception as e:
-            logger.error(f"Error initializing SQLite: {e}", exc_info=True)
-
-    def _ensure_qdrant_collection(self):
-        if not self.qdrant_client:
-            logger.warning("Qdrant client not initialized, skipping collection creation/check.")
-            return
-        try:
-            try:
-                collection_info = self.qdrant_client.get_collection(self.config.QDRANT_COLLECTION)
-                logger.info(f"Collection '{self.config.QDRANT_COLLECTION}' already exists.")
-                # Check existing configuration if collection exists
-                if hasattr(collection_info.config.params.vectors, 'size'): # For standard vectors
-                    current_vector_size = collection_info.config.params.vectors.size
-                    current_distance = collection_info.config.params.vectors.distance
-                elif isinstance(collection_info.config.params.vectors, dict): # For named vectors
-                    logger.info("Detailed configuration check for named vectors is not yet implemented.")
-                    current_vector_size = self.config.DEFAULT_VECTOR_SIZE # Assume match for now
-                    current_distance = models.Distance.COSINE        # Assume match
-                else: # Unknown vector configuration format
-                     logger.warning(f"Could not determine vector configuration for collection '{self.config.QDRANT_COLLECTION}'. Skipping check.")
-                     current_vector_size = self.config.DEFAULT_VECTOR_SIZE
-                     current_distance = models.Distance.COSINE
-
-                if current_vector_size != self.config.DEFAULT_VECTOR_SIZE or current_distance != models.Distance.COSINE:
-                     logger.warning(f"Configuration of existing collection '{self.config.QDRANT_COLLECTION}' (size: {current_vector_size}, distance: {current_distance}) "
-                                    f"does not match expected (size: {self.config.DEFAULT_VECTOR_SIZE}, distance: {models.Distance.COSINE}).")
-                else:
-                    logger.info(f"Collection configuration for '{self.config.QDRANT_COLLECTION}' is consistent.")
-            except Exception as e_get_collection: # Catch error when getting collection (e.g., if it doesn't exist)
-                if "not found" in str(e_get_collection).lower() or \
-                   (hasattr(e_get_collection, 'status_code') and e_get_collection.status_code == 404): # type: ignore
-                    logger.info(f"Collection '{self.config.QDRANT_COLLECTION}' not found. Creating new collection...")
-                    self.qdrant_client.recreate_collection(
-                        collection_name=self.config.QDRANT_COLLECTION,
-                        vectors_config=models.VectorParams(size=self.config.DEFAULT_VECTOR_SIZE, distance=models.Distance.COSINE)
-                    )
-                    logger.info(f"Collection '{self.config.QDRANT_COLLECTION}' successfully created.")
-                else: # Other error during get_collection
-                    logger.error(f"Error getting Qdrant collection info for '{self.config.QDRANT_COLLECTION}': {e_get_collection}", exc_info=True)
-        except Exception as e: # General error for recreate_collection etc.
-            logger.error(f"Error ensuring Qdrant collection '{self.config.QDRANT_COLLECTION}': {e}", exc_info=True)
 
     def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
         kem_data_copy = kem_data.copy()
-        if 'created_at' in kem_data_copy and not isinstance(kem_data_copy['created_at'], str):
-            del kem_data_copy['created_at']
-        if 'updated_at' in kem_data_copy and not isinstance(kem_data_copy['updated_at'], str):
-            del kem_data_copy['updated_at']
+        # CRITICAL FIX: Do not delete Timestamp objects if they are already Timestamp protos.
+        # ParseDict handles string ISO timestamps and proto Timestamps.
         if 'content' in kem_data_copy and isinstance(kem_data_copy['content'], str):
              kem_data_copy['content'] = kem_data_copy['content'].encode('utf-8')
         return ParseDict(kem_data_copy, kem_pb2.KEM(), ignore_unknown_fields=True)
 
-    def _kem_from_db_row(self, row: sqlite3.Row, embeddings_map: typing.Optional[dict] = None) -> kem_pb2.KEM:
-        kem_dict = dict(row)
-        kem_dict['metadata'] = json.loads(kem_dict.get('metadata', '{}'))
-        created_at_ts = Timestamp()
-        created_at_str = kem_dict.get('created_at')
-        if created_at_str: # Check if the string is not None or empty
-            if not created_at_str.endswith("Z"): created_at_str += "Z" # Ensure Zulu timezone for FromJsonString
-            created_at_ts.FromJsonString(created_at_str)
-        kem_dict['created_at'] = created_at_ts
+    def _kem_from_db_dict(self, kem_db_dict: typing.Dict[str, typing.Any], embeddings_map: typing.Optional[typing.Dict[str, typing.List[float]]] = None) -> kem_pb2.KEM:
+        if not kem_db_dict:
+            logger.error("_kem_from_db_dict received empty or None kem_db_dict")
+            return kem_pb2.KEM()
 
-        updated_at_ts = Timestamp()
-        updated_at_str = kem_dict.get('updated_at')
-        if updated_at_str: # Check if the string is not None or empty
-            if not updated_at_str.endswith("Z"): updated_at_str += "Z"
-            updated_at_ts.FromJsonString(updated_at_str)
-        kem_dict['updated_at'] = updated_at_ts
-        if embeddings_map and kem_dict['id'] in embeddings_map:
-            kem_dict['embeddings'] = embeddings_map[kem_dict['id']]
-        else: # Ensure embeddings field is present even if empty
-            kem_dict.setdefault('embeddings', [])
-        return self._kem_dict_to_proto(kem_dict)
+        kem_dict_for_proto = kem_db_dict.copy()
+        metadata_str = kem_dict_for_proto.get('metadata', '{}')
+        try:
+            kem_dict_for_proto['metadata'] = json.loads(metadata_str)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse metadata JSON: {metadata_str} for KEM ID {kem_db_dict.get('id')}. Using empty metadata.", exc_info=True)
+            kem_dict_for_proto['metadata'] = {}
+
+        for ts_field_name in ['created_at', 'updated_at']:
+            ts_str = kem_dict_for_proto.get(ts_field_name)
+            if ts_str and isinstance(ts_str, str):
+                ts_proto = Timestamp()
+                if not ts_str.endswith("Z") and '+' not in ts_str and '-' not in ts_str[10:]:
+                    ts_str_for_parse = ts_str + "Z"
+                else:
+                    ts_str_for_parse = ts_str
+                try:
+                    ts_proto.FromJsonString(ts_str_for_parse)
+                    kem_dict_for_proto[ts_field_name] = ts_proto
+                except Exception as e_ts_parse:
+                     logger.warning(f"Failed to parse timestamp string '{ts_str}' (tried as '{ts_str_for_parse}') for field '{ts_field_name}' in KEM ID {kem_db_dict.get('id')}: {e_ts_parse}", exc_info=True)
+                     if ts_field_name in kem_dict_for_proto: del kem_dict_for_proto[ts_field_name]
+            elif isinstance(ts_str, Timestamp): # Already a Timestamp from a previous conversion
+                 pass
+            else: # Not a string or None/empty
+                 if ts_field_name in kem_dict_for_proto: del kem_dict_for_proto[ts_field_name]
+
+        if embeddings_map and kem_dict_for_proto.get('id') in embeddings_map:
+            kem_dict_for_proto['embeddings'] = embeddings_map[kem_dict_for_proto['id']]
+        else:
+            kem_dict_for_proto.setdefault('embeddings', [])
+
+        return self._kem_dict_to_proto(kem_dict_for_proto)
 
     def StoreKEM(self, request: glm_service_pb2.StoreKEMRequest, context) -> glm_service_pb2.StoreKEMResponse:
         kem = request.kem
@@ -203,88 +131,68 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
         current_time_proto = Timestamp()
         current_time_proto.GetCurrentTime()
+
+        kem.id = kem_id
+
         final_created_at_proto = Timestamp()
-        is_new_kem = True
+        existing_created_at_str = self.sqlite_repo.get_kem_creation_timestamp(kem_id)
 
-        # Prepare KEM data (ID, timestamps)
-        kem.id = kem_id # Ensure ID is set on the proto
-        # Determine created_at (logic moved before SQLite transaction for clarity, actual check still needed inside for existing)
-        # This is a preliminary created_at, will be finalized based on DB state.
-        if kem.HasField("created_at") and kem.created_at.seconds > 0:
-            preliminary_created_at = kem.created_at
+        if existing_created_at_str:
+            try:
+                parse_str = existing_created_at_str + ("Z" if not existing_created_at_str.endswith("Z") and '+' not in existing_created_at_str and '-' not in existing_created_at_str[10:] else "")
+                final_created_at_proto.FromJsonString(parse_str)
+            except Exception as e_parse:
+                 logger.error(f"StoreKEM: Error parsing existing created_at '{existing_created_at_str}' from DB for KEM ID '{kem_id}': {e_parse}", exc_info=True)
+                 final_created_at_proto.CopyFrom(current_time_proto)
+        elif kem.HasField("created_at") and kem.created_at.seconds > 0:
+            final_created_at_proto.CopyFrom(kem.created_at)
         else:
-            preliminary_created_at = current_time_proto
+            final_created_at_proto.CopyFrom(current_time_proto)
 
-        kem.updated_at.CopyFrom(current_time_proto) # Always set/update updated_at
+        kem.created_at.CopyFrom(final_created_at_proto)
+        kem.updated_at.CopyFrom(current_time_proto)
 
-        sqlite_committed = False
+        # Qdrant operation first (if applicable)
+        if self.qdrant_repo and kem.embeddings:
+            if len(kem.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
+                msg = f"Embedding dimension ({len(kem.embeddings)}) does not match Qdrant config ({self.config.DEFAULT_VECTOR_SIZE})."
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg); return glm_service_pb2.StoreKEMResponse()
+
+            qdrant_payload = {"kem_id_ref": kem_id}
+            if kem.metadata:
+                for k, v_pb_val in kem.metadata.items(): qdrant_payload[f"md_{k}"] = v_pb_val
+            if kem.HasField("created_at"): qdrant_payload["created_at_ts"] = kem.created_at.seconds
+            if kem.HasField("updated_at"): qdrant_payload["updated_at_ts"] = kem.updated_at.seconds
+
+            try:
+                point = PointStruct(id=kem_id, vector=list(kem.embeddings), payload=qdrant_payload)
+                self.qdrant_repo.upsert_point(point)
+                logger.info(f"StoreKEM: Embeddings for KEM ID '{kem_id}' saved to Qdrant.")
+            except Exception as e_qdrant:
+                msg = f"StoreKEM: Qdrant error for ID '{kem_id}': {e_qdrant}"
+                logger.error(msg, exc_info=True)
+                context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
+
         try:
-            with self._get_sqlite_conn() as conn:
-                cursor = conn.cursor()
-
-                # Check if KEM exists to determine final created_at
-                cursor.execute("SELECT created_at FROM kems WHERE id = ?", (kem_id,))
-                existing_row = cursor.fetchone()
-                if existing_row:
-                    is_new_kem = False
-                    final_created_at_proto.FromJsonString(existing_row[0] + ("Z" if not existing_row[0].endswith("Z") else ""))
-                else: # is_new_kem is True
-                    final_created_at_proto.CopyFrom(preliminary_created_at)
-
-                kem.created_at.CopyFrom(final_created_at_proto)
-
-                # Perform SQLite INSERT/REPLACE (without commit yet)
-                logger.debug(f"StoreKEM: Attempting SQLite INSERT/REPLACE for ID '{kem_id}'.")
-                cursor.execute('''
-                INSERT OR REPLACE INTO kems (id, content_type, content, metadata, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''', (kem.id, kem.content_type, kem.content,
-                      json.dumps(dict(kem.metadata)),
-                      kem.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''), # Store as naive UTC string, seconds precision
-                      kem.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')))
-                logger.debug(f"StoreKEM: SQLite INSERT/REPLACE for ID '{kem_id}' executed by cursor.")
-
-                # Perform Qdrant operation if needed (before SQLite commit)
-                if self.qdrant_client and kem.embeddings:
-                    if len(kem.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
-                        msg = f"Embedding dimension ({len(kem.embeddings)}) does not match Qdrant collection configuration ({self.config.DEFAULT_VECTOR_SIZE})."
-                        logger.error(msg)
-                        # SQLite changes will be rolled back due to context abort / exception before commit.
-                        context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg); return glm_service_pb2.StoreKEMResponse()
-
-                    logger.debug(f"StoreKEM: Attempting Qdrant upsert for ID '{kem_id}'.")
-                    qdrant_payload = {"kem_id_ref": kem_id}
-                    if kem.metadata:
-                        for k, v_pb_val in kem.metadata.items():
-                            qdrant_payload[f"md_{k}"] = v_pb_val
-                    if kem.HasField("created_at"):
-                        qdrant_payload["created_at_ts"] = kem.created_at.seconds
-                    if kem.HasField("updated_at"):
-                        qdrant_payload["updated_at_ts"] = kem.updated_at.seconds
-
-                    self.qdrant_client.upsert(
-                        collection_name=self.config.QDRANT_COLLECTION,
-                        points=[PointStruct(id=kem_id, vector=list(kem.embeddings), payload=qdrant_payload)],
-                        wait=True # Ensure Qdrant operation completes before SQLite commit
-                    )
-                    logger.info(f"Embeddings and payload for KEM ID '{kem_id}' successfully upserted to Qdrant.")
-
-                # All operations successful, commit SQLite
-                conn.commit()
-                sqlite_committed = True
-                logger.info(f"Metadata/content for KEM ID '{kem_id}' saved/updated in SQLite and Qdrant (if applicable), transaction committed.")
-
-        except grpc.RpcError: # e.g. context.abort called
-            logger.warning(f"StoreKEM: gRPC RpcError encountered for ID '{kem_id}'. SQLite commit status: {sqlite_committed}.")
-            raise # Re-throw to be handled by gRPC server framework
-        except Exception as e:
-            msg = f"Error during StoreKEM for ID '{kem_id}': {e}. SQLite commit status: {sqlite_committed}."
+            self.sqlite_repo.store_or_replace_kem(
+                kem_id=kem.id,
+                content_type=kem.content_type,
+                content=kem.content,
+                metadata_json=json.dumps(dict(kem.metadata)),
+                created_at_iso=kem.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
+                updated_at_iso=kem.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
+            )
+            logger.info(f"StoreKEM: Metadata/content for KEM ID '{kem_id}' saved to SQLite.")
+        except Exception as e_sqlite:
+            msg = f"StoreKEM: SQLite error for ID '{kem_id}': {e_sqlite}"
             logger.error(msg, exc_info=True)
-            # If SQLite was not committed, 'with conn:' handles rollback on exception.
-            # If Qdrant failed, SQLite was not committed.
+            # Potential inconsistency: Qdrant write passed, SQLite failed.
+            # For a robust system, a compensating action (delete from Qdrant) might be needed here.
+            # This is complex and depends on retry policies for Qdrant as well.
+            # Current behavior: Qdrant might have the point, SQLite does not.
             context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
 
-        logger.info(f"KEM ID '{kem_id}' successfully saved/updated overall.")
+        logger.info(f"KEM ID '{kem_id}' successfully saved/updated.")
         return glm_service_pb2.StoreKEMResponse(kem=kem)
 
     def RetrieveKEMs(self, request: glm_service_pb2.RetrieveKEMsRequest, context) -> glm_service_pb2.RetrieveKEMsResponse:
@@ -294,148 +202,105 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         if request.page_token:
             try:
                 offset = int(request.page_token)
-                if offset < 0: offset = 0 # Offset cannot be negative
+                if offset < 0: offset = 0
             except ValueError:
                 logger.warning(f"Invalid page_token format: '{request.page_token}'. Using offset=0.")
 
         logger.info(f"RetrieveKEMs: query_filters={query.metadata_filters}, query_ids={list(query.ids)}, "
                     f"vector_query_present={bool(query.embedding_query)}, page_size={page_size}, offset={offset}")
 
-        found_kems_proto = []
-        next_offset_str = ""
-        embeddings_from_qdrant = {}
-
-        def _build_qdrant_filter_local(kem_query: glm_service_pb2.KEMQuery) -> typing.Optional[models.Filter]:
-            q_conditions = []
-            if kem_query.ids:
-                # Qdrant point IDs are strings, KEM IDs are strings.
-                q_conditions.append(models.HasIdCondition(has_id=list(kem_query.ids)))
-
-            if kem_query.metadata_filters:
-                for k, v_str in kem_query.metadata_filters.items():
-                    # Assuming metadata values are simple types that Qdrant can match.
-                    # Numbers might need specific handling if stored as numbers in Qdrant payload.
-                    # For now, assuming string match is sufficient for md_<key>.
-                    q_conditions.append(models.FieldCondition(key=f"md_{k}", match=models.MatchValue(value=v_str)))
-
-            def add_ts_range_condition(field_name, ts_start, ts_end):
-                gte_val, lte_val = None, None
-                if ts_start and (ts_start.seconds > 0 or ts_start.nanos > 0): gte_val = ts_start.seconds
-                if ts_end and (ts_end.seconds > 0 or ts_end.nanos > 0): lte_val = ts_end.seconds
-                if gte_val is not None or lte_val is not None:
-                    q_conditions.append(models.FieldCondition(key=field_name, range=models.Range(gte=gte_val, lte=lte_val)))
-
-            add_ts_range_condition("created_at_ts", kem_query.created_at_start, kem_query.created_at_end)
-            add_ts_range_condition("updated_at_ts", kem_query.updated_at_start, kem_query.updated_at_end)
-
-            return models.Filter(must=q_conditions) if q_conditions else None
+        found_kems_proto_list: typing.List[kem_pb2.KEM] = []
+        next_page_token_str = ""
 
         if query.embedding_query:
-            if not self.qdrant_client:
-                context.abort(grpc.StatusCode.INTERNAL, "Qdrant service unavailable."); return glm_service_pb2.RetrieveKEMsResponse()
+            if not self.qdrant_repo:
+                context.abort(grpc.StatusCode.INTERNAL, "Qdrant service not available for vector search."); return glm_service_pb2.RetrieveKEMsResponse()
             if len(query.embedding_query) != self.config.DEFAULT_VECTOR_SIZE:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid vector dimension: {len(query.embedding_query)}, expected {self.config.DEFAULT_VECTOR_SIZE}"); return glm_service_pb2.RetrieveKEMsResponse()
-            try:
-                qdrant_filter_obj = _build_qdrant_filter_local(query)
-                logger.debug(f"RetrieveKEMs (vector search): Qdrant filter object: {qdrant_filter_obj}")
 
-                search_result = self.qdrant_client.search(
-                    collection_name=self.config.QDRANT_COLLECTION,
-                    query_vector=list(query.embedding_query),
-                    query_filter=qdrant_filter_obj,
-                    limit=page_size,
-                    offset=offset,
-                    with_vectors=True # Retrieve vectors to populate KEM proto
+            try:
+                q_conditions = []
+                if query.ids: q_conditions.append(models.HasIdCondition(has_id=list(query.ids)))
+                if query.metadata_filters:
+                    for k, v_str in query.metadata_filters.items(): q_conditions.append(models.FieldCondition(key=f"md_{k}", match=models.MatchValue(value=v_str)))
+
+                def add_ts_range_q(field_name, ts_start, ts_end, conds):
+                    gte, lte = (ts_start.seconds if ts_start.seconds > 0 or ts_start.nanos > 0 else None), \
+                               (ts_end.seconds if ts_end.seconds > 0 or ts_end.nanos > 0 else None)
+                    if gte is not None or lte is not None: conds.append(models.FieldCondition(key=field_name, range=models.Range(gte=gte, lte=lte)))
+
+                add_ts_range_q("created_at_ts", query.created_at_start, query.created_at_end, q_conditions)
+                add_ts_range_q("updated_at_ts", query.updated_at_start, query.updated_at_end, q_conditions)
+
+                q_filter = models.Filter(must=q_conditions) if q_conditions else None
+
+                search_hits = self.qdrant_repo.search_points(
+                    query_vector=list(query.embedding_query), q_filter=q_filter,
+                    limit=page_size, offset=offset, with_vectors=True
+                )
+                if not search_hits: return glm_service_pb2.RetrieveKEMsResponse(kems=[], next_page_token="")
+
+                q_ids = [hit.id for hit in search_hits]
+                embed_map = {hit.id: list(hit.vector) for hit in search_hits if hit.vector}
+
+                # Fetch from SQLite, preserving Qdrant's order via INSTR in repo or manual sort here
+                # The SqliteKemRepository.retrieve_kems_from_db was modified to accept order_by_clause
+                ordered_instr_clause = f"ORDER BY INSTR('," + ",".join(q_ids) + ",', ',' || id || ',')"
+
+                db_kems_dicts, _ = self.sqlite_repo.retrieve_kems_from_db( # next_token from this call is not used for Qdrant primary search
+                    sql_conditions=[f"id IN ({','.join('?' for _ in q_ids)})"],
+                    sql_params=q_ids,
+                    page_size=len(q_ids), # Fetch all
+                    offset=0,
+                    order_by_clause=ordered_instr_clause
+                )
+                for db_dict in db_kems_dicts:
+                    found_kems_proto_list.append(self._kem_from_db_dict(db_dict, embed_map))
+
+                if len(search_hits) == page_size: next_page_token_str = str(offset + page_size)
+
+            except Exception as e_q_retrieve:
+                logger.error(f"RetrieveKEMs Qdrant/SQLite error (vector search): {e_q_retrieve}", exc_info=True)
+                context.abort(grpc.StatusCode.INTERNAL, f"RetrieveKEMs (vector) error: {e_q_retrieve}"); return glm_service_pb2.RetrieveKEMsResponse()
+        else: # Non-vector search
+            sql_conds, sql_pars = [], []
+            if query.ids:
+                sql_conds.append(f"id IN ({','.join('?' for _ in query.ids)})"); sql_pars.extend(list(query.ids))
+            for k, v in query.metadata_filters.items():
+                sql_conds.append(f"json_extract(metadata, '$.{k}') = ?"); sql_pars.append(v)
+
+            def add_date_cond_sql(fname, ts_s, ts_e, conds, pars):
+                if ts_s.seconds > 0 or ts_s.nanos > 0:
+                    conds.append(f"{fname} >= ?"); pars.append(ts_s.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+                if ts_e.seconds > 0 or ts_e.nanos > 0:
+                    conds.append(f"{fname} <= ?"); pars.append(ts_e.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+
+            add_date_cond_sql("created_at", query.created_at_start, query.created_at_end, sql_conds, sql_pars)
+            add_date_cond_sql("updated_at", query.updated_at_start, query.updated_at_end, sql_conds, sql_pars)
+
+            try:
+                db_kems_dicts, next_page_token_str = self.sqlite_repo.retrieve_kems_from_db(
+                    sql_conditions=sql_conds, sql_params=sql_pars,
+                    page_size=page_size, offset=offset # Uses default ordering by updated_at DESC from repo
                 )
 
-                qdrant_ids_retrieved = [hit.id for hit in search_result]
-                for hit in search_result:
-                    if hit.vector: embeddings_from_qdrant[hit.id] = list(hit.vector)
+                ids_from_page = [d['id'] for d in db_kems_dicts]
+                embed_map_page = {}
+                if ids_from_page and self.qdrant_repo:
+                    try:
+                        q_points = self.qdrant_repo.retrieve_points_by_ids(ids_from_page, with_vectors=True)
+                        for p in q_points:
+                            if p.vector: embed_map_page[p.id] = list(p.vector)
+                    except Exception as e_q_emb: logger.warning(f"Failed to retrieve embeddings for non-vector search: {e_q_emb}", exc_info=True)
 
-                if not qdrant_ids_retrieved:
-                    return glm_service_pb2.RetrieveKEMsResponse(kems=[], next_page_token="")
+                for db_dict in db_kems_dicts:
+                    found_kems_proto_list.append(self._kem_from_db_dict(db_dict, embed_map_page))
 
-                # Fetch from SQLite using the order from Qdrant
-                placeholders = ','.join('?' for _ in qdrant_ids_retrieved)
-                sql_query_final = f"SELECT id, content_type, content, metadata, created_at, updated_at FROM kems WHERE id IN ({placeholders}) ORDER BY INSTR(',' || ? || ',', ',' || id || ',')"
-                # The INSTR trick preserves Qdrant's ordering by searching for ',id,' in ',id1,id2,id3,'
-                ordered_ids_string = ',' + ','.join(qdrant_ids_retrieved) + ','
+            except Exception as e_sql_retrieve:
+                logger.error(f"RetrieveKEMs SQLite error (non-vector search): {e_sql_retrieve}", exc_info=True)
+                context.abort(grpc.StatusCode.INTERNAL, f"RetrieveKEMs (non-vector) error: {e_sql_retrieve}"); return glm_service_pb2.RetrieveKEMsResponse()
 
-                with self._get_sqlite_conn() as conn:
-                    conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-                    cursor.execute(sql_query_final, (ordered_ids_string,) + tuple(qdrant_ids_retrieved) )
-                    for row_dict in cursor.fetchall():
-                        found_kems_proto.append(self._kem_from_db_row(row_dict, embeddings_from_qdrant))
-
-                if len(search_result) == page_size: # Potential next page if Qdrant returned a full page
-                    # To confirm, Qdrant's SearchResponse usually has a `next_page_offset` if available.
-                    # Or we can assume if limit items were returned, there might be more.
-                    next_offset_str = str(offset + page_size)
-
-            except Exception as e:
-                logger.error(f"Qdrant error (RetrieveKEMs - vector search): {e}", exc_info=True)
-                context.abort(grpc.StatusCode.INTERNAL, f"Qdrant error: {e}"); return glm_service_pb2.RetrieveKEMsResponse()
-        else: # Non-vector search (SQLite primary)
-            sql_conditions = []; sql_params = []
-            if query.ids:
-                placeholders = ','.join('?' for _ in query.ids)
-                sql_conditions.append(f"id IN ({placeholders})"); sql_params.extend(query.ids)
-
-            for key, value in query.metadata_filters.items():
-                sql_conditions.append(f"json_extract(metadata, '$.{key}') = ?"); sql_params.append(value)
-
-            def add_date_condition(field_name, proto_ts, op):
-                if proto_ts.seconds > 0 or proto_ts.nanos > 0:
-                    # SQLite stores dates as TEXT in ISO format (YYYY-MM-DD HH:MM:SS)
-                    # Using timespec='seconds' ensures this format.
-                    # replace('+00:00', '') is not strictly needed here if DB stores naive UTC and comparison is also naive.
-                    # However, to be absolutely sure about format, let's ensure it matches the storage format.
-                    # Stored format is: kem.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
-                    sql_conditions.append(f"{field_name} {op} ?"); sql_params.append(proto_ts.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
-
-            add_date_condition("created_at", query.created_at_start, ">="); add_date_condition("created_at", query.created_at_end, "<=")
-            add_date_condition("updated_at", query.updated_at_start, ">="); add_date_condition("updated_at", query.updated_at_end, "<=")
-
-            sql_where_clause = " WHERE " + " AND ".join(sql_conditions) if sql_conditions else ""
-            # Default sort for non-vector search; can be made configurable
-            sql_query_ordered = f"SELECT id, content_type, content, metadata, created_at, updated_at FROM kems{sql_where_clause} ORDER BY updated_at DESC"
-            sql_query_paginated = f"{sql_query_ordered} LIMIT ? OFFSET ?"
-
-            try:
-                with self._get_sqlite_conn() as conn:
-                    conn.row_factory = sqlite3.Row; cursor = conn.cursor()
-                    final_sql_params = sql_params + [page_size, offset]
-                    cursor.execute(sql_query_paginated, final_sql_params)
-                    rows = cursor.fetchall()
-
-                    ids_from_sqlite = [row['id'] for row in rows]
-                    if ids_from_sqlite and self.qdrant_client: # Fetch embeddings if Qdrant is available
-                        try:
-                            qdrant_points = self.qdrant_client.retrieve(
-                                collection_name=self.config.QDRANT_COLLECTION,
-                                ids=ids_from_sqlite,
-                                with_vectors=True
-                            )
-                            for point in qdrant_points:
-                                if point.vector: embeddings_from_qdrant[point.id] = list(point.vector)
-                        except Exception as e_qd_retrieve:
-                            logger.warning(f"Failed to retrieve embeddings for KEMs from Qdrant: {e_qd_retrieve}")
-
-                    for row_dict in rows:
-                        found_kems_proto.append(self._kem_from_db_row(row_dict, embeddings_from_qdrant))
-
-                    if len(rows) == page_size: # Check if there might be a next page
-                        cursor_count = conn.cursor()
-                        # Check if there's at least one more record beyond the current page
-                        count_params = sql_params + [offset + page_size]
-                        cursor_count.execute(f"SELECT EXISTS({sql_query_ordered} LIMIT 1 OFFSET ?)", count_params)
-                        if cursor_count.fetchone()[0] == 1:
-                            next_offset_str = str(offset + page_size)
-            except Exception as e:
-                logger.error(f"SQLite error (RetrieveKEMs non-vector): {e}", exc_info=True)
-                context.abort(grpc.StatusCode.INTERNAL, f"SQLite error: {e}"); return glm_service_pb2.RetrieveKEMsResponse()
-
-        return glm_service_pb2.RetrieveKEMsResponse(kems=found_kems_proto, next_page_token=next_offset_str)
+        return glm_service_pb2.RetrieveKEMsResponse(kems=found_kems_proto_list, next_page_token=next_page_token_str)
 
     def UpdateKEM(self, request: glm_service_pb2.UpdateKEMRequest, context) -> kem_pb2.KEM:
         kem_id = request.kem_id
@@ -444,119 +309,89 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID must be specified for update.")
             return kem_pb2.KEM()
 
-        current_kem_dict_from_db = {}
-        original_created_at_iso_str = ""
-        final_embeddings_for_response = [] # Store embeddings for the response KEM
+        kem_current_db_dict = self.sqlite_repo.get_full_kem_by_id(kem_id)
+        if not kem_current_db_dict:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"KEM with ID '{kem_id}' not found for update.")
+            return kem_pb2.KEM()
 
-        # Timestamps
-        ts_now = Timestamp()
-        ts_now.GetCurrentTime()
-        updated_at_iso_str = ts_now.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
+        ts_now_proto = Timestamp(); ts_now_proto.GetCurrentTime()
 
-        sqlite_committed = False
+        # Prepare Qdrant payload first, as Qdrant op is before SQLite commit
+        qdrant_payload_update = {"kem_id_ref": kem_id}
+        current_metadata = json.loads(kem_current_db_dict.get('metadata', '{}'))
+        metadata_for_qdrant = current_metadata.copy()
+        if kem_data_update.metadata: # If metadata is in update, it replaces for Qdrant payload
+            metadata_for_qdrant = dict(kem_data_update.metadata)
+
+        for k, v in metadata_for_qdrant.items(): qdrant_payload_update[f"md_{k}"] = str(v) # Ensure string values for Qdrant typical use
+
         try:
-            # Step 1: Retrieve current KEM state from SQLite to prepare updates
-            with self._get_sqlite_conn() as conn_check:
-                cursor_check = conn_check.cursor()
-                cursor_check.execute("SELECT id, content_type, content, metadata, created_at, updated_at FROM kems WHERE id = ?", (kem_id,))
-                row = cursor_check.fetchone()
-                if not row:
-                    context.abort(grpc.StatusCode.NOT_FOUND, f"KEM with ID '{kem_id}' not found for update.")
-                    return kem_pb2.KEM()
+            created_at_ts_q = Timestamp()
+            # Use original created_at from DB for Qdrant ts field
+            original_created_at_iso = kem_current_db_dict['created_at']
+            parse_str_q_creat = original_created_at_iso + ("Z" if not original_created_at_iso.endswith("Z") and '+' not in original_created_at_iso and '-' not in original_created_at_iso[10:] else "")
+            created_at_ts_q.FromJsonString(parse_str_q_creat)
+            qdrant_payload_update["created_at_ts"] = created_at_ts_q.seconds
+        except Exception as e_ts_upd_q:
+            logger.warning(f"UpdateKEM: Failed to parse original_created_at_iso for Qdrant payload: {e_ts_upd_q}", exc_info=True)
+        qdrant_payload_update["updated_at_ts"] = ts_now_proto.seconds
 
-                current_kem_dict_from_db = dict(row)
-                current_kem_dict_from_db['metadata'] = json.loads(current_kem_dict_from_db.get('metadata', '{}'))
-                original_created_at_iso_str = current_kem_dict_from_db['created_at'] # Preserve original creation time string
+        final_embeddings_for_resp = [] # To store what embeddings should be in the response
 
-            # Step 2: Prepare updated KEM data based on request
-            updated_content_type = current_kem_dict_from_db['content_type']
-            if kem_data_update.HasField("content_type"):
-                updated_content_type = kem_data_update.content_type
-
-            updated_content = current_kem_dict_from_db['content']
-            if kem_data_update.HasField("content"):
-                updated_content = kem_data_update.content.value
-
-            updated_metadata_dict = current_kem_dict_from_db['metadata']
-            if kem_data_update.metadata: # If metadata is provided in update, it replaces the old one
-                updated_metadata_dict = dict(kem_data_update.metadata)
-
-            # Step 3: Qdrant Operation (before SQLite commit)
-            if self.qdrant_client:
-                logger.debug(f"UpdateKEM: Preparing Qdrant update for ID '{kem_id}'.")
-                qdrant_payload_update = {"kem_id_ref": kem_id}
-                if updated_metadata_dict: # Use potentially updated metadata
-                    for k, v_str in updated_metadata_dict.items():
-                        qdrant_payload_update[f"md_{k}"] = v_str
-
-                try:
-                    created_at_proto_for_qdrant = Timestamp() # For Qdrant timestamp payload
-                    created_at_proto_for_qdrant.FromJsonString(original_created_at_iso_str + ("Z" if not original_created_at_iso_str.endswith("Z") else ""))
-                    qdrant_payload_update["created_at_ts"] = created_at_proto_for_qdrant.seconds
-                except Exception as e_ts_create:
-                    logger.warning(f"UpdateKEM: Failed to parse original_created_at_iso ('{original_created_at_iso_str}') for Qdrant payload: {e_ts_create}", exc_info=True)
-                qdrant_payload_update["updated_at_ts"] = ts_now.seconds
-
-                if kem_data_update.embeddings: # New embeddings provided
-                    new_embeddings = list(kem_data_update.embeddings)
-                    if len(new_embeddings) != self.config.DEFAULT_VECTOR_SIZE:
-                        msg = f"Invalid embedding dimension for KEM ID '{kem_id}': {len(new_embeddings)}, expected {self.config.DEFAULT_VECTOR_SIZE}"
-                        logger.error(msg)
+        if self.qdrant_repo:
+            try:
+                q_point_to_upsert: models.PointStruct
+                if kem_data_update.embeddings:
+                    new_embeds = list(kem_data_update.embeddings)
+                    if len(new_embeds) != self.config.DEFAULT_VECTOR_SIZE:
+                        msg = f"Invalid embedding dimension for KEM ID '{kem_id}'"
                         context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg); return kem_pb2.KEM()
+                    q_point_to_upsert = PointStruct(id=kem_id, vector=new_embeds, payload=qdrant_payload_update)
+                    final_embeddings_for_resp = new_embeds
+                    logger.info(f"UpdateKEM: Qdrant: Updating vector and payload for KEM ID '{kem_id}'.")
+                else: # No embeddings in update, preserve existing vector if any, just update payload
+                    # To preserve vector, we must provide it in the upsert, or use a specific set_payload.
+                    # QdrantKemRepository doesn't have set_payload, so we retrieve existing vector.
+                    existing_q_points = self.qdrant_repo.retrieve_points_by_ids([kem_id], with_vectors=True)
+                    existing_vec = None
+                    if existing_q_points and existing_q_points[0].vector:
+                        existing_vec = list(existing_q_points[0].vector)
+                        final_embeddings_for_resp = existing_vec
+                    q_point_to_upsert = PointStruct(id=kem_id, vector=existing_vec, payload=qdrant_payload_update)
+                    logger.info(f"UpdateKEM: Qdrant: Updating payload for KEM ID '{kem_id}' (vector preserved: {existing_vec is not None}).")
 
-                    logger.info(f"UpdateKEM: Updating vector and payload for KEM ID '{kem_id}' in Qdrant.")
-                    self.qdrant_client.upsert(
-                        collection_name=self.config.QDRANT_COLLECTION,
-                        points=[PointStruct(id=kem_id, vector=new_embeddings, payload=qdrant_payload_update)],
-                        wait=True
-                    )
-                    final_embeddings_for_response = new_embeddings
-                else: # No new embeddings provided, only update payload, preserve vector
-                    logger.info(f"UpdateKEM: Updating payload (preserving vector) for KEM ID '{kem_id}' in Qdrant.")
-                    self.qdrant_client.set_payload(
-                        collection_name=self.config.QDRANT_COLLECTION,
-                        payload=qdrant_payload_update,
-                        points=[kem_id], # Qdrant expects list of point IDs
-                        wait=True
-                    )
-                    # For response, try to fetch existing vector if not provided in update
-                    points_resp = self.qdrant_client.retrieve(self.config.QDRANT_COLLECTION, ids=[kem_id], with_vectors=True)
-                    if points_resp and points_resp[0].vector:
-                        final_embeddings_for_response = list(points_resp[0].vector)
-                    else: # No vector or couldn't retrieve
-                        final_embeddings_for_response = []
-                logger.info(f"UpdateKEM: Qdrant operation for ID '{kem_id}' successful.")
+                self.qdrant_repo.upsert_point(q_point_to_upsert)
+            except Exception as e_q_upd:
+                msg = f"UpdateKEM: Qdrant error for ID '{kem_id}': {e_q_upd}"
+                logger.error(msg, exc_info=True)
+                context.abort(grpc.StatusCode.INTERNAL, msg); return kem_pb2.KEM()
 
-            # Step 4: Update SQLite (now that Qdrant op, if any, was successful)
-            with self._get_sqlite_conn() as conn:
-                cursor = conn.cursor()
-                logger.debug(f"UpdateKEM: Attempting SQLite UPDATE for ID '{kem_id}'.")
-                cursor.execute("UPDATE kems SET content_type = ?, content = ?, metadata = ?, updated_at = ? WHERE id = ?",
-                               (updated_content_type, updated_content,
-                                json.dumps(updated_metadata_dict),
-                                updated_at_iso_str, kem_id))
-                conn.commit()
-                sqlite_committed = True
-                logger.info(f"UpdateKEM: SQLite record for ID '{kem_id}' updated and committed.")
+        # Prepare fields for SQLite update
+        sqlite_updated_at_iso = ts_now_proto.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
+        sqlite_content_type = kem_data_update.content_type if kem_data_update.HasField("content_type") else None
+        sqlite_content = kem_data_update.content.value if kem_data_update.HasField("content") else None
+        sqlite_metadata_json = json.dumps(dict(kem_data_update.metadata)) if kem_data_update.metadata else None
 
-            # Step 5: Construct KEM to return
-            response_kem_dict = {
-                'id': kem_id,
-                'content_type': updated_content_type,
-                'content': updated_content, # content is already bytes if from db or from proto bytes_value
-                'metadata': updated_metadata_dict,
-                'created_at': original_created_at_iso_str, # Original creation time string
-                'updated_at': updated_at_iso_str,       # New update time string
-                'embeddings': final_embeddings_for_response
-            }
-            return self._kem_dict_to_proto(response_kem_dict)
+        try:
+            self.sqlite_repo.update_kem_fields(
+                kem_id=kem_id, updated_at_iso=sqlite_updated_at_iso,
+                content_type=sqlite_content_type, content=sqlite_content,
+                metadata_json=sqlite_metadata_json
+            )
+        except Exception as e_sql_upd:
+            msg = f"UpdateKEM: SQLite error for ID '{kem_id}': {e_sql_upd}"
+            logger.error(msg, exc_info=True)
+            # TODO: Qdrant succeeded, SQLite failed. Rollback Qdrant? (e.g. restore previous payload/vector)
+            context.abort(grpc.StatusCode.INTERNAL, msg); return kem_pb2.KEM()
 
-        except grpc.RpcError:
-            logger.warning(f"UpdateKEM: gRPC RpcError encountered for ID '{kem_id}'. SQLite commit status: {sqlite_committed}.")
-            raise
-        except Exception as e:
-            logger.error(f"Error updating KEM ID '{kem_id}': {e}. SQLite commit status: {sqlite_committed}.", exc_info=True)
-            context.abort(grpc.StatusCode.INTERNAL, f"Update error for KEM ID '{kem_id}': {e}"); return kem_pb2.KEM()
+        # Construct response KEM from potentially updated DB state
+        final_kem_db_dict_resp = self.sqlite_repo.get_full_kem_by_id(kem_id)
+        if not final_kem_db_dict_resp:
+            logger.error(f"UpdateKEM: KEM ID '{kem_id}' disappeared from DB after update for response.")
+            context.abort(grpc.StatusCode.INTERNAL, "KEM disappeared post-update."); return kem_pb2.KEM()
+
+        # final_embeddings_for_resp is already set based on Qdrant logic
+        return self._kem_from_db_dict(final_kem_db_dict_resp, {kem_id: final_embeddings_for_resp} if final_embeddings_for_resp else None)
 
     def DeleteKEM(self, request: glm_service_pb2.DeleteKEMRequest, context) -> empty_pb2.Empty:
         kem_id = request.kem_id
@@ -564,280 +399,174 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID must be specified for deletion.")
             return empty_pb2.Empty()
 
+        if self.qdrant_repo:
+            try:
+                self.qdrant_repo.delete_points_by_ids([kem_id])
+                logger.info(f"DeleteKEM: Qdrant processed delete for KEM ID '{kem_id}'.")
+            except Exception as e_qd_del:
+                msg = f"DeleteKEM: Qdrant error for ID '{kem_id}': {e_qd_del}"
+                logger.error(msg, exc_info=True)
+                context.abort(grpc.StatusCode.INTERNAL, msg); return empty_pb2.Empty()
+
         try:
-            # Step 1: Delete from Qdrant first
-            if self.qdrant_client:
-                logger.debug(f"DeleteKEM: Attempting to delete point for KEM ID '{kem_id}' from Qdrant.")
-                try:
-                    self.qdrant_client.delete_points(
-                        collection_name=self.config.QDRANT_COLLECTION,
-                        points_selector=models.PointIdsList(points=[kem_id]),
-                        wait=True # Ensure operation completes
-                    )
-                    logger.info(f"Point for KEM ID '{kem_id}' successfully deleted/marked for deletion from Qdrant (or was not found).")
-                except Exception as e_qd_del:
-                    msg = f"Qdrant error while deleting point for KEM ID '{kem_id}': {e_qd_del}"
-                    logger.error(msg, exc_info=True)
-                    context.abort(grpc.StatusCode.INTERNAL, msg); return empty_pb2.Empty()
-
-            # Step 2: Delete from SQLite
-            logger.debug(f"DeleteKEM: Attempting to delete KEM ID '{kem_id}' from SQLite.")
-            with self._get_sqlite_conn() as conn:
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM kems WHERE id = ?", (kem_id,))
-                conn.commit()
-                if cursor.rowcount == 0:
-                    logger.warning(f"KEM ID '{kem_id}' not found in SQLite for deletion (or was already deleted). Qdrant delete was attempted if configured.")
-                else:
-                    logger.info(f"KEM ID '{kem_id}' successfully deleted from SQLite.")
-
-            logger.info(f"DeleteKEM: Successfully processed deletion for KEM ID '{kem_id}'.")
-            return empty_pb2.Empty()
-
-        except grpc.RpcError:
-            logger.warning(f"DeleteKEM: gRPC RpcError encountered for ID '{kem_id}'.")
-            raise
-        except Exception as e:
-            # This would typically catch errors from _get_sqlite_conn or other unexpected issues
-            msg = f"Unexpected error in DeleteKEM for ID '{kem_id}': {e}"
+            deleted_sqlite = self.sqlite_repo.delete_kem_by_id(kem_id)
+            if not deleted_sqlite: logger.warning(f"DeleteKEM: KEM ID '{kem_id}' not found in SQLite (or already deleted).")
+            else: logger.info(f"DeleteKEM: KEM ID '{kem_id}' deleted from SQLite.")
+        except Exception as e_sql_del:
+            msg = f"DeleteKEM: SQLite error for ID '{kem_id}': {e_sql_del}"
             logger.error(msg, exc_info=True)
+            # Qdrant might have deleted. Potential inconsistency.
             context.abort(grpc.StatusCode.INTERNAL, msg); return empty_pb2.Empty()
+
+        logger.info(f"DeleteKEM: Successfully processed deletion for KEM ID '{kem_id}'.")
+        return empty_pb2.Empty()
 
     def BatchStoreKEMs(self, request: glm_service_pb2.BatchStoreKEMsRequest, context) -> glm_service_pb2.BatchStoreKEMsResponse:
         logger.info(f"BatchStoreKEMs: Received {len(request.kems)} KEMs for storage.")
-        successfully_stored_kems_list = []
-        failed_kem_references_list = []
+        successfully_stored_kems_protos: typing.List[kem_pb2.KEM] = []
+        failed_kem_original_references: typing.List[str] = []
+
+        kems_to_process_internally = [] # Store dicts or internal KEM representations
 
         for idx, kem_in_req in enumerate(request.kems):
-            # Create a mutable copy of the KEM from request
-            current_kem_to_process = kem_pb2.KEM()
-            current_kem_to_process.CopyFrom(kem_in_req)
+            kem_id = kem_in_req.id if kem_in_req.id else str(uuid.uuid4())
+            original_ref = kem_in_req.id if kem_in_req.id else f"req_idx_{idx}" # For error reporting
 
-            kem_id = current_kem_to_process.id if current_kem_to_process.id else str(uuid.uuid4())
-            current_kem_to_process.id = kem_id
+            # Validate embeddings early if present and Qdrant is used
+            if kem_in_req.embeddings and self.qdrant_repo:
+                if len(kem_in_req.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
+                    logger.error(f"BatchStoreKEMs: Invalid embedding dimension for KEM ID '{kem_id}' (ref: {original_ref}). Skipping.")
+                    failed_kem_original_references.append(original_ref)
+                    continue
+            elif kem_in_req.embeddings and not self.qdrant_repo:
+                 logger.error(f"BatchStoreKEMs: Qdrant repo not available. KEM ID '{kem_id}' (ref: {original_ref}) with embeddings cannot be fully stored. Skipping.")
+                 failed_kem_original_references.append(original_ref)
+                 continue
 
-            current_time_proto = Timestamp(); current_time_proto.GetCurrentTime()
-            final_created_at_proto = Timestamp()
-            is_new_kem_in_db = True
-            sqlite_persisted_this_op = False
-            qdrant_persisted_this_op = True # Assume success if no embeddings or no Qdrant client
+            # Prepare internal representation or directly the proto for later processing
+            # For now, let's just collect the protos and determine timestamps later
+            # We need to ensure the ID is set on the proto if it was generated
+            kem_proto_copy = kem_pb2.KEM()
+            kem_proto_copy.CopyFrom(kem_in_req)
+            kem_proto_copy.id = kem_id # Ensure ID is set
 
-            # Step 1: Process KEMs for SQLite and prepare for Qdrant
-            kems_for_sqlite_processing = [] # Tuples of (KEM_proto, original_client_id_or_index_ref)
-            qdrant_points_to_upsert = []
+            kems_to_process_internally.append({
+                "proto": kem_proto_copy,
+                "original_ref": original_ref
+            })
 
-            for idx, kem_in_req in enumerate(request.kems):
-                current_kem_to_process = kem_pb2.KEM()
-                current_kem_to_process.CopyFrom(kem_in_req)
-                original_client_ref = kem_in_req.id if kem_in_req.id else f"req_idx_{idx}"
+        # Determine created_at for all KEMs
+        ids_from_request = [item['proto'].id for item in kems_to_process_internally if item['proto'].id]
+        existing_kems_timestamps_map = self.sqlite_repo.get_kems_creation_timestamps(ids_from_request) if ids_from_request else {}
 
-                kem_id = current_kem_to_process.id if current_kem_to_process.id else str(uuid.uuid4())
-                current_kem_to_process.id = kem_id
+        kems_for_sqlite_batch_op = [] # List of tuples/dicts for a batch SQLite operation (if repo supports it)
+                                   # Or list of fully prepared KEM protos for individual repo calls
 
-                # Timestamp handling (common for SQLite and Qdrant payload)
-                current_time_proto = Timestamp(); current_time_proto.GetCurrentTime()
-                final_created_at_proto = Timestamp()
-                is_new_kem_in_db_check_needed = True # Assume we need to check, can be optimized if client guarantees new IDs
+        kems_processed_for_qdrant_payload = {} # kem_id -> kem_proto_with_final_timestamps
 
-                # Check for Qdrant viability BEFORE adding to SQLite processing list if embeddings are present
-                if current_kem_to_process.embeddings:
-                    if not self.qdrant_client:
-                        logger.error(f"BatchStoreKEMs: Qdrant client not available. KEM ID '{kem_id}' (ref: {original_client_ref}) with embeddings cannot be stored.")
-                        failed_kem_references_list.append(original_client_ref)
-                        continue # Skip this KEM entirely, do not attempt SQLite persistence
+        for item in kems_to_process_internally:
+            kem_p = item['proto']
+            current_time = Timestamp(); current_time.GetCurrentTime()
+            final_created_at = Timestamp()
 
-                    if len(current_kem_to_process.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
-                        logger.error(f"BatchStoreKEMs: Invalid embedding dimension for KEM ID '{kem_id}' (ref: {original_client_ref}). Expected {self.config.DEFAULT_VECTOR_SIZE}, got {len(current_kem_to_process.embeddings)}.")
-                        failed_kem_references_list.append(original_client_ref) # Early fail for this KEM
-                        continue # Skip this KEM entirely
-
-                # If all checks passed (or no embeddings), add to SQLite processing list
-                kems_for_sqlite_processing.append({'proto': current_kem_to_process, 'original_ref': original_client_ref, 'final_created_at': final_created_at_proto, 'current_time': current_time_proto, 'is_new_check_needed': is_new_kem_in_db_check_needed})
-
-                # If it has embeddings (and passed checks), also add to Qdrant list
-                if current_kem_to_process.embeddings:
-                    # qdrant_payload construction is deferred until after SQLite success confirms final timestamps
-                    qdrant_points_to_upsert.append({'id': kem_id, 'vector': list(current_kem_to_process.embeddings),
-                                                    'payload_kem_proto_ref': current_kem_to_process, # Will be updated by SQLite step
-                                                    'original_ref': original_client_ref})
-
-            # Step 2: Batch persist to SQLite
-            processed_for_qdrant_kems_map = {} # kem_id -> KEM_proto (with final timestamps)
-
-            with self._get_sqlite_conn() as conn: # Single transaction for all SQLite operations
-                cursor = conn.cursor()
-
-                # Pre-fetch existing created_at timestamps for KEMs that have an ID
-                ids_to_check = [
-                    kem_data['proto'].id
-                    for kem_data in kems_for_sqlite_processing
-                    if kem_data['proto'].id and kem_data['is_new_check_needed']
-                ]
-                existing_kems_created_at_map: Dict[str, str] = {}
-                if ids_to_check:
-                    placeholders = ','.join('?' for _ in ids_to_check)
-                    cursor.execute(f"SELECT id, created_at FROM kems WHERE id IN ({placeholders})", tuple(ids_to_check))
-                    for row in cursor.fetchall():
-                        existing_kems_created_at_map[row[0]] = row[1]
-
-                logger.debug(f"BatchStoreKEMs: Pre-fetched created_at for {len(existing_kems_created_at_map)} existing KEMs.")
-
-                for kem_data_for_sqlite in kems_for_sqlite_processing:
-                    kem_proto = kem_data_for_sqlite['proto']
-                    original_ref = kem_data_for_sqlite['original_ref']
-                    final_created_at_proto_local = kem_data_for_sqlite['final_created_at'] # This is a Timestamp object
-                    current_time_proto_local = kem_data_for_sqlite['current_time']     # This is a Timestamp object
-
-                    try:
-                        kem_id_str = kem_proto.id # Should be populated at this point
-                        if kem_id_str in existing_kems_created_at_map:
-                            # KEM exists, use its stored created_at
-                            created_at_str_from_db = existing_kems_created_at_map[kem_id_str]
-                            final_created_at_proto_local.FromJsonString(created_at_str_from_db + ("Z" if not created_at_str_from_db.endswith("Z") else ""))
-                        else:
-                            # KEM is new or ID was generated server-side and thus not in existing_kems_created_at_map
-                            # Use client-provided created_at if valid, otherwise current_time
-                            if kem_proto.HasField("created_at") and kem_proto.created_at.seconds > 0:
-                                final_created_at_proto_local.CopyFrom(kem_proto.created_at)
-                            else:
-                                final_created_at_proto_local.CopyFrom(current_time_proto_local)
-
-                        kem_proto.created_at.CopyFrom(final_created_at_proto_local)
-                        kem_proto.updated_at.CopyFrom(current_time_proto_local) # updated_at is always current time for the batch op
-
-                        cursor.execute('''
-                        INSERT OR REPLACE INTO kems (id, content_type, content, metadata, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ''', (kem_proto.id, kem_proto.content_type,
-                              kem_proto.content, json.dumps(dict(kem_proto.metadata)),
-                      kem_proto.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
-                      kem_proto.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')))
-
-                        processed_for_qdrant_kems_map[kem_proto.id] = kem_proto # Mark as SQLite success
-                    except Exception as e_sqlite_item:
-                        logger.error(f"BatchStoreKEMs: SQLite error for KEM ID '{kem_proto.id}' (ref: {original_ref}): {e_sqlite_item}", exc_info=True)
-                        failed_kem_references_list.append(original_ref)
-                conn.commit() # Commit all successful SQLite operations
-
-            # Step 3: Prepare final Qdrant points for those that succeeded SQLite
-            final_qdrant_points_batch = []
-            kems_with_embeddings_that_succeeded_sqlite = []
-
-            for q_point_data in qdrant_points_to_upsert:
-                kem_id = q_point_data['id']
-                if kem_id in processed_for_qdrant_kems_map: # If SQLite part was successful
-                    kem_proto_for_payload = processed_for_qdrant_kems_map[kem_id]
-                    qdrant_payload = {"kem_id_ref": kem_id} # Rebuild payload with final timestamps
-                    if kem_proto_for_payload.metadata:
-                        for k, v_str in kem_proto_for_payload.metadata.items(): qdrant_payload[f"md_{k}"] = v_str
-                    if kem_proto_for_payload.HasField("created_at"): qdrant_payload["created_at_ts"] = kem_proto_for_payload.created_at.seconds
-                    if kem_proto_for_payload.HasField("updated_at"): qdrant_payload["updated_at_ts"] = kem_proto_for_payload.updated_at.seconds
-
-                    final_qdrant_points_batch.append(PointStruct(id=kem_id, vector=q_point_data['vector'], payload=qdrant_payload))
-                    kems_with_embeddings_that_succeeded_sqlite.append(kem_id) # Track for potential rollback
-                # If not in processed_for_qdrant_kems_map, it means its SQLite part failed, already in failed_kem_references_list.
-
-            # Step 4: Batch upsert to Qdrant
-            qdrant_batch_success = True
-            if final_qdrant_points_batch:
-                if not self.qdrant_client: # Should have been caught earlier per KEM, but as a safeguard for the batch
-                    logger.error("BatchStoreKEMs: Qdrant client not available for batch upsert.")
-                    qdrant_batch_success = False
-                else:
-                    try:
-                        logger.info(f"BatchStoreKEMs: Upserting {len(final_qdrant_points_batch)} points to Qdrant.")
-                        self.qdrant_client.upsert(
-                            collection_name=self.config.QDRANT_COLLECTION,
-                            points=final_qdrant_points_batch
-                        )
-                    except Exception as e_qdrant_batch:
-                        logger.error(f"BatchStoreKEMs: Qdrant batch upsert error: {e_qdrant_batch}", exc_info=True)
-                        qdrant_batch_success = False
-
-            # Step 5: Handle Qdrant failures: Rollback SQLite for affected KEMs
-            if not qdrant_batch_success and kems_with_embeddings_that_succeeded_sqlite:
-                logger.warning("BatchStoreKEMs: Qdrant batch upsert failed. Rolling back corresponding SQLite entries for KEMs with embeddings.")
+            if kem_p.id in existing_kems_timestamps_map:
+                db_ts_str = existing_kems_timestamps_map[kem_p.id]
                 try:
-                    with self._get_sqlite_conn() as conn_cleanup:
-                        cursor_cleanup = conn_cleanup.cursor()
-                        for kem_id_to_rollback in kems_with_embeddings_that_succeeded_sqlite:
-                            # Find original_ref for logging/failed_kem_references_list
-                            original_ref_to_fail = ""
-                            for q_point_data in qdrant_points_to_upsert: # Find it back from original list
-                                if q_point_data['id'] == kem_id_to_rollback:
-                                    original_ref_to_fail = q_point_data['original_ref']
-                                    break
+                    parse_ts = db_ts_str + ("Z" if not db_ts_str.endswith("Z") and '+' not in db_ts_str and '-' not in db_ts_str[10:] else "")
+                    final_created_at.FromJsonString(parse_ts)
+                except Exception: final_created_at.CopyFrom(current_time) # Fallback
+            elif kem_p.HasField("created_at") and kem_p.created_at.seconds > 0:
+                final_created_at.CopyFrom(kem_p.created_at)
+            else:
+                final_created_at.CopyFrom(current_time)
 
-                            if original_ref_to_fail not in failed_kem_references_list:
-                                failed_kem_references_list.append(original_ref_to_fail)
+            kem_p.created_at.CopyFrom(final_created_at)
+            kem_p.updated_at.CopyFrom(current_time)
 
-                            if kem_id_to_rollback in processed_for_qdrant_kems_map: # Should be
-                                del processed_for_qdrant_kems_map[kem_id_to_rollback] # Remove from successfully processed map
+            # Add to list for SQLite operation
+            # If SqliteKemRepository had a batch store method:
+            # kems_for_sqlite_batch_op.append( (kem_p.id, kem_p.content_type, ... ) )
+            # For now, we'll call store_or_replace_kem individually but track success/failure
+            kems_processed_for_qdrant_payload[kem_p.id] = kem_p # Store proto with final timestamps
 
-                            cursor_cleanup.execute("DELETE FROM kems WHERE id = ?", (kem_id_to_rollback,))
-                            logger.info(f"BatchStoreKEMs: SQLite record for KEM ID '{kem_id_to_rollback}' (ref: {original_ref_to_fail}) deleted due to Qdrant batch error.")
-                        conn_cleanup.commit()
-                except Exception as e_cleanup:
-                    logger.critical(f"BatchStoreKEMs: CRITICAL ERROR during SQLite rollback after Qdrant batch failure: {e_cleanup}")
+        # SQLite batch operation (simulated by loop for now)
+        successfully_stored_sqlite_ids = set()
+        for kem_id_sqlite, kem_proto_sqlite in kems_processed_for_qdrant_payload.items():
+            original_ref_sqlite = "" # Find original_ref
+            for item_orig in kems_to_process_internally:
+                if item_orig['proto'].id == kem_id_sqlite: original_ref_sqlite = item_orig['original_ref']; break
+            try:
+                self.sqlite_repo.store_or_replace_kem(
+                    kem_id=kem_proto_sqlite.id,
+                    content_type=kem_proto_sqlite.content_type,
+                    content=kem_proto_sqlite.content,
+                    metadata_json=json.dumps(dict(kem_proto_sqlite.metadata)),
+                    created_at_iso=kem_proto_sqlite.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
+                    updated_at_iso=kem_proto_sqlite.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
+                )
+                successfully_stored_sqlite_ids.add(kem_id_sqlite)
+            except Exception as e_bs_sql:
+                logger.error(f"BatchStoreKEMs: SQLite error for KEM ID '{kem_id_sqlite}' (ref: {original_ref_sqlite}): {e_bs_sql}", exc_info=True)
+                failed_kem_original_references.append(original_ref_sqlite)
 
-            # Step 6: Populate successfully_stored_kems_list
-            for kem_id, kem_proto in processed_for_qdrant_kems_map.items():
-                 # Check if it was part of qdrant_points_to_upsert, and if that batch failed for it
-                has_embeddings_for_this_kem = any(p['id'] == kem_id for p in qdrant_points_to_upsert)
+        # Prepare and execute Qdrant batch operation
+        qdrant_batch_points: List[PointStruct] = []
+        kems_for_qdrant_rollback_check = [] # KEM IDs that had embeddings and were sent to Qdrant
 
-                if has_embeddings_for_this_kem and not qdrant_batch_success:
-                    # This KEM had embeddings, and the Qdrant batch failed. It should have been rolled back from SQLite
-                    # and added to failed_kem_references_list. It should not be in successfully_stored_kems_list.
-                    # The del from processed_for_qdrant_kems_map during rollback handles this.
-                    pass
-                else: # Either no embeddings, or embeddings with successful Qdrant batch (or Qdrant not involved)
-                    successfully_stored_kems_list.append(kem_proto)
+        if self.qdrant_repo:
+            for kem_id_q, kem_p_q in kems_processed_for_qdrant_payload.items():
+                if kem_id_q not in successfully_stored_sqlite_ids: continue # Skip if SQLite op failed for this KEM
+                if kem_p_q.embeddings:
+                    q_payload = {"kem_id_ref": kem_id_q}
+                    if kem_p_q.metadata:
+                        for k, v in kem_p_q.metadata.items(): q_payload[f"md_{k}"] = v
+                    if kem_p_q.HasField("created_at"): q_payload["created_at_ts"] = kem_p_q.created_at.seconds
+                    if kem_p_q.HasField("updated_at"): q_payload["updated_at_ts"] = kem_p_q.updated_at.seconds
+                    qdrant_batch_points.append(PointStruct(id=kem_id_q, vector=list(kem_p_q.embeddings), payload=q_payload))
+                    kems_for_qdrant_rollback_check.append(kem_id_q)
 
-        logger.info(f"BatchStoreKEMs: Successfully processed {len(successfully_stored_kems_list)} KEMs overall. Failed references: {len(set(failed_kem_references_list))}.")
-        unique_failed_refs = list(set(failed_kem_references_list))
+            qdrant_op_ok = True
+            if qdrant_batch_points:
+                try:
+                    self.qdrant_repo.upsert_points_batch(qdrant_batch_points)
+                except Exception as e_q_batch_final:
+                    logger.error(f"BatchStoreKEMs: Qdrant batch upsert error: {e_q_batch_final}", exc_info=True)
+                    qdrant_op_ok = False
+
+            if not qdrant_op_ok: # Qdrant failed, rollback SQLite for these KEMs
+                logger.warning("BatchStoreKEMs: Qdrant batch op failed. Rolling back SQLite for KEMs in this Qdrant batch.")
+                for r_kem_id in kems_for_qdrant_rollback_check:
+                    original_ref_rb = "" # Find original_ref
+                    for item_orig_rb in kems_to_process_internally:
+                        if item_orig_rb['proto'].id == r_kem_id: original_ref_rb = item_orig_rb['original_ref']; break
+
+                    if original_ref_rb and original_ref_rb not in failed_kem_original_references:
+                        failed_kem_original_references.append(original_ref_rb)
+
+                    successfully_stored_sqlite_ids.discard(r_kem_id) # No longer successfully stored overall
+                    try:
+                        self.sqlite_repo.delete_kem_by_id(r_kem_id)
+                        logger.info(f"BatchStoreKEMs: Rolled back KEM ID '{r_kem_id}' from SQLite.")
+                    except Exception as e_rb_sql:
+                        logger.critical(f"BatchStoreKEMs: CRITICAL error during SQLite rollback for KEM '{r_kem_id}': {e_rb_sql}", exc_info=True)
+
+        # Populate final successful list
+        for final_id in successfully_stored_sqlite_ids:
+            if final_id in kems_processed_for_qdrant_payload: # Should always be true
+                 successfully_stored_kems_protos.append(kems_processed_for_qdrant_payload[final_id])
+
+        final_failed_refs = list(set(failed_kem_original_references))
         response = glm_service_pb2.BatchStoreKEMsResponse(
-            successfully_stored_kems=successfully_stored_kems_list,
-            failed_kem_references=unique_failed_refs
+            successfully_stored_kems=successfully_stored_kems_protos,
+            failed_kem_references=final_failed_refs
         )
-        if response.failed_kem_references:
-            response.overall_error_message = f"Failed to fully store {len(response.failed_kem_references)} KEMs from the batch."
-        elif not request.kems and not successfully_stored_kems_list:
+        if final_failed_refs:
+            response.overall_error_message = f"Failed to fully store {len(final_failed_refs)} KEMs from the batch."
+        elif not request.kems and not successfully_stored_kems_protos:
             response.overall_error_message = "Received an empty list of KEMs to store."
 
+        logger.info(f"BatchStoreKEMs: Processed. Success: {len(successfully_stored_kems_protos)}, Failures: {len(final_failed_refs)}.")
         return response
 
 def serve():
-    logger.info(f"GLM Configuration: Qdrant={config.QDRANT_HOST}:{config.QDRANT_PORT} (Collection: '{config.QDRANT_COLLECTION}'), "
-                f"SQLite DB={os.path.join(app_dir, config.DB_FILENAME)}, gRPC Address={config.GRPC_LISTEN_ADDRESS}, LogLevel={config.LOG_LEVEL}")
-    try:
-        # Test Qdrant connection early
-        client_test = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT, timeout=2)
-        client_test.get_collections() # A simple call to check connectivity
-        logger.info(f"Qdrant is available at {config.QDRANT_HOST}:{config.QDRANT_PORT}.")
-    except Exception as e:
-        logger.critical(f"CRITICAL ERROR: Qdrant is unavailable at {config.QDRANT_HOST}:{config.QDRANT_PORT}. Details: {e}. Server NOT STARTED.")
-        return
-
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    try:
-        servicer_instance = GlobalLongTermMemoryServicerImpl()
-    except Exception as e: # Catch any exception during servicer initialization
-        logger.critical(f"CRITICAL ERROR initializing GlobalLongTermMemoryServicerImpl: {e}", exc_info=True)
-        return
-
-    glm_service_pb2_grpc.add_GlobalLongTermMemoryServicer_to_server(servicer_instance, server)
-    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting GLM server on {config.GRPC_LISTEN_ADDRESS}...")
-    server.start()
-    logger.info(f"GLM server started and listening on {config.GRPC_LISTEN_ADDRESS}.")
-
-    try:
-        server.wait_for_termination()
-    except KeyboardInterrupt:
-        logger.info("GLM server stopping via KeyboardInterrupt...")
-    finally:
-        server.stop(grace=5) # Allow 5 seconds for ongoing RPCs to complete
-        logger.info("GLM server stopped.")
-
-if __name__ == '__main__':
-    serve()
+>>>>>>> REPLACE
