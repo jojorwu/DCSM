@@ -646,33 +646,48 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                                                     'original_ref': original_client_ref})
 
             # Step 2: Batch persist to SQLite
-            # This needs to be done carefully to associate failures with original KEMs
-            # and to update KEM protos with correct created_at for Qdrant payload.
-
             processed_for_qdrant_kems_map = {} # kem_id -> KEM_proto (with final timestamps)
-                                            # This map will also indicate which KEMs successfully passed SQLite stage.
 
             with self._get_sqlite_conn() as conn: # Single transaction for all SQLite operations
                 cursor = conn.cursor()
+
+                # Pre-fetch existing created_at timestamps for KEMs that have an ID
+                ids_to_check = [
+                    kem_data['proto'].id
+                    for kem_data in kems_for_sqlite_processing
+                    if kem_data['proto'].id and kem_data['is_new_check_needed']
+                ]
+                existing_kems_created_at_map: Dict[str, str] = {}
+                if ids_to_check:
+                    placeholders = ','.join('?' for _ in ids_to_check)
+                    cursor.execute(f"SELECT id, created_at FROM kems WHERE id IN ({placeholders})", tuple(ids_to_check))
+                    for row in cursor.fetchall():
+                        existing_kems_created_at_map[row[0]] = row[1]
+
+                logger.debug(f"BatchStoreKEMs: Pre-fetched created_at for {len(existing_kems_created_at_map)} existing KEMs.")
+
                 for kem_data_for_sqlite in kems_for_sqlite_processing:
                     kem_proto = kem_data_for_sqlite['proto']
                     original_ref = kem_data_for_sqlite['original_ref']
-                    final_created_at_proto_local = kem_data_for_sqlite['final_created_at']
-                    current_time_proto_local = kem_data_for_sqlite['current_time']
+                    final_created_at_proto_local = kem_data_for_sqlite['final_created_at'] # This is a Timestamp object
+                    current_time_proto_local = kem_data_for_sqlite['current_time']     # This is a Timestamp object
 
                     try:
-                        if kem_data_for_sqlite['is_new_check_needed']:
-                            cursor.execute("SELECT created_at FROM kems WHERE id = ?", (kem_proto.id,))
-                            existing_row = cursor.fetchone()
-                            if existing_row:
-                                final_created_at_proto_local.FromJsonString(existing_row[0] + ("Z" if not existing_row[0].endswith("Z") else ""))
-                            else: # Is new
-                                final_created_at_proto_local.CopyFrom(kem_proto.created_at if kem_proto.HasField("created_at") and kem_proto.created_at.seconds > 0 else current_time_proto_local)
-                        else: # Assume new if check_needed is false
-                             final_created_at_proto_local.CopyFrom(kem_proto.created_at if kem_proto.HasField("created_at") and kem_proto.created_at.seconds > 0 else current_time_proto_local)
+                        kem_id_str = kem_proto.id # Should be populated at this point
+                        if kem_id_str in existing_kems_created_at_map:
+                            # KEM exists, use its stored created_at
+                            created_at_str_from_db = existing_kems_created_at_map[kem_id_str]
+                            final_created_at_proto_local.FromJsonString(created_at_str_from_db + ("Z" if not created_at_str_from_db.endswith("Z") else ""))
+                        else:
+                            # KEM is new or ID was generated server-side and thus not in existing_kems_created_at_map
+                            # Use client-provided created_at if valid, otherwise current_time
+                            if kem_proto.HasField("created_at") and kem_proto.created_at.seconds > 0:
+                                final_created_at_proto_local.CopyFrom(kem_proto.created_at)
+                            else:
+                                final_created_at_proto_local.CopyFrom(current_time_proto_local)
 
                         kem_proto.created_at.CopyFrom(final_created_at_proto_local)
-                        kem_proto.updated_at.CopyFrom(current_time_proto_local)
+                        kem_proto.updated_at.CopyFrom(current_time_proto_local) # updated_at is always current time for the batch op
 
                         cursor.execute('''
                         INSERT OR REPLACE INTO kems (id, content_type, content, metadata, created_at, updated_at)

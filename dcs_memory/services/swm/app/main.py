@@ -1,3 +1,4 @@
+import grpc
 import grpc.aio as grpc_aio
 import asyncio
 import time
@@ -7,6 +8,7 @@ import uuid
 import logging
 import threading
 import asyncio # asyncio was imported twice, removing one
+import random # For jitter in retry logic
 # import queue as sync_queue # Unused
 
 from dataclasses import dataclass, field # field is now imported
@@ -120,12 +122,17 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         logger.setLevel(self.config.get_log_level_int()) # Set logger level from this instance's config
 
         logger.info(f"Initializing SharedWorkingMemoryServiceImpl... Cache size: {self.config.CACHE_MAX_SIZE}, Indexed keys: {self.config.INDEXED_METADATA_KEYS}")
-        # self.glm_channel: Optional[grpc_aio.Channel] = None # This async channel was unused
-        self.glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None # This is for the sync stub
 
-        self.retry_max_attempts = self.config.GLM_RETRY_MAX_ATTEMPTS
-        self.retry_initial_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
-        self.retry_backoff_factor = self.config.GLM_RETRY_BACKOFF_FACTOR
+        self.aio_glm_channel: Optional[grpc_aio.Channel] = None
+        self.aio_glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None
+
+        # Retry parameters will be taken from self.config directly in the methods
+        self.retryable_error_codes = (
+            grpc.StatusCode.UNAVAILABLE,
+            grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc.StatusCode.INTERNAL,
+            grpc.StatusCode.RESOURCE_EXHAUSTED
+        )
 
         self.subscribers_lock = asyncio.Lock()
         self.swm_cache = IndexedLRUCache(
@@ -144,12 +151,21 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         self.general_kem_event_subscribers: Set[str] = set()
 
         try:
-            self.sync_glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS) # Use self.config
-            self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.sync_glm_channel)
-            logger.info(f"GLM client (sync) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}")
+            # Initialize asynchronous GLM client
+            self.aio_glm_channel = grpc_aio.insecure_channel(self.config.GLM_SERVICE_ADDRESS)
+            self.aio_glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.aio_glm_channel)
+            logger.info(f"GLM client (async) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}")
         except Exception as e:
-            logger.error(f"Error initializing synchronous GLM client in SWM: {e}")
-            self.glm_stub = None
+            logger.error(f"Error initializing asynchronous GLM client in SWM: {e}", exc_info=True)
+            self.aio_glm_stub = None
+            if self.aio_glm_channel:
+                try:
+                    # This is problematic in a non-async __init__.
+                    # The channel should ideally be closed in an async cleanup method.
+                    # For now, just log and it will be handled in stop_background_tasks.
+                    logger.warning("SWM: GLM async channel was created but stub initialization failed. Channel will be closed on shutdown.")
+                except Exception as close_e:
+                    logger.error(f"SWM: Exception while trying to handle GLM channel close during __init__ failure: {close_e}", exc_info=True)
 
     async def start_background_tasks(self):
         if self._lock_cleanup_task is None or self._lock_cleanup_task.done():
@@ -163,6 +179,15 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             except asyncio.TimeoutError: logger.warning("SWM: Expired lock cleanup task did not finish in time.")
             except asyncio.CancelledError: logger.info("SWM: Expired lock cleanup task was cancelled.")
         self._lock_cleanup_task = None
+
+        if self.aio_glm_channel:
+            logger.info("SWM: Closing GLM client (async) channel.")
+            try:
+                await self.aio_glm_channel.close()
+            except Exception as e:
+                logger.error(f"SWM: Error closing GLM async channel: {e}", exc_info=True)
+            self.aio_glm_channel = None
+            self.aio_glm_stub = None
 
     async def _expired_lock_cleanup_task_async(self):
         logger.info("SWM: Async expired lock cleanup task started.")
@@ -186,12 +211,82 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         logger.info("SWM: Async expired lock cleanup task stopped.")
 
     async def _glm_retrieve_kems_async(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int = 20) -> glm_service_pb2.RetrieveKEMsResponse:
-        if not self.glm_stub: raise grpc_aio.AioRpcError(grpc_aio.StatusCode.INTERNAL, "GLM client not available") # type: ignore
-        return await asyncio.to_thread(self.glm_stub.RetrieveKEMs, request, timeout=timeout)
+        if not self.aio_glm_stub:
+            logger.error("SWM: GLM async client not available for RetrieveKEMs.")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM client not available")
+
+        current_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
+        for attempt in range(1, self.config.GLM_RETRY_MAX_ATTEMPTS + 1):
+            try:
+                logger.debug(f"Attempt {attempt} to call GLM RetrieveKEMs (async).")
+                return await self.aio_glm_stub.RetrieveKEMs(request, timeout=timeout)
+            except grpc_aio.AioRpcError as e:
+                if e.code() in self.retryable_error_codes:
+                    if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS:
+                        logger.error(f"GLM call RetrieveKEMs failed after {self.config.GLM_RETRY_MAX_ATTEMPTS} attempts. Last error: {e.code()} - {e.details()}", exc_info=False)
+                        raise
+
+                    jitter_fraction = 0.1
+                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
+                    actual_delay_s = max(0, current_delay_s + jitter_value)
+
+                    logger.warning(f"GLM call RetrieveKEMs failed (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}) with status {e.code()}. Retrying in {actual_delay_s:.2f}s. Details: {e.details()}", exc_info=False)
+                    await asyncio.sleep(actual_delay_s)
+                    current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
+                else:
+                    logger.error(f"GLM call RetrieveKEMs failed with non-retryable status {e.code()}. Details: {e.details()}", exc_info=True)
+                    raise
+            except Exception as e_generic:
+                logger.error(f"A non-gRPC error occurred during GLM call RetrieveKEMs (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}): {e_generic}", exc_info=True)
+                if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS: raise
+                jitter_fraction = 0.1
+                jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
+                actual_delay_s = max(0, current_delay_s + jitter_value)
+                logger.info(f"Retrying GLM RetrieveKEMs after non-gRPC error in {actual_delay_s:.2f}s.")
+                await asyncio.sleep(actual_delay_s)
+                current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
+        logger.error("GLM RetrieveKEMs exhausted attempts unexpectedly without raising an error.")
+        raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM RetrieveKEMs exhausted attempts unexpectedly.")
+
 
     async def _glm_store_kem_async(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
-        if not self.glm_stub: raise grpc_aio.AioRpcError(grpc_aio.StatusCode.INTERNAL, "GLM client not available") # type: ignore
-        return await asyncio.to_thread(self.glm_stub.StoreKEM, request, timeout=timeout)
+        if not self.aio_glm_stub:
+            logger.error("SWM: GLM async client not available for StoreKEM.")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM client not available")
+
+        current_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
+        for attempt in range(1, self.config.GLM_RETRY_MAX_ATTEMPTS + 1):
+            try:
+                logger.debug(f"Attempt {attempt} to call GLM StoreKEM (async).")
+                return await self.aio_glm_stub.StoreKEM(request, timeout=timeout)
+            except grpc_aio.AioRpcError as e:
+                if e.code() in self.retryable_error_codes:
+                    if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS:
+                        logger.error(f"GLM call StoreKEM failed after {self.config.GLM_RETRY_MAX_ATTEMPTS} attempts. Last error: {e.code()} - {e.details()}", exc_info=False)
+                        raise
+
+                    jitter_fraction = 0.1
+                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
+                    actual_delay_s = max(0, current_delay_s + jitter_value)
+
+                    logger.warning(f"GLM call StoreKEM failed (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}) with status {e.code()}. Retrying in {actual_delay_s:.2f}s. Details: {e.details()}", exc_info=False)
+                    await asyncio.sleep(actual_delay_s)
+                    current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
+                else:
+                    logger.error(f"GLM call StoreKEM failed with non-retryable status {e.code()}. Details: {e.details()}", exc_info=True)
+                    raise
+            except Exception as e_generic:
+                logger.error(f"A non-gRPC error occurred during GLM call StoreKEM (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}): {e_generic}", exc_info=True)
+                if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS: raise
+                jitter_fraction = 0.1
+                jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
+                actual_delay_s = max(0, current_delay_s + jitter_value)
+                logger.info(f"Retrying GLM StoreKEM after non-gRPC error in {actual_delay_s:.2f}s.")
+                await asyncio.sleep(actual_delay_s)
+                current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
+        logger.error("GLM StoreKEM exhausted attempts unexpectedly without raising an error.")
+        raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM StoreKEM exhausted attempts unexpectedly.")
+
 
     def _handle_kem_eviction_sync(self, evicted_kem: kem_pb2.KEM):
         if evicted_kem: logger.info(f"SWM: KEM ID '{evicted_kem.id}' evicted. Scheduling notification.");
