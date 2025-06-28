@@ -280,17 +280,13 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         ag_id = request.agent_id
         sub_id = ag_id or str(uuid.uuid4())
 
-        # Determine queue size
-        # TODO: Make these min/max/default queue sizes configurable in SWMConfig
-        DEFAULT_Q_SIZE = 100
-        MIN_Q_SIZE = 10
-        MAX_Q_SIZE = 1000
-
+        # Determine queue size using values from SWMConfig
         requested_q_size = request.requested_queue_size
         if requested_q_size <= 0:
-            actual_q_size = DEFAULT_Q_SIZE
+            actual_q_size = self.config.SWM_SUBSCRIBER_DEFAULT_QUEUE_SIZE
         else:
-            actual_q_size = max(MIN_Q_SIZE, min(requested_q_size, MAX_Q_SIZE))
+            actual_q_size = max(self.config.SWM_SUBSCRIBER_MIN_QUEUE_SIZE,
+                                min(requested_q_size, self.config.SWM_SUBSCRIBER_MAX_QUEUE_SIZE))
 
         logger.info(f"SWM: New subscriber '{sub_id}' (agent_id: '{ag_id}'). Requested Q size: {requested_q_size}, Actual Q size: {actual_q_size}. Topics: {request.topics}")
         q = asyncio.Queue(maxsize=actual_q_size)
