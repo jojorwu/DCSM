@@ -30,7 +30,6 @@ class SWMClient:
         self.retry_initial_delay_s = retry_initial_delay_s
         self.retry_backoff_factor = retry_backoff_factor
         self.retry_jitter_fraction = retry_jitter_fraction
-        # logger.info(f"SWMClient initialized for {self.server_address}")
 
     def connect(self):
         if not self.channel:
