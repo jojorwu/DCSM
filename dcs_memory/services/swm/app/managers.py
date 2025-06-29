@@ -31,11 +31,26 @@ class SubscriptionManager:
         self.subscribers_lock = asyncio.Lock()
         self.subscribers: Dict[str, SubscriberInfoInternal] = {}
 
-        # Indexes for dispatching KEM events
-        self.kem_id_to_subscribers: Dict[str, Set[str]] = {}
-        self.metadata_exact_match_to_subscribers: Dict[str, Dict[str, Set[str]]] = {} # meta_key -> meta_value -> set(sub_id)
-        self.general_kem_event_subscribers: Set[str] = set() # Subs to all KEM lifecycle events
-        logger.info("SubscriptionManager initialized.")
+        # Modified index structures to support event type filtering per filter criteria.
+        # For a specific filter (e.g., kem_id="X" or metadata.key="Y"), store which event types the subscriber wants.
+        # If desired_event_types is empty for a filter, it means all event types for that filter.
+        # Map: filter_key (e.g. "kem_id:X") -> subscriber_id -> Set[EventType] (empty set means all types)
+        self.specific_filters_to_subscribers: Dict[str, Dict[str, Set[swm_service_pb2.SWMMemoryEvent.EventType]]] = {}
+
+        # For subscribers to ALL KEM_LIFECYCLE_EVENTS (no specific filter_criteria or empty filter_criteria)
+        # Map: subscriber_id -> Set[EventType] (empty set means all types for "all KEMs")
+        self.general_kem_lifecycle_subscribers: Dict[str, Set[swm_service_pb2.SWMMemoryEvent.EventType]] = {}
+        logger.info("SubscriptionManager initialized with new index structures for event type filtering.")
+
+    def _parse_filter_key(self, key_from_criteria: str, value_from_criteria: str) -> Optional[str]:
+        """Helper to create a unique key for specific_filters_to_subscribers map."""
+        if key_from_criteria == "kem_id":
+            return f"kem_id:{value_from_criteria}"
+        elif key_from_criteria.startswith("metadata."):
+            actual_meta_key = key_from_criteria.split("metadata.", 1)[1]
+            if actual_meta_key:
+                return f"metadata:{actual_meta_key}:{value_from_criteria}"
+        return None
 
     async def add_subscriber(self, subscriber_id: str, topics: List[swm_service_pb2.SubscriptionTopic], requested_q_size: int) -> asyncio.Queue:
         actual_q_size = max(self.config.SUBSCRIBER_MIN_QUEUE_SIZE,
@@ -44,38 +59,49 @@ class SubscriptionManager:
         event_queue = asyncio.Queue(maxsize=actual_q_size)
 
         parsed_filters: Dict[str, Set[str]] = {}
-        sub_all_kem = False
+        sub_all_kem = False # Default: not subscribed to all KEM events
 
-        # Determine if this subscription is for all KEM lifecycle events or specific ones
-        # This logic is moved from the SWM servicer's SubscribeToSWMEvents method
-        has_any_kem_lifecycle_topic = any(t.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS for t in topics)
+        has_at_least_one_kem_topic_with_filter = False
 
-        if not topics and has_any_kem_lifecycle_topic: # Should not happen if topics is empty
-             sub_all_kem = True # Or if only KEM_LIFECYCLE_EVENTS topic type without filter_criteria
-        elif topics:
-            has_specific_kem_filter = False
-            has_general_kem_topic_without_filter = False
-
+        if not topics: # No topics provided at all
+            # If the default behavior for an empty topic list for KEM_LIFECYCLE_EVENTS
+            # (if such a concept exists implicitly) means "subscribe to all", this needs to be handled.
+            # For now, no topics means no KEM subscriptions.
+            pass
+        else:
             for topic in topics:
                 if topic.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS:
-                    if not topic.filter_criteria:
-                        has_general_kem_topic_without_filter = True
-                        break # This implies subscription to all KEM events
+                    if not topic.filter_criteria or topic.filter_criteria.strip() == "":
+                        # Explicit subscription to all KEM events via empty filter on KEM_LIFECYCLE_EVENTS topic
+                        sub_all_kem = True
+                        parsed_filters.clear() # No specific filters needed if subscribed to all
+                        break # Found "subscribe to all" condition
 
                     # Parse filter_criteria (simple key=value for now)
                     if '=' in topic.filter_criteria:
                         key, value = topic.filter_criteria.split("=", 1)
                         key = key.strip()
                         value = value.strip()
-                        parsed_filters.setdefault(key, set()).add(value)
-                        if key == "kem_id" or (key.startswith("metadata.") and key.split("metadata.",1)[1]):
-                             has_specific_kem_filter = True
+                        if key and value: # Ensure key and value are not empty after strip
+                            parsed_filters.setdefault(key, set()).add(value)
+                            if key == "kem_id" or (key.startswith("metadata.") and key.split("metadata.",1)[1]):
+                                has_at_least_one_kem_topic_with_filter = True
+                        else:
+                            logger.warning(f"SubscriptionManager: Malformed filter_criteria '{topic.filter_criteria}' for subscriber '{subscriber_id}'. Skipped.")
+                    else:
+                        logger.warning(f"SubscriptionManager: Unparseable filter_criteria '{topic.filter_criteria}' (no '=') for subscriber '{subscriber_id}'. Skipped.")
 
-            if has_general_kem_topic_without_filter:
-                sub_all_kem = True
-            elif has_any_kem_lifecycle_topic and not has_specific_kem_filter : # Has KEM topics, but no specific kem_id/metadata filters parsed
-                sub_all_kem = True # Treat as subscribe to all if filters are not specific enough for indexing
-            # If only specific filters, sub_all_kem remains False
+            if not sub_all_kem and not has_at_least_one_kem_topic_with_filter and \
+               any(t.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS for t in topics):
+                # This case means there were KEM_LIFECYCLE_EVENTS topics, but none had valid specific filters,
+                # and none were an explicit "subscribe to all" (empty filter).
+                # Defaulting to "subscribe to all" in this ambiguous case might be too broad.
+                # Let's make it so that if there are KEM topics but no valid filters, it's NOT a sub_all_kem.
+                # It means they might have provided malformed filters.
+                # If the intent was to subscribe to all, filter_criteria should be empty.
+                # Thus, sub_all_kem remains False unless explicitly set by an empty filter_criteria.
+                pass
+
 
         sub_info = SubscriberInfoInternal(
             event_queue=event_queue,
@@ -94,8 +120,7 @@ class SubscriptionManager:
             if sub_info.subscribes_to_all_kem_lifecycle:
                 self.general_kem_event_subscribers.add(subscriber_id)
                 logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' added to general KEM event subscribers.")
-            else:
-                # Update specific filter indexes only if not subscribing to all
+            elif parsed_filters: # Only add to specific indexes if not sub_all_kem and there are parsed_filters
                 for key, values in parsed_filters.items():
                     if key == "kem_id":
                         for value in values:
@@ -108,7 +133,7 @@ class SubscriptionManager:
                             for value in values:
                                 meta_key_index.setdefault(value, set()).add(subscriber_id)
                                 logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' indexed for metadata.{actual_meta_key}='{value}'.")
-
+            # If not sub_all_kem and no valid parsed_filters for KEMs, they won't receive KEM events.
             logger.info(f"SubscriptionManager: Subscriber '{subscriber_id}' added/updated. Total subscribers: {len(self.subscribers)}. General KEM subs: {len(self.general_kem_event_subscribers)}.")
         return event_queue
 

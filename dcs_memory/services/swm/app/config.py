@@ -72,6 +72,10 @@ class SWMConfig(BaseServiceConfig):
         default=10.0,
         description="Maximum interval in seconds to wait before flushing the persistence queue to GLM, even if batch size is not reached."
     )
+    GLM_PERSISTENCE_BATCH_MAX_RETRIES: int = Field(
+        default=3,
+        description="Maximum number of retry attempts for a batch that failed to persist to GLM."
+    )
 
 if __name__ == '__main__':
     print("--- Тестирование SWMConfig ---")
