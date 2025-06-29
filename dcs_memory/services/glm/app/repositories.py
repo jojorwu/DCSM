@@ -194,6 +194,51 @@ class SqliteKemRepository:
 
         return found_kems_list, next_page_token_str
 
+    def batch_store_or_replace_kems(self, kems_data: List[Dict[str, Any]]):
+        """
+        Stores or replaces a batch of KEM records in a single transaction.
+        Each dict in kems_data should contain: 'id', 'content_type', 'content',
+        'metadata_json', 'created_at_iso', 'updated_at_iso'.
+        """
+        if not kems_data:
+            return
+
+        sql = '''
+            INSERT OR REPLACE INTO kems (id, content_type, content, metadata, created_at, updated_at)
+            VALUES (:id, :content_type, :content, :metadata_json, :created_at_iso, :updated_at_iso)
+        '''
+        # executemany expects a list of tuples/dicts matching the placeholders.
+        # We need to ensure the keys in our dicts match the named placeholders.
+
+        # For simplicity and direct control, iterate and execute, but all within one transaction.
+        # executemany with INSERT OR REPLACE is fine.
+
+        params_list = []
+        for kem_d in kems_data:
+            params_list.append({
+                "id": kem_d['id'],
+                "content_type": kem_d['content_type'],
+                "content": kem_d['content'],
+                "metadata_json": kem_d['metadata_json'],
+                "created_at_iso": kem_d['created_at_iso'],
+                "updated_at_iso": kem_d['updated_at_iso'],
+            })
+
+        with self._get_sqlite_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                # It's generally better to execute individual statements in a loop
+                # if you need fine-grained error handling per item, but for batch
+                # INSERT OR REPLACE, executemany is more concise if errors are handled for the whole batch.
+                # If one fails, the transaction will be rolled back by the 'with' statement if an exception propagates.
+                cursor.executemany(sql, params_list)
+                conn.commit()
+                logger.debug(f"Repository: Batch of {len(kems_data)} KEMs stored/replaced in SQLite.")
+            except sqlite3.Error as e_batch:
+                logger.error(f"Repository: SQLite error during batch store/replace: {e_batch}", exc_info=True)
+                # conn.rollback() # Handled by 'with' statement context exit on error
+                raise # Re-raise to allow servicer to handle it
+
 
 class QdrantKemRepository:
     def __init__(self, qdrant_client: QdrantClient, collection_name: str, default_vector_size: int):

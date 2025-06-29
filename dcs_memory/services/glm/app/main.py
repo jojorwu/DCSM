@@ -36,10 +36,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # --- End of logging setup ---
 
-# service_root_dir = os.path.dirname(app_dir) # No longer needed for sys.path manipulation here
-# if service_root_dir not in sys.path:
-#     sys.path.insert(0, service_root_dir)
-
 from generated_grpc import kem_pb2
 from generated_grpc import glm_service_pb2
 from generated_grpc import glm_service_pb2_grpc
@@ -79,8 +75,6 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
     def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
         kem_data_copy = kem_data.copy()
-        # CRITICAL FIX: Do not delete Timestamp objects if they are already Timestamp protos.
-        # ParseDict handles string ISO timestamps and proto Timestamps.
         if 'content' in kem_data_copy and isinstance(kem_data_copy['content'], str):
              kem_data_copy['content'] = kem_data_copy['content'].encode('utf-8')
         return ParseDict(kem_data_copy, kem_pb2.KEM(), ignore_unknown_fields=True)
@@ -112,9 +106,9 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 except Exception as e_ts_parse:
                      logger.warning(f"Failed to parse timestamp string '{ts_str}' (tried as '{ts_str_for_parse}') for field '{ts_field_name}' in KEM ID {kem_db_dict.get('id')}: {e_ts_parse}", exc_info=True)
                      if ts_field_name in kem_dict_for_proto: del kem_dict_for_proto[ts_field_name]
-            elif isinstance(ts_str, Timestamp): # Already a Timestamp from a previous conversion
+            elif isinstance(ts_str, Timestamp):
                  pass
-            else: # Not a string or None/empty
+            else:
                  if ts_field_name in kem_dict_for_proto: del kem_dict_for_proto[ts_field_name]
 
         if embeddings_map and kem_dict_for_proto.get('id') in embeddings_map:
@@ -152,7 +146,6 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         kem.created_at.CopyFrom(final_created_at_proto)
         kem.updated_at.CopyFrom(current_time_proto)
 
-        # Qdrant operation first (if applicable)
         if self.qdrant_repo and kem.embeddings:
             if len(kem.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
                 msg = f"Embedding dimension ({len(kem.embeddings)}) does not match Qdrant config ({self.config.DEFAULT_VECTOR_SIZE})."
@@ -186,10 +179,6 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         except Exception as e_sqlite:
             msg = f"StoreKEM: SQLite error for ID '{kem_id}': {e_sqlite}"
             logger.error(msg, exc_info=True)
-            # Potential inconsistency: Qdrant write passed, SQLite failed.
-            # For a robust system, a compensating action (delete from Qdrant) might be needed here.
-            # This is complex and depends on retry policies for Qdrant as well.
-            # Current behavior: Qdrant might have the point, SQLite does not.
             context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
 
         logger.info(f"KEM ID '{kem_id}' successfully saved/updated.")
@@ -243,16 +232,10 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 q_ids = [hit.id for hit in search_hits]
                 embed_map = {hit.id: list(hit.vector) for hit in search_hits if hit.vector}
 
-                # Fetch from SQLite, preserving Qdrant's order via INSTR in repo or manual sort here
-                # The SqliteKemRepository.retrieve_kems_from_db was modified to accept order_by_clause
                 ordered_instr_clause = f"ORDER BY INSTR('," + ",".join(q_ids) + ",', ',' || id || ',')"
-
-                db_kems_dicts, _ = self.sqlite_repo.retrieve_kems_from_db( # next_token from this call is not used for Qdrant primary search
-                    sql_conditions=[f"id IN ({','.join('?' for _ in q_ids)})"],
-                    sql_params=q_ids,
-                    page_size=len(q_ids), # Fetch all
-                    offset=0,
-                    order_by_clause=ordered_instr_clause
+                db_kems_dicts, _ = self.sqlite_repo.retrieve_kems_from_db(
+                    sql_conditions=[f"id IN ({','.join('?' for _ in q_ids)})"], sql_params=q_ids,
+                    page_size=len(q_ids), offset=0, order_by_clause=ordered_instr_clause
                 )
                 for db_dict in db_kems_dicts:
                     found_kems_proto_list.append(self._kem_from_db_dict(db_dict, embed_map))
@@ -281,7 +264,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             try:
                 db_kems_dicts, next_page_token_str = self.sqlite_repo.retrieve_kems_from_db(
                     sql_conditions=sql_conds, sql_params=sql_pars,
-                    page_size=page_size, offset=offset # Uses default ordering by updated_at DESC from repo
+                    page_size=page_size, offset=offset
                 )
 
                 ids_from_page = [d['id'] for d in db_kems_dicts]
@@ -316,18 +299,16 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
         ts_now_proto = Timestamp(); ts_now_proto.GetCurrentTime()
 
-        # Prepare Qdrant payload first, as Qdrant op is before SQLite commit
         qdrant_payload_update = {"kem_id_ref": kem_id}
         current_metadata = json.loads(kem_current_db_dict.get('metadata', '{}'))
         metadata_for_qdrant = current_metadata.copy()
-        if kem_data_update.metadata: # If metadata is in update, it replaces for Qdrant payload
+        if kem_data_update.metadata:
             metadata_for_qdrant = dict(kem_data_update.metadata)
 
-        for k, v in metadata_for_qdrant.items(): qdrant_payload_update[f"md_{k}"] = str(v) # Ensure string values for Qdrant typical use
+        for k, v in metadata_for_qdrant.items(): qdrant_payload_update[f"md_{k}"] = str(v)
 
         try:
             created_at_ts_q = Timestamp()
-            # Use original created_at from DB for Qdrant ts field
             original_created_at_iso = kem_current_db_dict['created_at']
             parse_str_q_creat = original_created_at_iso + ("Z" if not original_created_at_iso.endswith("Z") and '+' not in original_created_at_iso and '-' not in original_created_at_iso[10:] else "")
             created_at_ts_q.FromJsonString(parse_str_q_creat)
@@ -336,7 +317,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             logger.warning(f"UpdateKEM: Failed to parse original_created_at_iso for Qdrant payload: {e_ts_upd_q}", exc_info=True)
         qdrant_payload_update["updated_at_ts"] = ts_now_proto.seconds
 
-        final_embeddings_for_resp = [] # To store what embeddings should be in the response
+        final_embeddings_for_resp = []
 
         if self.qdrant_repo:
             try:
@@ -349,9 +330,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     q_point_to_upsert = PointStruct(id=kem_id, vector=new_embeds, payload=qdrant_payload_update)
                     final_embeddings_for_resp = new_embeds
                     logger.info(f"UpdateKEM: Qdrant: Updating vector and payload for KEM ID '{kem_id}'.")
-                else: # No embeddings in update, preserve existing vector if any, just update payload
-                    # To preserve vector, we must provide it in the upsert, or use a specific set_payload.
-                    # QdrantKemRepository doesn't have set_payload, so we retrieve existing vector.
+                else:
                     existing_q_points = self.qdrant_repo.retrieve_points_by_ids([kem_id], with_vectors=True)
                     existing_vec = None
                     if existing_q_points and existing_q_points[0].vector:
@@ -366,7 +345,6 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 logger.error(msg, exc_info=True)
                 context.abort(grpc.StatusCode.INTERNAL, msg); return kem_pb2.KEM()
 
-        # Prepare fields for SQLite update
         sqlite_updated_at_iso = ts_now_proto.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
         sqlite_content_type = kem_data_update.content_type if kem_data_update.HasField("content_type") else None
         sqlite_content = kem_data_update.content.value if kem_data_update.HasField("content") else None
@@ -381,16 +359,13 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         except Exception as e_sql_upd:
             msg = f"UpdateKEM: SQLite error for ID '{kem_id}': {e_sql_upd}"
             logger.error(msg, exc_info=True)
-            # TODO: Qdrant succeeded, SQLite failed. Rollback Qdrant? (e.g. restore previous payload/vector)
             context.abort(grpc.StatusCode.INTERNAL, msg); return kem_pb2.KEM()
 
-        # Construct response KEM from potentially updated DB state
         final_kem_db_dict_resp = self.sqlite_repo.get_full_kem_by_id(kem_id)
         if not final_kem_db_dict_resp:
             logger.error(f"UpdateKEM: KEM ID '{kem_id}' disappeared from DB after update for response.")
             context.abort(grpc.StatusCode.INTERNAL, "KEM disappeared post-update."); return kem_pb2.KEM()
 
-        # final_embeddings_for_resp is already set based on Qdrant logic
         return self._kem_from_db_dict(final_kem_db_dict_resp, {kem_id: final_embeddings_for_resp} if final_embeddings_for_resp else None)
 
     def DeleteKEM(self, request: glm_service_pb2.DeleteKEMRequest, context) -> empty_pb2.Empty:
@@ -415,7 +390,6 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         except Exception as e_sql_del:
             msg = f"DeleteKEM: SQLite error for ID '{kem_id}': {e_sql_del}"
             logger.error(msg, exc_info=True)
-            # Qdrant might have deleted. Potential inconsistency.
             context.abort(grpc.StatusCode.INTERNAL, msg); return empty_pb2.Empty()
 
         logger.info(f"DeleteKEM: Successfully processed deletion for KEM ID '{kem_id}'.")
@@ -423,150 +397,191 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
     def BatchStoreKEMs(self, request: glm_service_pb2.BatchStoreKEMsRequest, context) -> glm_service_pb2.BatchStoreKEMsResponse:
         logger.info(f"BatchStoreKEMs: Received {len(request.kems)} KEMs for storage.")
-        successfully_stored_kems_protos: typing.List[kem_pb2.KEM] = []
+
+        successfully_stored_kems_final_protos: typing.List[kem_pb2.KEM] = []
         failed_kem_original_references: typing.List[str] = []
 
-        kems_to_process_internally = [] # Store dicts or internal KEM representations
-
+        # Pre-process and validate incoming KEMs
+        valid_kems_for_processing: typing.List[typing.Dict[str,typing.Any]] = []
         for idx, kem_in_req in enumerate(request.kems):
+            original_ref = kem_in_req.id if kem_in_req.id else f"req_idx_{idx}"
             kem_id = kem_in_req.id if kem_in_req.id else str(uuid.uuid4())
-            original_ref = kem_in_req.id if kem_in_req.id else f"req_idx_{idx}" # For error reporting
 
-            # Validate embeddings early if present and Qdrant is used
-            if kem_in_req.embeddings and self.qdrant_repo:
+            if kem_in_req.embeddings:
+                if not self.qdrant_repo:
+                    logger.error(f"BatchStoreKEMs: Qdrant repo not available. KEM ID '{kem_id}' (ref: {original_ref}) with embeddings cannot be stored.")
+                    failed_kem_original_references.append(original_ref); continue
                 if len(kem_in_req.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
-                    logger.error(f"BatchStoreKEMs: Invalid embedding dimension for KEM ID '{kem_id}' (ref: {original_ref}). Skipping.")
-                    failed_kem_original_references.append(original_ref)
-                    continue
-            elif kem_in_req.embeddings and not self.qdrant_repo:
-                 logger.error(f"BatchStoreKEMs: Qdrant repo not available. KEM ID '{kem_id}' (ref: {original_ref}) with embeddings cannot be fully stored. Skipping.")
-                 failed_kem_original_references.append(original_ref)
-                 continue
+                    logger.error(f"BatchStoreKEMs: Invalid embedding dimension for KEM ID '{kem_id}' (ref: {original_ref}). Expected {self.config.DEFAULT_VECTOR_SIZE}.")
+                    failed_kem_original_references.append(original_ref); continue
 
-            # Prepare internal representation or directly the proto for later processing
-            # For now, let's just collect the protos and determine timestamps later
-            # We need to ensure the ID is set on the proto if it was generated
-            kem_proto_copy = kem_pb2.KEM()
-            kem_proto_copy.CopyFrom(kem_in_req)
+            # Store a mutable copy of the proto for timestamp updates
+            kem_proto_copy = kem_pb2.KEM(); kem_proto_copy.CopyFrom(kem_in_req)
             kem_proto_copy.id = kem_id # Ensure ID is set
+            valid_kems_for_processing.append({"proto": kem_proto_copy, "original_ref": original_ref})
 
-            kems_to_process_internally.append({
-                "proto": kem_proto_copy,
-                "original_ref": original_ref
-            })
+        if not valid_kems_for_processing: # All KEMs failed initial validation
+            return glm_service_pb2.BatchStoreKEMsResponse(
+                successfully_stored_kems=[], failed_kem_references=list(set(failed_kem_original_references)),
+                overall_error_message="No valid KEMs to process after initial validation." if request.kems else "Received an empty list of KEMs to store."
+            )
 
-        # Determine created_at for all KEMs
-        ids_from_request = [item['proto'].id for item in kems_to_process_internally if item['proto'].id]
-        existing_kems_timestamps_map = self.sqlite_repo.get_kems_creation_timestamps(ids_from_request) if ids_from_request else {}
+        # Determine created_at timestamps for SQLite batch
+        ids_to_check_in_db = [item['proto'].id for item in valid_kems_for_processing if item['proto'].id]
+        db_created_at_map = self.sqlite_repo.get_kems_creation_timestamps(ids_to_check_in_db) if ids_to_check_in_db else {}
 
-        kems_for_sqlite_batch_op = [] # List of tuples/dicts for a batch SQLite operation (if repo supports it)
-                                   # Or list of fully prepared KEM protos for individual repo calls
+        sqlite_batch_data = []
+        # This map will hold protos with finalized timestamps, to be used for Qdrant payload and final response
+        kems_with_final_timestamps: typing.Dict[str, kem_pb2.KEM] = {}
 
-        kems_processed_for_qdrant_payload = {} # kem_id -> kem_proto_with_final_timestamps
-
-        for item in kems_to_process_internally:
+        for item in valid_kems_for_processing:
             kem_p = item['proto']
-            current_time = Timestamp(); current_time.GetCurrentTime()
-            final_created_at = Timestamp()
+            current_ts = Timestamp(); current_ts.GetCurrentTime()
+            final_created_ts = Timestamp()
 
-            if kem_p.id in existing_kems_timestamps_map:
-                db_ts_str = existing_kems_timestamps_map[kem_p.id]
+            if kem_p.id in db_created_at_map:
+                db_ts_str = db_created_at_map[kem_p.id]
                 try:
-                    parse_ts = db_ts_str + ("Z" if not db_ts_str.endswith("Z") and '+' not in db_ts_str and '-' not in db_ts_str[10:] else "")
-                    final_created_at.FromJsonString(parse_ts)
-                except Exception: final_created_at.CopyFrom(current_time) # Fallback
+                    parse_ts_str_b = db_ts_str + ("Z" if not db_ts_str.endswith("Z") and '+' not in db_ts_str and '-' not in db_ts_str[10:] else "")
+                    final_created_ts.FromJsonString(parse_ts_str_b)
+                except Exception: final_created_ts.CopyFrom(current_ts)
             elif kem_p.HasField("created_at") and kem_p.created_at.seconds > 0:
                 final_created_at.CopyFrom(kem_p.created_at)
             else:
-                final_created_at.CopyFrom(current_time)
+                final_created_at.CopyFrom(current_ts)
 
             kem_p.created_at.CopyFrom(final_created_at)
-            kem_p.updated_at.CopyFrom(current_time)
+            kem_p.updated_at.CopyFrom(current_ts)
 
-            # Add to list for SQLite operation
-            # If SqliteKemRepository had a batch store method:
-            # kems_for_sqlite_batch_op.append( (kem_p.id, kem_p.content_type, ... ) )
-            # For now, we'll call store_or_replace_kem individually but track success/failure
-            kems_processed_for_qdrant_payload[kem_p.id] = kem_p # Store proto with final timestamps
+            sqlite_batch_data.append({
+                "id": kem_p.id, "content_type": kem_p.content_type, "content": kem_p.content,
+                "metadata_json": json.dumps(dict(kem_p.metadata)),
+                "created_at_iso": kem_p.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
+                "updated_at_iso": kem_p.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
+            })
+            kems_with_final_timestamps[kem_p.id] = kem_p
 
-        # SQLite batch operation (simulated by loop for now)
-        successfully_stored_sqlite_ids = set()
-        for kem_id_sqlite, kem_proto_sqlite in kems_processed_for_qdrant_payload.items():
-            original_ref_sqlite = "" # Find original_ref
-            for item_orig in kems_to_process_internally:
-                if item_orig['proto'].id == kem_id_sqlite: original_ref_sqlite = item_orig['original_ref']; break
+        # Perform SQLite batch store
+        sqlite_op_ok = False
+        if sqlite_batch_data:
             try:
-                self.sqlite_repo.store_or_replace_kem(
-                    kem_id=kem_proto_sqlite.id,
-                    content_type=kem_proto_sqlite.content_type,
-                    content=kem_proto_sqlite.content,
-                    metadata_json=json.dumps(dict(kem_proto_sqlite.metadata)),
-                    created_at_iso=kem_proto_sqlite.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
-                    updated_at_iso=kem_proto_sqlite.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
-                )
-                successfully_stored_sqlite_ids.add(kem_id_sqlite)
-            except Exception as e_bs_sql:
-                logger.error(f"BatchStoreKEMs: SQLite error for KEM ID '{kem_id_sqlite}' (ref: {original_ref_sqlite}): {e_bs_sql}", exc_info=True)
-                failed_kem_original_references.append(original_ref_sqlite)
+                self.sqlite_repo.batch_store_or_replace_kems(sqlite_batch_data)
+                sqlite_op_ok = True
+                logger.info(f"BatchStoreKEMs: SQLite batch store successful for {len(sqlite_batch_data)} KEMs.")
+            except Exception as e_sql_batch:
+                logger.error(f"BatchStoreKEMs: SQLite batch store operation failed: {e_sql_batch}", exc_info=True)
+                # All KEMs in this batch are considered failed for SQLite
+                for item in valid_kems_for_processing: # Add all original refs from this batch attempt
+                    if item['original_ref'] not in failed_kem_original_references:
+                        failed_kem_original_references.append(item['original_ref'])
 
-        # Prepare and execute Qdrant batch operation
-        qdrant_batch_points: List[PointStruct] = []
-        kems_for_qdrant_rollback_check = [] # KEM IDs that had embeddings and were sent to Qdrant
+        if not sqlite_op_ok and sqlite_batch_data: # If batch data was present but op failed
+             return glm_service_pb2.BatchStoreKEMsResponse(
+                successfully_stored_kems=[], failed_kem_references=list(set(failed_kem_original_references)),
+                overall_error_message="SQLite batch persistence failed for all processed KEMs."
+            )
 
-        if self.qdrant_repo:
-            for kem_id_q, kem_p_q in kems_processed_for_qdrant_payload.items():
-                if kem_id_q not in successfully_stored_sqlite_ids: continue # Skip if SQLite op failed for this KEM
+        # Prepare and execute Qdrant batch operation for successfully stored SQLite KEMs
+        qdrant_batch_points_to_upsert: List[PointStruct] = []
+        ids_for_qdrant_rollback = [] # KEMs with embeddings that went into Qdrant batch
+
+        if self.qdrant_repo and sqlite_op_ok: # Only if SQLite was ok and Qdrant is available
+            for kem_id_q, kem_p_q in kems_with_final_timestamps.items():
+                # Check if this KEM was part of the successful SQLite batch
+                # This check is implicitly handled if sqlite_op_ok is True and we iterate kems_with_final_timestamps
+                # (assuming kems_with_final_timestamps only contains those intended for the successful batch)
                 if kem_p_q.embeddings:
-                    q_payload = {"kem_id_ref": kem_id_q}
+                    q_payload_item = {"kem_id_ref": kem_id_q}
                     if kem_p_q.metadata:
-                        for k, v in kem_p_q.metadata.items(): q_payload[f"md_{k}"] = v
-                    if kem_p_q.HasField("created_at"): q_payload["created_at_ts"] = kem_p_q.created_at.seconds
-                    if kem_p_q.HasField("updated_at"): q_payload["updated_at_ts"] = kem_p_q.updated_at.seconds
-                    qdrant_batch_points.append(PointStruct(id=kem_id_q, vector=list(kem_p_q.embeddings), payload=q_payload))
-                    kems_for_qdrant_rollback_check.append(kem_id_q)
+                        for k_meta, v_meta in kem_p_q.metadata.items(): q_payload_item[f"md_{k_meta}"] = v_meta
+                    if kem_p_q.HasField("created_at"): q_payload_item["created_at_ts"] = kem_p_q.created_at.seconds
+                    if kem_p_q.HasField("updated_at"): q_payload_item["updated_at_ts"] = kem_p_q.updated_at.seconds
+                    qdrant_batch_points_to_upsert.append(PointStruct(id=kem_id_q, vector=list(kem_p_q.embeddings), payload=q_payload_item))
+                    ids_for_qdrant_rollback.append(kem_id_q)
 
-            qdrant_op_ok = True
-            if qdrant_batch_points:
+            qdrant_batch_op_ok = True
+            if qdrant_batch_points_to_upsert:
                 try:
-                    self.qdrant_repo.upsert_points_batch(qdrant_batch_points)
-                except Exception as e_q_batch_final:
-                    logger.error(f"BatchStoreKEMs: Qdrant batch upsert error: {e_q_batch_final}", exc_info=True)
-                    qdrant_op_ok = False
+                    self.qdrant_repo.upsert_points_batch(qdrant_batch_points_to_upsert)
+                except Exception as e_q_batch_up:
+                    logger.error(f"BatchStoreKEMs: Qdrant batch upsert error: {e_q_batch_up}", exc_info=True)
+                    qdrant_batch_op_ok = False
 
-            if not qdrant_op_ok: # Qdrant failed, rollback SQLite for these KEMs
+            if not qdrant_batch_op_ok: # Qdrant failed, rollback SQLite for these KEMs
                 logger.warning("BatchStoreKEMs: Qdrant batch op failed. Rolling back SQLite for KEMs in this Qdrant batch.")
-                for r_kem_id in kems_for_qdrant_rollback_check:
-                    original_ref_rb = "" # Find original_ref
-                    for item_orig_rb in kems_to_process_internally:
-                        if item_orig_rb['proto'].id == r_kem_id: original_ref_rb = item_orig_rb['original_ref']; break
+                for r_id in ids_for_qdrant_rollback:
+                    original_ref_rb_q = ""
+                    for item_orig_q_rb in valid_kems_for_processing:
+                        if item_orig_q_rb['proto'].id == r_id: original_ref_rb_q = item_orig_q_rb['original_ref']; break
+                    if original_ref_rb_q and original_ref_rb_q not in failed_kem_original_references:
+                        failed_kem_original_references.append(original_ref_rb_q)
 
-                    if original_ref_rb and original_ref_rb not in failed_kem_original_references:
-                        failed_kem_original_references.append(original_ref_rb)
-
-                    successfully_stored_sqlite_ids.discard(r_kem_id) # No longer successfully stored overall
+                    # Also remove from kems_with_final_timestamps to prevent it from being added to successful list
+                    if r_id in kems_with_final_timestamps:
+                        del kems_with_final_timestamps[r_id]
                     try:
-                        self.sqlite_repo.delete_kem_by_id(r_kem_id)
-                        logger.info(f"BatchStoreKEMs: Rolled back KEM ID '{r_kem_id}' from SQLite.")
-                    except Exception as e_rb_sql:
-                        logger.critical(f"BatchStoreKEMs: CRITICAL error during SQLite rollback for KEM '{r_kem_id}': {e_rb_sql}", exc_info=True)
+                        self.sqlite_repo.delete_kem_by_id(r_id)
+                        logger.info(f"BatchStoreKEMs: Rolled back KEM ID '{r_id}' from SQLite due to Qdrant error.")
+                    except Exception as e_rb_sql_q:
+                        logger.critical(f"BatchStoreKEMs: CRITICAL error during SQLite rollback for KEM '{r_id}': {e_rb_sql_q}", exc_info=True)
 
-        # Populate final successful list
-        for final_id in successfully_stored_sqlite_ids:
-            if final_id in kems_processed_for_qdrant_payload: # Should always be true
-                 successfully_stored_kems_protos.append(kems_processed_for_qdrant_payload[final_id])
+        # Populate final successful list from kems_with_final_timestamps (which now only contains fully successful ones)
+        for kem_p_final_succ in kems_with_final_timestamps.values():
+            successfully_stored_kems_protos.append(kem_p_final_succ)
 
-        final_failed_refs = list(set(failed_kem_original_references))
+        final_failed_refs_list = list(set(failed_kem_original_references))
         response = glm_service_pb2.BatchStoreKEMsResponse(
             successfully_stored_kems=successfully_stored_kems_protos,
-            failed_kem_references=final_failed_refs
+            failed_kem_references=final_failed_refs_list
         )
-        if final_failed_refs:
-            response.overall_error_message = f"Failed to fully store {len(final_failed_refs)} KEMs from the batch."
+        if final_failed_refs_list:
+            response.overall_error_message = f"Failed to fully store {len(final_failed_refs_list)} KEMs from the batch."
         elif not request.kems and not successfully_stored_kems_protos:
             response.overall_error_message = "Received an empty list of KEMs to store."
 
-        logger.info(f"BatchStoreKEMs: Processed. Success: {len(successfully_stored_kems_protos)}, Failures: {len(final_failed_refs)}.")
+        logger.info(f"BatchStoreKEMs: Processed. Success: {len(successfully_stored_kems_protos)}, Failures: {len(final_failed_refs_list)}.")
         return response
 
 def serve():
->>>>>>> REPLACE
+    logger.info(f"GLM Configuration: Qdrant Host={config.QDRANT_HOST}, Qdrant Port={config.QDRANT_PORT}, Collection='{config.QDRANT_COLLECTION}', "
+                f"SQLite DB='{os.path.join(app_dir, config.DB_FILENAME)}', gRPC Address={config.GRPC_LISTEN_ADDRESS}, LogLevel={config.LOG_LEVEL}")
+
+    # Perform pre-flight check for Qdrant if configured
+    if config.QDRANT_HOST:
+        try:
+            client_test = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT, timeout=2)
+            client_test.get_collections()
+            logger.info(f"Qdrant pre-flight check: Successfully connected to Qdrant at {config.QDRANT_HOST}:{config.QDRANT_PORT}.")
+        except Exception as e_preflight:
+            logger.critical(f"CRITICAL ERROR: Qdrant pre-flight check failed. Qdrant is unavailable at {config.QDRANT_HOST}:{config.QDRANT_PORT}. Details: {e_preflight}. Server NOT STARTED if Qdrant is required by config/logic.")
+            # Depending on policy, we might not start if Qdrant is essential.
+            # For now, GLM servicer __init__ will also try and might log errors or raise.
+            # If QDRANT_HOST is set, and it fails here, it's a strong indicator of problems.
+            # Consider exiting if QDRANT_HOST is set but connection fails.
+            # For now, allow __init__ to make the final decision on raising or running degraded.
+            pass # Let constructor handle it.
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    try:
+        servicer_instance = GlobalLongTermMemoryServicerImpl()
+    except Exception as e_servicer_init:
+        logger.critical(f"CRITICAL ERROR initializing GlobalLongTermMemoryServicerImpl: {e_servicer_init}", exc_info=True)
+        return # Do not start server if servicer init fails
+
+    glm_service_pb2_grpc.add_GlobalLongTermMemoryServicer_to_server(servicer_instance, server)
+    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
+    logger.info(f"Starting GLM server on {config.GRPC_LISTEN_ADDRESS}...")
+    server.start()
+    logger.info(f"GLM server started and listening on {config.GRPC_LISTEN_ADDRESS}.")
+
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info("GLM server stopping via KeyboardInterrupt...")
+    finally:
+        server.stop(grace=5)
+        logger.info("GLM server stopped.")
+
+if __name__ == '__main__':
+    serve()
+```
