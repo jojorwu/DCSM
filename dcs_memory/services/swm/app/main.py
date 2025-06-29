@@ -19,6 +19,7 @@ from typing import Optional, List, Set, Dict, Callable, AsyncGenerator, Tuple
 
 from .config import SWMConfig
 from .managers import SubscriptionManager, DistributedLockManager, DistributedCounterManager
+from .redis_kem_cache import RedisKemCache # Import RedisKemCache - this was from a different plan, remove for now
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
         self._stop_event = asyncio.Event()
         self._glm_persistence_worker_task: Optional[asyncio.Task] = None
-        self.glm_persistence_queue: asyncio.Queue[Tuple[kem_pb2.KEM, int]] = asyncio.Queue( # Stores (KEM, retry_count)
+        self.glm_persistence_queue: asyncio.Queue[Tuple[kem_pb2.KEM, int]] = asyncio.Queue(
             maxsize=self.config.GLM_PERSISTENCE_QUEUE_MAX_SIZE
         )
         logger.info("SharedWorkingMemoryServiceImpl initialized with managers.")
@@ -245,7 +246,6 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         while not self._stop_event.is_set():
             current_batch_items_with_retry: List[Tuple[kem_pb2.KEM, int]] = []
             try:
-                # Wait for the first item or timeout
                 first_item_tuple = await asyncio.wait_for(
                     self.glm_persistence_queue.get(),
                     timeout=self.config.GLM_PERSISTENCE_FLUSH_INTERVAL_S
@@ -253,7 +253,6 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                 current_batch_items_with_retry.append(first_item_tuple)
                 self.glm_persistence_queue.task_done()
 
-                # Try to fill the rest of the batch
                 while len(current_batch_items_with_retry) < self.config.GLM_PERSISTENCE_BATCH_SIZE:
                     try:
                         item_tuple = self.glm_persistence_queue.get_nowait()
@@ -262,10 +261,10 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                     except asyncio.QueueEmpty:
                         break
             except asyncio.TimeoutError:
-                pass # Flush interval reached
+                pass
             except asyncio.CancelledError:
                 logger.info("SWM: GLM Persistence Worker cancelled during queue get.")
-                for kem_proto, retry_c in reversed(current_batch_items_with_retry): # Re-queue fetched items
+                for kem_proto, retry_c in reversed(current_batch_items_with_retry):
                     if not self.glm_persistence_queue.full(): await self.glm_persistence_queue.put((kem_proto, retry_c))
                 break
             except Exception as e_q_get:
@@ -275,14 +274,15 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
             if current_batch_items_with_retry:
                 kems_for_glm_call = [item[0] for item in current_batch_items_with_retry]
-                logger.info(f"SWM: GLM Persistence Worker processing batch of {len(kems_for_glm_call)} KEMs.")
+                logger.info(f"SWM: GLM Persistence Worker processing batch of {len(kems_for_glm_call)} KEMs (Retry counts: {[item[1] for item in current_batch_items_with_retry]})")
 
-                glm_op_success_overall = False # Tracks if the GLM call itself was successful
+                glm_batch_call_successful = False
+                glm_response = None
+
                 if self.aio_glm_stub:
                     glm_response = await self._glm_batch_store_kems_async(kems_for_glm_call)
                     if glm_response:
-                        glm_op_success_overall = True # GLM processed the batch
-                        successfully_processed_in_glm_ids = {k.id for k in glm_response.successfully_stored_kems}
+                        glm_batch_call_successful = True # GLM processed the batch, may have partial success/failure
 
                         if glm_response.successfully_stored_kems:
                             logger.info(f"SWM: GLM Worker: {len(glm_response.successfully_stored_kems)} KEMs confirmed persisted by GLM. Updating SWM cache.")
@@ -293,38 +293,44 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                                 except Exception as e_cache_upd:
                                     logger.error(f"SWM: GLM Worker: Error updating SWM cache for KEM ID '{kem_from_glm.id}': {e_cache_upd}", exc_info=True)
 
+                        # Handle KEMs that GLM specifically reported as failed
                         if glm_response.failed_kem_references:
-                            logger.warning(f"SWM: GLM Worker: BatchStoreKEMs reported {len(glm_response.failed_kem_references)} failed refs: {glm_response.failed_kem_references}.")
-                            # Re-queue KEMs that GLM explicitly failed, if they haven't reached max retries
-                            for item_kem_proto, item_retry_count in current_batch_items_with_retry:
-                                if item_kem_proto.id in glm_response.failed_kem_references: # This assumes failed_kem_references are IDs
-                                    if item_retry_count < self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES:
-                                        if not self.glm_persistence_queue.full():
-                                            await self.glm_persistence_queue.put((item_kem_proto, item_retry_count + 1))
-                                            logger.info(f"SWM: GLM Worker: Re-queued KEM ID '{item_kem_proto.id}' (GLM specific fail, attempt {item_retry_count + 1}).")
-                                        else:
-                                            logger.error(f"SWM: GLM Worker: Failed to re-queue KEM ID '{item_kem_proto.id}' (GLM specific fail), queue full. KEM may be lost.")
+                            failed_ids_from_glm = set(glm_response.failed_kem_references)
+                            logger.warning(f"SWM: GLM Worker: BatchStoreKEMs reported {len(failed_ids_from_glm)} failed KEM IDs: {failed_ids_from_glm}.")
+                            items_to_potentially_requeue = []
+                            for kem_proto, retry_count in current_batch_items_with_retry:
+                                if kem_proto.id in failed_ids_from_glm: # This KEM was part of the batch and GLM said it failed
+                                    if retry_count < self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES:
+                                        items_to_potentially_requeue.append((kem_proto, retry_count + 1))
+                                        logger.info(f"SWM: GLM Worker: Marking KEM ID '{kem_proto.id}' for re-queue (GLM specific fail, next attempt {retry_count + 1}).")
                                     else:
-                                        logger.error(f"SWM: GLM Worker: KEM ID '{item_kem_proto.id}' (GLM specific fail) reached max retries ({self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES}). Discarding.")
-                    # If glm_response is None (batch call itself failed), glm_op_success_overall remains False
+                                        logger.error(f"SWM: GLM Worker: KEM ID '{kem_proto.id}' (GLM specific fail) reached max retries ({self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES}). Discarding.")
 
-                if not glm_op_success_overall: # Covers GLM stub None OR _glm_batch_store_kems_async returning None
+                            for item_to_requeue in reversed(items_to_potentially_requeue): # Re-queue if needed
+                                if not self.glm_persistence_queue.full():
+                                    await self.glm_persistence_queue.put(item_to_requeue)
+                                else:
+                                    logger.error(f"SWM: GLM Worker: Failed to re-queue KEM ID '{item_to_requeue[0].id}' (GLM specific fail), queue full. KEM may be lost.")
+                                    # Potentially stop trying to re-queue others in this sub-batch if queue is full
+
+                # If the entire batch call failed (glm_response is None) or GLM stub is missing
+                if not glm_batch_call_successful:
                     if not self.aio_glm_stub:
                         logger.error("SWM: GLM Persistence Worker: GLM stub not available. Batch not persisted.")
-                    else:
-                        logger.error(f"SWM: GLM Persistence Worker: Batch of {len(kems_for_glm_call)} KEMs failed GLM processing (batch call failure).")
+                    else: # Implies _glm_batch_store_kems_async returned None
+                        logger.error(f"SWM: GLM Persistence Worker: Entire batch of {len(kems_for_glm_call)} KEMs failed GLM processing (batch call failed).")
 
-                    logger.warning(f"SWM: GLM Persistence Worker: Re-queueing {len(current_batch_items_with_retry)} items from failed batch.")
+                    logger.warning(f"SWM: GLM Persistence Worker: Re-queueing {len(current_batch_items_with_retry)} items from failed/unprocessed batch.")
                     for kem_proto_retry, retry_count_retry in reversed(current_batch_items_with_retry):
                         if retry_count_retry < self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES:
                             if not self.glm_persistence_queue.full():
                                 await self.glm_persistence_queue.put((kem_proto_retry, retry_count_retry + 1))
-                                logger.info(f"SWM: GLM Persistence Worker: Re-queued KEM ID '{kem_proto_retry.id}' (attempt {retry_count_retry + 1}).")
+                                logger.info(f"SWM: GLM Persistence Worker: Re-queued KEM ID '{kem_proto_retry.id}' (batch fail, attempt {retry_count_retry + 1}).")
                             else:
                                 logger.error(f"SWM: GLM Persistence Worker: Failed to re-queue KEM ID '{kem_proto_retry.id}', queue full. KEM may be lost.")
                                 break
                         else:
-                            logger.error(f"SWM: GLM Persistence Worker: KEM ID '{kem_proto_retry.id}' reached max retries ({self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES}). Discarding.")
+                            logger.error(f"SWM: GLM Persistence Worker: KEM ID '{kem_proto_retry.id}' (batch fail) reached max retries ({self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES}). Discarding.")
 
             if self._stop_event.is_set() and self.glm_persistence_queue.empty():
                  logger.info("SWM: GLM Persistence Worker stopping as stop event is set and queue is empty."); break
@@ -333,19 +339,24 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             logger.info(f"SWM: GLM Persistence Worker - processing remaining {self.glm_persistence_queue.qsize()} items on shutdown...")
             final_batch_to_send: List[kem_pb2.KEM] = []
             processed_during_shutdown_count = 0
+            temp_final_batch_items = [] # To hold (kem, retry_count) for logging if final send fails
             while not self.glm_persistence_queue.empty():
                 try:
                     kem_tuple_final = self.glm_persistence_queue.get_nowait()
-                    final_batch_to_send.append(kem_tuple_final[0]) # Just KEM for final batch
+                    temp_final_batch_items.append(kem_tuple_final)
+                    final_batch_to_send.append(kem_tuple_final[0])
                     self.glm_persistence_queue.task_done()
                     processed_during_shutdown_count +=1
-                    if len(final_batch_to_send) >= self.config.GLM_PERSISTENCE_BATCH_SIZE: # Still batch if many items
-                        if self.aio_glm_stub: await self._glm_batch_store_kems_async(final_batch_to_send); # fire and forget
+                    if len(final_batch_to_send) >= self.config.GLM_PERSISTENCE_BATCH_SIZE:
+                        if self.aio_glm_stub:
+                            logger.info(f"SWM (Shutdown): Sending batch of {len(final_batch_to_send)} KEMs.")
+                            await self._glm_batch_store_kems_async(final_batch_to_send)
                         else: logger.error(f"SWM (Shutdown): GLM stub gone, cannot send {len(final_batch_to_send)} KEMs.")
                         final_batch_to_send.clear()
+                        temp_final_batch_items.clear()
                 except asyncio.QueueEmpty: break
 
-            if final_batch_to_send and self.aio_glm_stub: # Remainder of the last batch
+            if final_batch_to_send and self.aio_glm_stub:
                 logger.info(f"SWM: GLM Persistence Worker - sending final batch of {len(final_batch_to_send)} KEMs to GLM during shutdown.")
                 await self._glm_batch_store_kems_async(final_batch_to_send)
             elif final_batch_to_send:
