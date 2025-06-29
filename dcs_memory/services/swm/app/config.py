@@ -77,6 +77,14 @@ class SWMConfig(BaseServiceConfig):
         description="Maximum number of retry attempts for a batch that failed to persist to GLM."
     )
 
+    # Redis Cache Configuration for SWM
+    SWM_REDIS_HOST: str = Field(default="localhost", description="Hostname for the Redis server used by SWM cache.")
+    SWM_REDIS_PORT: int = Field(default=6379, description="Port for the Redis server.")
+    SWM_REDIS_DB: int = Field(default=0, description="Redis database number for SWM cache.")
+    SWM_REDIS_PASSWORD: Optional[str] = Field(default=None, description="Password for Redis server (if any).")
+    # SWM_CACHE_MAX_SIZE might be removed as Redis maxmemory handles this.
+    # INDEXED_METADATA_KEYS is still needed for RedisKemCache to know what to index.
+
 if __name__ == '__main__':
     print("--- Тестирование SWMConfig ---")
 
