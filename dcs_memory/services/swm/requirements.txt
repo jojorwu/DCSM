@@ -2,4 +2,5 @@ grpcio
 grpcio-tools
 protobuf
 cachetools
+readerwriterlock>=1.0.9 # Or a suitable version for RWLockFair
 # qdrant-client # SWM interacts with GLM, GLM handles Qdrant. Not directly needed by SWM.
