@@ -58,7 +58,7 @@ class SqliteKemRepository:
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_meta_source_system ON kems(json_extract(metadata, '$.source_system'));")
                     logger.info("Repository: JSON indexes (meta_type, meta_source_system) creation attempted.")
                 except sqlite3.Error as e_json_idx:
-                    logger.warning(f"Repository: Could not create JSON indexes (SQLite < 3.38.0 or other error): {e_json_idx}. ")
+                    logger.warning(f"Repository: Could not create JSON indexes (SQLite < 3.38.0 or other error): {e_json_idx}.", exc_info=True)
                 conn.commit()
             logger.info("Repository: 'kems' table and indexes in SQLite successfully initialized via Repository.")
         except Exception as e:

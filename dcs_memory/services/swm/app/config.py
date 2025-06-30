@@ -15,16 +15,19 @@ class SWMConfig(BaseServiceConfig):
 
     GLM_SERVICE_ADDRESS: str = "glm:50051" # Адрес GLM, используемый по умолчанию в Docker
     GRPC_LISTEN_ADDRESS: str = "[::]:50053"
-    CACHE_MAX_SIZE: int = 200
-    DEFAULT_PAGE_SIZE: int = 20 # DEFAULT_SWM_PAGE_SIZE в старом коде
+    CACHE_MAX_SIZE: int = Field(
+        default=200,
+        description="Informational: Maximum number of items for some cache types. "
+                    "For RedisKemCache, Redis 'maxmemory' policies control eviction, not this setting directly. "
+                    "May be used by other potential cache backends or for logical limits."
+    )
+    DEFAULT_PAGE_SIZE: int = 20
 
-    # SWM_INDEXED_METADATA_KEYS was a list of strings, obtained via split(',')
-    # Pydantic can automatically convert a comma-separated string to a List[str]
-    # if List[str] type hint is used and the env var is a comma-separated string.
-    # pydantic-settings handles this for simple types.
     INDEXED_METADATA_KEYS: List[str] = Field(
-        default_factory=list, # Default to an empty list if not provided
-        description="Comma-separated list of KEM metadata keys to be indexed by SWM's internal cache. E.g., 'type,source'"
+        default_factory=list,
+        description="Comma-separated list of KEM metadata field names (e.g., 'type,source_system') "
+                    "that RedisKemCache should create secondary indexes for. "
+                    "Enables faster filtering on these keys in QuerySWM."
     )
 
     # Retry parameters for the GLM client within SWM
@@ -82,6 +85,10 @@ class SWMConfig(BaseServiceConfig):
     SWM_REDIS_PORT: int = Field(default=6379, description="Port for the Redis server.")
     SWM_REDIS_DB: int = Field(default=0, description="Redis database number for SWM cache.")
     SWM_REDIS_PASSWORD: Optional[str] = Field(default=None, description="Password for Redis server (if any).")
+    SWM_REDIS_RECONNECT_DELAY_S: float = Field(
+        default=5.0,
+        description="Delay in seconds before SWM eviction listener attempts to reconnect to Redis PubSub after a connection error."
+    )
     # SWM_CACHE_MAX_SIZE might be removed as Redis maxmemory handles this.
     # INDEXED_METADATA_KEYS is still needed for RedisKemCache to know what to index.
 

@@ -67,37 +67,32 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 ### 3.4. Shared Working Memory Service (SWM)
 
 *   **Location:** `dcs_memory/services/swm/`
-*   **Purpose:** Serves as an active, fast caching layer for memory units (KEMs) that agents interact with directly. It manages "hot" KEMs, enables collective access, and coordinates memory-related activities.
-*   **Core Functions (current basic implementation):**
-    *   **Active KEM Caching:** Uses an internal LRU cache to store frequently accessed or recently loaded KEMs.
-    *   **Loading from GLM:** Retrieves KEMs from GLM upon request (`LoadKEMsFromGLM`) and places them into its cache.
-    *   **Cache Querying:** Provides an interface (`QuerySWM`) for agents to request KEMs from the SWM cache with filtering by ID, metadata, and dates.
-    *   **KEM Publishing:** Agents can publish KEMs to SWM (`PublishKEMToSWM`), which are stored in the cache and can optionally be persisted to GLM.
-    *   **Event Subscription:** The `SubscribeToSWMEvents` method allows agents to subscribe to KEM creation, update, and eviction events within SWM. SWM uses internal queues for each subscriber and server-side streaming to deliver events. Basic server-side event filtering is implemented.
-    *   **Distributed Lock Management**: SWM provides mechanisms to acquire and release locks on named resources, enabling agents to coordinate access to shared data or KEMs.
-        *   **Acquisition with Timeout**: The `AcquireLock` method supports a `timeout_ms` parameter, allowing an agent to wait server-side for a resource to be released for a specified duration.
-        *   **Lock Leasing**: Locks can be acquired for a specific duration (`lease_duration_ms`).
-        *   **Automatic Cleanup**: SWM includes a background process that periodically checks for and removes locks срок действия аренды которых истек, preventing resources from becoming "stuck".
-        *   **Waiter Notification**: When a lock is released or expires, waiting agents are notified to retry acquisition.
-    *   **Distributed Counter Management**: SWM allows for the creation, atomic increment/decrement, and retrieval of named counters, which can be used by agents for various coordination or statistical tasks. Counters are stored in SWM's memory.
+*   **Purpose:** Serves as an active, fast caching layer based on Redis, with which agents interact directly. It manages "hot" KEMs, enables collective access, and coordinates memory-related activities.
+*   **Core Functions:**
+    *   **Active KEM Caching in Redis:** Uses Redis to store KEMs. KEMs are stored as Redis Hashes. Secondary indexes on configurable metadata fields (via Redis Sets) and on creation/update dates (via Redis Sorted Sets) are supported.
+    *   **LRU Eviction Policy:** Implemented via Redis configuration (`maxmemory` and `maxmemory-policy allkeys-lru`).
+    *   **Loading from GLM:** Retrieves KEMs from GLM upon request (`LoadKEMsFromGLM`) and places them into the Redis cache.
+    *   **Cache Querying:** Provides an interface (`QuerySWM`) for agents to request KEMs from the Redis cache with filtering by ID, indexed metadata, and dates. Default sorting is by update date.
+    *   **KEM Publishing:** Agents can publish KEMs to SWM (`PublishKEMToSWM`). KEMs are stored in the Redis cache. If persistence is flagged, KEMs are queued for asynchronous batch writing to GLM.
+    *   **Event Subscription:** The `SubscribeToSWMEvents` method allows agents to subscribe to KEM creation (`KEM_PUBLISHED`), update (`KEM_UPDATED`), and eviction (`KEM_EVICTED`) events within SWM. Filtering by ID, metadata, and event type is supported. `KEM_EVICTED` events are generated based on Redis Keyspace Notifications.
+    *   **Distributed Lock and Counter Management:** Provides mechanisms for agent coordination (logic encapsulated in respective managers).
 *   **Caching and Eviction Strategies in SWM**:
-    *   **Storage**: Uses `IndexedLRUCache` (see section 3.6), which implements an LRU (Least Recently Used) eviction strategy.
-    *   **Eviction**: When the cache reaches its maximum size (`SWM_CACHE_MAX_SIZE`), adding a new item causes the least recently used item to be evicted.
-    *   **Eviction Notification**: When a KEM is evicted from the cache, SWM generates a `KEM_EVICTED` event and notifies all interested subscribers. This allows agents or other systems to react to the removal of KEMs from active memory.
+    *   **Storage**: Redis. KEMs are stored as Redis Hashes. Secondary indexes for metadata (on keys specified in `SWM_INDEXED_METADATA_KEYS`) and for `created_at`/`updated_at` dates are maintained using Redis Sets and Sorted Sets, respectively.
+    *   **Eviction**: Managed by Redis based on the `allkeys-lru` policy and the `maxmemory` setting.
+    *   **Eviction Notification**: SWM subscribes to Redis Keyspace Notifications (`__keyevent@<db>__:evicted`). Upon receiving a notification, a `KEM_EVICTED` event (containing only the KEM ID) is generated for SWM subscribers.
 *   **SWM Synchronization with GLM**:
-    *   **Loading from GLM (`LoadKEMsFromGLM`)**: SWM can load KEMs from GLM on demand. Loaded KEMs are placed into the SWM cache. If a KEM with the same ID already exists in the cache, it is updated. `KEM_PUBLISHED` or `KEM_UPDATED` events are generated when KEMs are placed in the cache.
-    *   **Saving to GLM (`PublishKEMToSWM`)**: When publishing a KEM to SWM, if the `persist_to_glm_if_new_or_updated` flag is set, SWM attempts to save or update this KEM in GLM.
-        *   If GLM successfully saves/updates the KEM and returns it (possibly with updated server-side timestamps or a generated ID), SWM **updates the corresponding KEM in its cache with this version from GLM**. This ensures greater data consistency between SWM and GLM.
+    *   **Loading from GLM (`LoadKEMsFromGLM`)**: SWM loads KEMs from GLM and places them into the Redis cache. If a KEM with the same ID already exists in the cache, it is updated. `KEM_PUBLISHED` or `KEM_UPDATED` events are generated.
+    *   **Saving to GLM (`PublishKEMToSWM`)**: When publishing a KEM to SWM with the `persist_to_glm_if_new_or_updated` flag, the KEM is added to an internal queue. A background worker (`_glm_persistence_worker`) processes this queue, forming batches and sending them to GLM via `BatchStoreKEMs`. After successful persistence in GLM, the SWM cache is updated with the KEM version returned by GLM (for ID and timestamp consistency).
 *   **Technologies (current implementation):**
     *   gRPC for API.
-    *   `IndexedLRUCache` (based on `cachetools.LRUCache`): for the internal cache with indexing.
-    *   GLM gRPC client (with retry logic).
-    *   `asyncio.Queue` for managing per-subscriber event queues in its asynchronous gRPC environment.
+    *   Redis: For the primary KEM cache and secondary indexes. Uses the `aioredis` client.
+    *   GLM gRPC client (asynchronous, with retry logic).
+    *   Internal `asyncio.Queue` for SWM's Pub/Sub mechanism and for the GLM persistence queue.
 *   **API (gRPC - `swm_service.proto`):**
-    *   `PublishKEMToSWM`: Publishes a KEM to SWM (and optionally to GLM).
+    *   `PublishKEMToSWM`: Publishes a KEM to SWM (Redis). Optionally queues it for asynchronous persistence to GLM.
     *   `SubscribeToSWMEvents`: Subscribes to SWM events.
-    *   `QuerySWM`: Queries KEMs from the SWM cache with filtering.
-    *   `LoadKEMsFromGLM`: Initiates loading of KEMs from GLM into the SWM cache.
+    *   `QuerySWM`: Queries KEMs from the SWM cache (Redis) with filtering.
+    *   `LoadKEMsFromGLM`: Initiates loading of KEMs from GLM into the SWM cache (Redis).
     *   `AcquireLock`, `ReleaseLock`, `GetLockInfo`: Manage distributed locks.
     *   `IncrementCounter`, `GetCounter`: Work with distributed counters.
 
@@ -217,15 +212,39 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
         *   Upon successful persistence in GLM, SWM may update the KEM in its cache with the version returned by GLM (for ID and GLM server-side timestamp consistency).
 4.  **SWM** returns a response to the agent about the SWM publication status and (if applicable) the status of the GLM operation.
 
-#### 4.3.1. Data Structure in SWM (Cache)
+#### 4.3.1. Data Structure in SWM (Redis-based Cache)
 
-*   **Purpose**: Fast storage for "hot" KEMs for agents' operational access.
-*   **Storage**: `IndexedLRUCache` (thread-safe LRU cache with metadata key indexing capability).
-*   **KEM Format**: KEMs are stored in the cache as `kem_pb2.KEM` protobuf message instances. This ensures data consistency with the format used in gRPC communication and in GLM.
-*   **Indexing**:
-    *   Primary KEM data is accessible by `id` via standard LRU cache methods.
-    *   Additionally, `IndexedLRUCache` builds internal indexes on metadata key values specified in SWM configuration (`SWM_INDEXED_METADATA_KEYS`). These indexes allow for quick retrieval of KEM IDs matching specific metadata values without a full cache scan (used in `QuerySWM`).
-*   **Example**: If `SWM_INDEXED_METADATA_KEYS="topic,status"`, then for a KEM with `metadata={"topic":"AI", "status":"draft"}`, indexes for `topic="AI"` and `status="draft"` will be updated.
+*   **Purpose**: Fast storage for "hot" KEMs for agents' operational access, capable of handling large amounts of data.
+*   **Storage**: Redis.
+*   **KEM Storage**:
+    *   **Main KEM object key:** `swm_kem:<kem_id>` (e.g., `swm_kem:a1b2c3d4-e5f6-7890-1234-567890abcdef`).
+    *   **Redis Data Type:** Hash.
+    *   **Hash fields for KEM:**
+        *   `id`: (string) `<kem_id_str>`
+        *   `content_type`: (string) `<kem_mime_type>`
+        *   `content`: (byte string) Serialized KEM content (protobuf `kem.content`).
+        *   `metadata`: (string) JSON string of all KEM metadata.
+        *   `created_at`: (string) ISO 8601 timestamp string of creation.
+        *   `updated_at`: (string) ISO 8601 timestamp string of update.
+        *   `created_at_ts`: (stringified number) Unix timestamp (seconds) for `created_at` (used for sorting/filtering in Redis).
+        *   `updated_at_ts`: (stringified number) Unix timestamp (seconds) for `updated_at` (used for sorting/filtering in Redis).
+        *   `embeddings`: (byte string) Serialized list of floats (e.g., via MessagePack).
+*   **Secondary Indexing (Manual, without RediSearch):**
+    *   **Metadata Indexes:**
+        *   **Redis Data Type:** Set.
+        *   **Index Key:** `swm_idx:meta:<metadata_key>:<metadata_value>` (e.g., `swm_idx:meta:type:document`).
+        *   **Set Members:** KEM IDs (`<kem_id>`).
+        *   Atomically updated during KEM set/delete operations using `MULTI/EXEC` transactions.
+    *   **Date Indexes:**
+        *   **Redis Data Type:** Sorted Set.
+        *   **Index Keys:** `swm_idx:date:created_at` and `swm_idx:date:updated_at`.
+        *   **Score:** Unix timestamp (integer, seconds).
+        *   **Member:** KEM ID (`<kem_id>`).
+        *   Atomically updated during KEM set/delete operations.
+*   **LRU Eviction Policy:**
+    *   Configured in Redis: `maxmemory <size>` and `maxmemory-policy allkeys-lru`.
+*   **Eviction Notifications:**
+    *   SWM subscribes to Redis Keyspace Notifications (`__keyevent@<db>__:evicted`). The `KEM_EVICTED` event in SWM contains only the ID of the evicted KEM.
 
 #### 4.3.2. Data Structure in LAM (Local Agent Memory in Agent SDK)
 
