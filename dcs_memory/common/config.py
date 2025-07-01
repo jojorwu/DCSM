@@ -45,6 +45,11 @@ class BaseServiceConfig(BaseSettings):
     GRPC_SERVER_MAX_CONNECTION_AGE_MS: int = Field(default=0, description="gRPC server max connection age in ms (0 for infinite).")
     GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: int = Field(default=0, description="gRPC server max connection age grace period in ms (0 for infinite).")
 
+    # Circuit Breaker Configuration (shared defaults)
+    CIRCUIT_BREAKER_ENABLED: bool = Field(default=True, description="Enable or disable circuit breakers globally for client calls.")
+    CIRCUIT_BREAKER_FAIL_MAX: int = Field(default=5, description="Maximum number of failures before opening the circuit.")
+    CIRCUIT_BREAKER_RESET_TIMEOUT_S: int = Field(default=30, description="Timeout in seconds before trying to half-open the circuit.")
+
     # Advanced Logging Configuration
     LOG_FORMAT: str = Field(
         default="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -195,6 +200,12 @@ class KPSConfig(BaseServiceConfig):
     DEFAULT_VECTOR_SIZE: int = Field(description="Expected/generated embedding dimension.")
     DEFAULT_PROCESSING_BATCH_SIZE: int = Field(default=32, description="Default batch size for processing documents.")
     GLM_STORE_KEM_TIMEOUT_S: int = Field(default=15, description="Timeout for KPS calling GLM's StoreKEM, in seconds.")
+
+    # KPS Idempotency Settings
+    KPS_IDEMPOTENCY_CHECK_ENABLED: bool = Field(default=True, description="Enable idempotency checks for ProcessRawData based on data_id.")
+    KPS_IDEMPOTENCY_METADATA_KEY: str = Field(default="source_data_id", description="Metadata key used to store/check data_id for idempotency.")
+    # TODO: Consider KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S if a separate timeout is needed for this specific GLM query.
+
     # GRPC_SERVER_MAX_WORKERS can be inherited or overridden
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited or overridden
 
@@ -257,6 +268,11 @@ class SWMConfig(BaseServiceConfig):
     REDIS_INDEX_DATE_CREATED_KEY: str = Field(default="swm_idx:date:created_at", description="Redis key for 'created_at' sorted set index.")
     REDIS_INDEX_DATE_UPDATED_KEY: str = Field(default="swm_idx:date:updated_at", description="Redis key for 'updated_at' sorted set index.")
     REDIS_QUERY_TEMP_KEY_PREFIX: str = Field(default="swm_query_tmp:", description="Prefix for temporary keys used during SWM queries in Redis.")
+
+    # GLM Persistence DLQ Settings
+    GLM_PERSISTENCE_DLQ_ENABLED: bool = Field(default=True, description="Enable Dead Letter Queue for failed GLM persistence attempts.")
+    REDIS_DLQ_KEY: str = Field(default="dcsm:swm:glm_dlq", description="Redis key for the GLM persistence DLQ list.")
+    DLQ_MAX_SIZE: int = Field(default=1000, description="Maximum number of items in the DLQ (0 for unlimited).")
 
     # Distributed Lock and Counter Redis Settings
     REDIS_LOCK_KEY_PREFIX: str = Field(default="dcsm:lock:", description="Prefix for distributed lock keys in Redis.")

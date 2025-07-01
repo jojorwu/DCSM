@@ -22,6 +22,11 @@ shared:
   GRPC_SERVER_MAX_CONNECTION_AGE_MS: 0             # 0 for infinite (server-side)
   GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: 0       # 0 for infinite (server-side)
 
+  # Circuit Breaker Configuration (for client calls)
+  CIRCUIT_BREAKER_ENABLED: true               # true or false
+  CIRCUIT_BREAKER_FAIL_MAX: 5                 # Max failures before opening
+  CIRCUIT_BREAKER_RESET_TIMEOUT_S: 30         # Seconds before attempting half-open state
+
   # Advanced Logging Configuration
   LOG_FORMAT: "%(asctime)s - %(name)s - %(levelname)-8s - %(message)s" # Default: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   LOG_DATE_FORMAT: "%Y-%m-%d %H:%M:%S,%03d" # Default
@@ -55,6 +60,10 @@ kps:
   DEFAULT_PROCESSING_BATCH_SIZE: 32
   GRPC_LISTEN_ADDRESS: "[::]:50052"
   GLM_STORE_KEM_TIMEOUT_S: 15 # Timeout for KPS calling GLM StoreKEM
+
+  # KPS Idempotency Settings
+  KPS_IDEMPOTENCY_CHECK_ENABLED: true # true or false
+  KPS_IDEMPOTENCY_METADATA_KEY: "source_data_id" # Metadata key for storing/checking data_id
 
 swm:
   # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_SHUTDOWN_GRACE_S, GRPC_KEEPALIVE_* from shared
@@ -113,6 +122,11 @@ swm:
   RETRY_MAX_ATTEMPTS: 4
   RETRY_INITIAL_DELAY_S: 0.8
   RETRY_BACKOFF_FACTOR: 1.5
+
+  # GLM Persistence DLQ Settings
+  GLM_PERSISTENCE_DLQ_ENABLED: true # true or false
+  REDIS_DLQ_KEY: "dcsm:swm:glm_dlq" # Redis key for the DLQ list
+  DLQ_MAX_SIZE: 1000 # Max items in DLQ, 0 for unlimited
 
   # SWM Distributed Primitives (Redis-backed)
   REDIS_LOCK_KEY_PREFIX: "dcsm:lock:"

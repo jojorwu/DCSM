@@ -348,9 +348,15 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
     # --- GLM Client Methods (using async_retry_grpc_call decorator) ---
     # Note: The config for RETRY_MAX_ATTEMPTS etc. for SWM's GLM client calls
-    # will be SWMConfig's own values for these fields (which can override shared values).
+# Attempt to import pybreaker, make it optional
+try:
+    import pybreaker
+except ImportError:
+    pybreaker = None
+
+# --- GLM Client Methods (using async_retry_grpc_call decorator and internal circuit breaker) ---
     @async_retry_grpc_call(
-        max_attempts=config.RETRY_MAX_ATTEMPTS,
+        max_attempts=config.RETRY_MAX_ATTEMPTS, # Sourced from SWMConfig instance
         initial_delay_s=config.RETRY_INITIAL_DELAY_S,
         backoff_factor=config.RETRY_BACKOFF_FACTOR,
         jitter_fraction=config.RETRY_JITTER_FRACTION
@@ -359,8 +365,19 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for RetrieveKEMs.")
             raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
-        logger.debug(f"Calling GLM RetrieveKEMs (async, with retry). Timeout: {timeout}s")
-        return await self.aio_glm_stub.RetrieveKEMs(request, timeout=timeout)
+
+        async def actual_glm_call():
+            logger.debug(f"Calling GLM RetrieveKEMs (async). Timeout: {timeout}s")
+            return await self.aio_glm_stub.RetrieveKEMs(request, timeout=timeout)
+
+        if self.glm_circuit_breaker and self.config.CIRCUIT_BREAKER_ENABLED:
+            try:
+                return await self.glm_circuit_breaker.call_async(actual_glm_call)
+            except pybreaker.CircuitBreakerError as e: # type: ignore
+                logger.error(f"SWM: GLM Circuit Breaker open for RetrieveKEMs: {e}")
+                raise # Propagates to retry decorator, which should let it pass through
+        else:
+            return await actual_glm_call()
 
     @async_retry_grpc_call(
         max_attempts=config.RETRY_MAX_ATTEMPTS,
@@ -372,8 +389,19 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for StoreKEM.");
             raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
-        logger.debug(f"Calling GLM StoreKEM (async, with retry). Timeout: {timeout}s")
-        return await self.aio_glm_stub.StoreKEM(request, timeout=timeout)
+
+        async def actual_glm_call():
+            logger.debug(f"Calling GLM StoreKEM (async). Timeout: {timeout}s")
+            return await self.aio_glm_stub.StoreKEM(request, timeout=timeout)
+
+        if self.glm_circuit_breaker and self.config.CIRCUIT_BREAKER_ENABLED:
+            try:
+                return await self.glm_circuit_breaker.call_async(actual_glm_call)
+            except pybreaker.CircuitBreakerError as e: # type: ignore
+                logger.error(f"SWM: GLM Circuit Breaker open for StoreKEM: {e}")
+                raise
+        else:
+            return await actual_glm_call()
 
     @async_retry_grpc_call(
         max_attempts=config.RETRY_MAX_ATTEMPTS,
@@ -385,12 +413,24 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for BatchStoreKEMs.");
             raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
-        logger.debug(f"Calling GLM BatchStoreKEMs (async, with retry). KEMs: {len(request.kems)}, Timeout: {timeout}s")
-        response = await self.aio_glm_stub.BatchStoreKEMs(request, timeout=timeout)
+
+        async def actual_glm_call():
+            logger.debug(f"Calling GLM BatchStoreKEMs (async). KEMs: {len(request.kems)}, Timeout: {timeout}s")
+            return await self.aio_glm_stub.BatchStoreKEMs(request, timeout=timeout)
+
+        if self.glm_circuit_breaker and self.config.CIRCUIT_BREAKER_ENABLED:
+            try:
+                response = await self.glm_circuit_breaker.call_async(actual_glm_call)
+            except pybreaker.CircuitBreakerError as e: # type: ignore
+                logger.error(f"SWM: GLM Circuit Breaker open for BatchStoreKEMs: {e}")
+                raise
+        else:
+            response = await actual_glm_call()
+
         if response and response.failed_kem_references:
-             logger.warning(f"SWM: GLM BatchStoreKEMs (after retry) reported {len(response.failed_kem_references)} failures. Refs: {response.failed_kem_references}")
+             logger.warning(f"SWM: GLM BatchStoreKEMs (after CB/retry) reported {len(response.failed_kem_references)} failures. Refs: {response.failed_kem_references}")
         elif response:
-             logger.info(f"SWM: GLM BatchStoreKEMs (after retry) processed. Success: {len(response.successfully_stored_kems)}, Failures: {len(response.failed_kem_references if response.failed_kem_references else [])}")
+             logger.info(f"SWM: GLM BatchStoreKEMs (after CB/retry) processed. Success: {len(response.successfully_stored_kems)}, Failures: {len(response.failed_kem_references if response.failed_kem_references else [])}")
         return response
 
 
@@ -497,7 +537,9 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                                 logger.error(f"SWM: GLM Persistence Worker: Failed to re-queue KEM ID '{kem_proto_retry.id}', queue full. KEM may be lost.")
                                 break # Stop trying to re-queue if queue is full
                         else:
-                            logger.error(f"SWM: GLM Persistence Worker: KEM ID '{kem_proto_retry.id}' (batch processing failure) reached max retries ({self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES}). Discarding.")
+                            logger.error(f"SWM: GLM Persistence Worker: KEM ID '{kem_proto_retry.id}' (batch processing failure) reached max retries ({self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES}). Attempting to DLQ.")
+                            await self._add_to_dlq(kem_proto_retry, "Max retries reached during GLM batch persistence.", "batch_processing_failure")
+
 
             if self._stop_event.is_set() and self.glm_persistence_queue.empty():
                  logger.info("SWM: GLM Persistence Worker stopping as stop event is set and queue is empty.")
@@ -534,8 +576,41 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                     logger.error(f"SWM (Shutdown): Error sending final batch on exit: {e_final_batch_exit}", exc_info=True)
             elif final_batch_to_send:
                 logger.error(f"SWM: GLM Persistence Worker - GLM stub not available for final batch of {len(final_batch_to_send)} KEMs during shutdown. Data may be lost.")
+                for kem_final_dlq in final_batch_to_send: # Attempt to DLQ items from final unsent batch
+                    await self._add_to_dlq(kem_final_dlq, "Failed to send final batch during shutdown (GLM stub unavailable).", "shutdown_glm_unavailable")
             logger.info(f"SWM: GLM Persistence Worker processed {processed_during_shutdown_count} items during shutdown flush.")
         logger.info("SWM: GLM Persistence Worker stopped.")
+
+    async def _add_to_dlq(self, kem: kem_pb2.KEM, reason: str, failure_type: str):
+        if not self.config.GLM_PERSISTENCE_DLQ_ENABLED or not self.redis_client:
+            if self.config.GLM_PERSISTENCE_DLQ_ENABLED and not self.redis_client:
+                logger.error(f"SWM DLQ: DLQ is enabled but Redis client is unavailable. Cannot DLQ KEM ID '{kem.id}'.")
+            return
+
+        try:
+            # Serialize KEM to bytes (e.g., protobuf bytes) then base64 for JSON compatibility, or just store key fields.
+            # For simplicity, let's store KEM ID and key metadata. Full KEM might be large.
+            # A more robust DLQ might store the full KEM if needed for reprocessing.
+            # Here, we'll store a summary.
+            kem_summary_for_dlq = {
+                "failed_at_iso": Timestamp().GetCurrentTime().ToJsonString(), # google.protobuf.Timestamp
+                "original_kem_id": kem.id,
+                "content_type": kem.content_type,
+                "metadata_sample": dict(list(kem.metadata.items())[:3]), # Sample of metadata
+                "failure_reason": reason,
+                "failure_type": failure_type,
+                "has_embeddings": bool(kem.embeddings)
+            }
+            dlq_entry_json = json.dumps(kem_summary_for_dlq)
+
+            await self.redis_client.lpush(self.config.REDIS_DLQ_KEY, dlq_entry_json)
+            logger.info(f"SWM: KEM ID '{kem.id}' added to DLQ '{self.config.REDIS_DLQ_KEY}'. Reason: {reason}")
+
+            if self.config.DLQ_MAX_SIZE > 0:
+                await self.redis_client.ltrim(self.config.REDIS_DLQ_KEY, 0, self.config.DLQ_MAX_SIZE - 1)
+        except Exception as e_dlq:
+            logger.error(f"SWM: Failed to add KEM ID '{kem.id}' to DLQ: {e_dlq}", exc_info=True)
+
 
     async def _put_kem_to_cache_and_notify_async(self, kem: kem_pb2.KEM) -> None:
         if not kem or not kem.id:
