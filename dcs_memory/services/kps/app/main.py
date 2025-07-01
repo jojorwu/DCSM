@@ -10,14 +10,57 @@ from sentence_transformers import SentenceTransformer
 from .config import KPSConfig
 
 # Global configuration instance
+from pythonjsonlogger import jsonlogger # Import for JSON logging
+
 config = KPSConfig()
 
 # --- Logging Setup ---
-logging.basicConfig(
-    level=config.get_log_level_int(),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+def setup_logging(log_config: KPSConfig): # Changed type hint
+    handlers_list = []
+
+    if log_config.LOG_OUTPUT_MODE in ["json_stdout", "json_file"]:
+        json_fmt_str = getattr(log_config, 'LOG_JSON_FORMAT', log_config.LOG_FORMAT)
+        formatter = jsonlogger.JsonFormatter(fmt=json_fmt_str, datefmt=log_config.LOG_DATE_FORMAT)
+    else: # For "stdout", "file"
+        formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
+
+    if log_config.LOG_OUTPUT_MODE in ["stdout", "json_stdout"]:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        handlers_list.append(stream_handler)
+
+    if log_config.LOG_OUTPUT_MODE in ["file", "json_file"]:
+        if log_config.LOG_FILE_PATH:
+            try:
+                file_handler = logging.FileHandler(log_config.LOG_FILE_PATH)
+                file_handler.setFormatter(formatter)
+                handlers_list.append(file_handler)
+            except Exception as e:
+                print(f"Error setting up file logger at {log_config.LOG_FILE_PATH}: {e}. Falling back to stdout.", file=sys.stderr)
+                if not any(isinstance(h, logging.StreamHandler) for h in handlers_list):
+                    stream_handler_fallback = logging.StreamHandler(sys.stdout)
+                    stream_handler_fallback.setFormatter(formatter)
+                    handlers_list.append(stream_handler_fallback)
+        else:
+            print(f"LOG_OUTPUT_MODE is '{log_config.LOG_OUTPUT_MODE}' but LOG_FILE_PATH is not set. Defaulting to stdout.", file=sys.stderr)
+            if not handlers_list:
+                stream_handler_default = logging.StreamHandler(sys.stdout)
+                stream_handler_default.setFormatter(formatter)
+                handlers_list.append(stream_handler_default)
+
+    if not handlers_list:
+        print("Warning: No logging handlers configured. Defaulting to basic stdout.", file=sys.stderr)
+        logging.basicConfig(level=log_config.get_log_level_int())
+        return
+
+    logging.basicConfig(
+        level=log_config.get_log_level_int(),
+        handlers=handlers_list,
+        force=True
+    )
+    # Note: format and datefmt in basicConfig are less relevant when handlers are specified with their own formatters.
+
+setup_logging(config)
 logger = logging.getLogger(__name__)
 # --- End Logging Setup ---
 

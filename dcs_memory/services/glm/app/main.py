@@ -21,12 +21,71 @@ app_dir = os.path.dirname(current_script_path)
 
 config = GLMConfig()
 
-logging.basicConfig(
-    level=config.get_log_level_int(),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
+from pythonjsonlogger import jsonlogger # Import for JSON logging
+
+# Centralized logging setup
+def setup_logging(log_config: GLMConfig):
+    handlers_list = []
+
+    # Determine formatter based on output mode
+    if log_config.LOG_OUTPUT_MODE in ["json_stdout", "json_file"]:
+        # For JSON, LOG_FORMAT can define the fields. A common practice:
+        # Example: "(asctime) (levelname) (name) (module) (funcName) (lineno) (message)"
+        # These will become keys in the JSON log.
+        # If LOG_FORMAT is the default text one, JsonFormatter will still work but might produce less structured JSON.
+        # It's better if LOG_FORMAT is tailored for JSON keys when using JsonFormatter.
+        # For simplicity, we can use a default JSON format string or make LOG_FORMAT more flexible.
+        # Let's assume LOG_FORMAT is suitable or use a generic set of fields for JSON.
+        # The `python-json-logger` adds default fields like 'asctime', 'levelname', 'message'.
+        # The format string for JsonFormatter specifies *additional* fields from the LogRecord.
+        json_fmt_str = getattr(log_config, 'LOG_JSON_FORMAT', log_config.LOG_FORMAT) # Could add LOG_JSON_FORMAT to config
+        formatter = jsonlogger.JsonFormatter(fmt=json_fmt_str, datefmt=log_config.LOG_DATE_FORMAT)
+    else: # For "stdout", "file"
+        formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
+
+    if log_config.LOG_OUTPUT_MODE in ["stdout", "json_stdout"]:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        handlers_list.append(stream_handler)
+
+    if log_config.LOG_OUTPUT_MODE in ["file", "json_file"]:
+        if log_config.LOG_FILE_PATH:
+            # TODO: Ensure directory for LOG_FILE_PATH exists or handle creation/permissions.
+            try:
+                file_handler = logging.FileHandler(log_config.LOG_FILE_PATH)
+                file_handler.setFormatter(formatter)
+                handlers_list.append(file_handler)
+            except Exception as e:
+                # Fallback to stdout if file handler fails
+                print(f"Error setting up file logger at {log_config.LOG_FILE_PATH}: {e}. Falling back to stdout.", file=sys.stderr)
+                if not any(isinstance(h, logging.StreamHandler) for h in handlers_list): # Avoid duplicate stdout
+                    stream_handler_fallback = logging.StreamHandler(sys.stdout)
+                    stream_handler_fallback.setFormatter(formatter)
+                    handlers_list.append(stream_handler_fallback)
+        else:
+            print(f"LOG_OUTPUT_MODE is '{log_config.LOG_OUTPUT_MODE}' but LOG_FILE_PATH is not set. Defaulting to stdout if no other handler.", file=sys.stderr)
+            if not handlers_list: # If no handlers configured yet (e.g. only file mode was chosen but path was missing)
+                stream_handler_default = logging.StreamHandler(sys.stdout)
+                stream_handler_default.setFormatter(formatter)
+                handlers_list.append(stream_handler_default)
+
+    if not handlers_list: # Ultimate fallback if somehow no handlers were added
+        print("Warning: No logging handlers configured. Defaulting to basic stdout.", file=sys.stderr)
+        logging.basicConfig(level=log_config.get_log_level_int())
+        return
+
+    logging.basicConfig(
+        level=log_config.get_log_level_int(),
+        # format and datefmt in basicConfig are not used when handlers are specified,
+        # as handlers have their own formatters.
+        handlers=handlers_list,
+        force=True # Override any existing basicConfig
+    )
+    # Ensure all loggers obtained via getLogger propagate to the handlers set by basicConfig.
+    # The level set on basicConfig (root logger) will be the effective level unless child loggers override it.
+
+setup_logging(config)
+logger = logging.getLogger(__name__) # Get a logger specific to this module
 
 from generated_grpc import kem_pb2
 from generated_grpc import glm_service_pb2

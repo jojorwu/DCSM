@@ -22,8 +22,16 @@ shared:
   GRPC_SERVER_MAX_CONNECTION_AGE_MS: 0             # 0 for infinite (server-side)
   GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: 0       # 0 for infinite (server-side)
 
+  # Advanced Logging Configuration
+  LOG_FORMAT: "%(asctime)s - %(name)s - %(levelname)-8s - %(message)s" # Default: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  LOG_DATE_FORMAT: "%Y-%m-%d %H:%M:%S,%03d" # Default
+  LOG_OUTPUT_MODE: "stdout" # Options: "stdout", "file", "json_stdout", "json_file"
+  LOG_FILE_PATH: null # Example: "/var/log/dcsm/dcsm_service.log" (used if mode is 'file' or 'json_file')
+
 glm:
-  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_* from shared unless overridden
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_* from shared unless overridden
+  GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS: true      # true or false
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_* from shared unless overridden
   DB_FILENAME: "glm_prod_metadata.sqlite3"
   QDRANT_HOST: "dcsm_qdrant"
   QDRANT_PORT: 6333

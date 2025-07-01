@@ -34,7 +34,73 @@ if aioredis:
 else:
     RedisKemCache = None # type: ignore
 
-logger = logging.getLogger(__name__)
+# config instance is created after setup_logging is defined, so pass it then.
+# logger will be configured by setup_logging.
+
+from .config import SWMConfig # Moved up to be available for setup_logging type hint
+
+# Centralized logging setup
+def setup_logging(log_config: SWMConfig): # Type hint SWMConfig
+    handlers_list = []
+    formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
+
+    if log_config.LOG_OUTPUT_MODE in ["stdout", "json_stdout"]:
+        # TODO: JSON Formatter for json_stdout
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        handlers_list.append(stream_handler)
+
+    if log_config.LOG_OUTPUT_MODE in ["file", "json_file"]:
+        if log_config.LOG_FILE_PATH:
+            # TODO: JSON Formatter for json_file, directory creation, rotation
+            try:
+                file_handler = logging.FileHandler(log_config.LOG_FILE_PATH)
+                file_handler.setFormatter(formatter)
+                handlers_list.append(file_handler)
+            except Exception as e:
+                print(f"Error setting up file logger for SWM at {log_config.LOG_FILE_PATH}: {e}. Falling back to stdout.", file=sys.stderr)
+                if not any(isinstance(h, logging.StreamHandler) for h in handlers_list):
+                    stream_handler_fallback = logging.StreamHandler(sys.stdout)
+                    stream_handler_fallback.setFormatter(formatter)
+                    handlers_list.append(stream_handler_fallback)
+        else:
+            print(f"SWM: LOG_OUTPUT_MODE is '{log_config.LOG_OUTPUT_MODE}' but LOG_FILE_PATH is not set. Defaulting to stdout.", file=sys.stderr)
+            if not handlers_list: # If no handlers configured yet
+                stream_handler_default = logging.StreamHandler(sys.stdout)
+                stream_handler_default.setFormatter(formatter)
+                handlers_list.append(stream_handler_default)
+
+    if not handlers_list:
+        print("SWM Warning: No logging handlers configured. Defaulting to basic stdout.", file=sys.stderr)
+        # BasicConfig without handlers will add a default StreamHandler to sys.stderr
+        logging.basicConfig(level=log_config.get_log_level_int(), format=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT, force=True)
+        return logging.getLogger(__name__) # Return a logger instance
+
+    # Configure root logger with the determined handlers and level
+    logging.basicConfig(
+        level=log_config.get_log_level_int(),
+        handlers=handlers_list,
+        force=True # This will replace any existing handlers on the root logger
+    )
+    # It's generally better to configure the root logger if using basicConfig,
+    # or get the root logger and add handlers to it.
+    # The format/datefmt in basicConfig is only used if it has to create a default handler.
+    # Since we provide handlers, they use their own formatter.
+
+    # Get the specific logger instance for the module.
+    # All child loggers will inherit level from root if not set explicitly.
+    module_logger = logging.getLogger(__name__)
+    # Ensure the module logger itself is also set to the configured level
+    # (though basicConfig on root should generally cover this for propagation)
+    module_logger.setLevel(log_config.get_log_level_int())
+    return module_logger
+
+
+# Create config object first
+config = SWMConfig() # Global config instance for the module
+# Then setup logging using this config object
+logger = setup_logging(config) # Global logger instance for the module
+
 
 from generated_grpc import kem_pb2
 from generated_grpc import glm_service_pb2
@@ -45,10 +111,12 @@ from generated_grpc import swm_service_pb2_grpc
 # IndexedLRUCache class definition is removed.
 
 class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemoryServiceServicer):
-    def __init__(self):
-        self.config = SWMConfig()
-        logger.setLevel(self.config.get_log_level_int())
-        logger.info(f"Initializing SharedWorkingMemoryServiceImpl...")
+    def __init__(self, service_config: SWMConfig): # Accept config instance
+        self.config = service_config # Use passed config
+        # Logger is already configured at module level.
+        # Setting level on the instance logger is not standard if module logger is used.
+        # logger.setLevel(self.config.get_log_level_int()) # This would affect the global module logger
+        logger.info(f"Initializing SharedWorkingMemoryServiceImpl with config ID: {id(self.config)}...")
 
         self.aio_glm_channel: Optional[grpc_aio.Channel] = None
         self.aio_glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None
@@ -679,59 +747,33 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         return await self.counter_manager.get_counter(request.counter_id)
 
 async def serve():
-    module_cfg = SWMConfig()
-    logging.basicConfig(
-        level=module_cfg.get_log_level_int(),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)],
-        force=True
-    )
+    # module_cfg = SWMConfig() # config is already created globally at module level
+    # Logging is already set up using the global 'config' instance.
 
-    # Construct server options from config
+    # Construct server options from the global 'config' instance
     server_options = [
-        ('grpc.keepalive_time_ms', module_cfg.GRPC_KEEPALIVE_TIME_MS),
-        ('grpc.keepalive_timeout_ms', module_cfg.GRPC_KEEPALIVE_TIMEOUT_MS),
-        ('grpc.keepalive_permit_without_calls', 1 if module_cfg.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS else 0),
-        ('grpc.max_receive_message_length', module_cfg.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
-        ('grpc.max_send_message_length', module_cfg.GRPC_MAX_SEND_MESSAGE_LENGTH),
-        ('grpc.max_connection_idle_ms', module_cfg.GRPC_SERVER_MAX_CONNECTION_IDLE_MS),
-        ('grpc.max_connection_age_ms', module_cfg.GRPC_SERVER_MAX_CONNECTION_AGE_MS),
-        ('grpc.max_connection_age_grace_ms', module_cfg.GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS),
+        ('grpc.keepalive_time_ms', config.GRPC_KEEPALIVE_TIME_MS),
+        ('grpc.keepalive_timeout_ms', config.GRPC_KEEPALIVE_TIMEOUT_MS),
+        ('grpc.keepalive_permit_without_calls', 1 if config.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS else 0),
+        ('grpc.max_receive_message_length', config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
+        ('grpc.max_send_message_length', config.GRPC_MAX_SEND_MESSAGE_LENGTH),
+        ('grpc.max_connection_idle_ms', config.GRPC_SERVER_MAX_CONNECTION_IDLE_MS),
+        ('grpc.max_connection_age_ms', config.GRPC_SERVER_MAX_CONNECTION_AGE_MS),
+        ('grpc.max_connection_age_grace_ms', config.GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS),
     ]
-    # Filter out options with non-positive values for time/age, as gRPC might not like 0 for some.
-    # Or ensure Pydantic models have minimums if 0 means "disabled" but gRPC expects positive.
-    # For keepalives, 0 usually means disabled or system default. Max connection age/idle 0 means infinite.
-    # For message length, -1 often means unlimited, 0 is invalid.
-    # Let's assume Pydantic defaults are sensible (e.g. >0 for times, 0 for infinite ages, >0 for lengths).
-    # The current Pydantic defaults are mostly fine.
-    # Filter options where value is 0 for time/age/grace and it means "infinite" or "disabled"
-    # For message lengths, they default to 4MB, so they are positive.
-    # For keepalive_time_ms, if 0, it might disable it. If that's intended, fine.
-    # The grpc library itself has defaults if options are not provided.
-    # Providing them explicitly from config gives control.
-
-    # Let's filter options that are 0 if they semantically mean "disabled" or "infinite"
-    # and gRPC might expect them to be absent or >0.
-    # For example, max_connection_idle_ms = 0 means infinite.
-    # Keepalive_time_ms = 0 might be problematic if not handled by underlying C-core as "use default".
-    # Python gRPC docs suggest default for keepalive_time_ms is INT_MAX.
-    # For safety, let's only pass time/age values if they are > 0.
-    # Message lengths are always > 0 from defaults.
     final_server_options = []
     for key, value in server_options:
-        if "_MS" in key.upper() and value <= 0: # For time, age, grace in ms
+        if "_MS" in key.upper() and value <= 0:
             if key in ['grpc.max_connection_idle_ms', 'grpc.max_connection_age_ms', 'grpc.max_connection_age_grace_ms']:
-                 # For these, 0 means infinite/disabled, so we can skip passing them if 0 to use gRPC default behavior for "infinite"
                  pass
-            else: # For other _MS values like keepalives, 0 might be invalid or disable. Pass if intended.
+            else:
                  final_server_options.append((key,value))
         else:
             final_server_options.append((key,value))
 
-
     server=grpc_aio.server(options=final_server_options)
     try:
-        servicer_instance=SharedWorkingMemoryServiceImpl()
+        servicer_instance=SharedWorkingMemoryServiceImpl(config) # Pass the global config
     except SystemExit as e_init_fail:
         logger.critical(f"SWM Servicer initialization failed critically, cannot start server: {e_init_fail}")
         return

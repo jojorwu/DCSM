@@ -45,6 +45,25 @@ class BaseServiceConfig(BaseSettings):
     GRPC_SERVER_MAX_CONNECTION_AGE_MS: int = Field(default=0, description="gRPC server max connection age in ms (0 for infinite).")
     GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: int = Field(default=0, description="gRPC server max connection age grace period in ms (0 for infinite).")
 
+    # Advanced Logging Configuration
+    LOG_FORMAT: str = Field(
+        default="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        description="Logging format string."
+    )
+    LOG_DATE_FORMAT: str = Field(
+        default="%Y-%m-%d %H:%M:%S,%03d", # Example: 2023-10-27 10:30:00,123
+        description="Logging date format string."
+    )
+    LOG_OUTPUT_MODE: Literal["stdout", "file", "json_stdout", "json_file"] = Field(
+        default="stdout",
+        description="Logging output mode: stdout, file, json_stdout, json_file."
+    )
+    LOG_FILE_PATH: Optional[str] = Field(
+        default=None,
+        description="Path to the log file, used if LOG_OUTPUT_MODE is 'file' or 'json_file'."
+    )
+    # Optional: For JSON logging, specify if default log record fields should be renamed or if specific ones are desired
+    # For now, we'll rely on python-json-logger's defaults and ability to add extra fields via logging calls.
 
     @classmethod
     def settings_customise_sources(
