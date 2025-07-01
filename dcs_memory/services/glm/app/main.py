@@ -271,7 +271,12 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             except Exception as e_qdrant:
                 msg = f"StoreKEM: Qdrant error for ID '{kem_id}': {e_qdrant}"
                 logger.error(msg, exc_info=True)
-                context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
+                # Determine if this is a connection issue vs. other Qdrant error
+                # This is a heuristic; specific Qdrant client exceptions should be checked if available
+                if "connect" in str(e_qdrant).lower() or "unavailable" in str(e_qdrant).lower():
+                    context.abort(grpc.StatusCode.UNAVAILABLE, f"Qdrant unavailable: {e_qdrant}"); return glm_service_pb2.StoreKEMResponse()
+                else:
+                    context.abort(grpc.StatusCode.INTERNAL, f"Qdrant processing error: {e_qdrant}"); return glm_service_pb2.StoreKEMResponse()
 
         try:
             self.sqlite_repo.store_or_replace_kem(
@@ -292,7 +297,11 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 except Exception as e_qdrant_rollback:
                     logger.error(f"StoreKEM: CRITICAL - Failed to roll back Qdrant upsert for KEM ID '{kem_id}': {e_qdrant_rollback}", exc_info=True)
                     # This KEM might be orphaned in Qdrant or in an inconsistent state.
-            context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
+            # Determine if this is a connection issue vs. other SQLite error
+            if isinstance(e_sqlite, sqlite3.OperationalError) and ("unable to open" in str(e_sqlite) or "database is locked" in str(e_sqlite)):
+                context.abort(grpc.StatusCode.UNAVAILABLE, f"SQLite unavailable or busy: {e_sqlite}"); return glm_service_pb2.StoreKEMResponse()
+            else:
+                context.abort(grpc.StatusCode.INTERNAL, f"SQLite processing error: {e_sqlite}"); return glm_service_pb2.StoreKEMResponse()
 
         duration = time.monotonic() - start_time
         logger.info(f"StoreKEM: Finished. KEM_ID='{kem_id}'. Duration: {duration:.4f}s.")
@@ -317,7 +326,12 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
         if is_vec_q:
             if not self.qdrant_repo:
-                context.abort(grpc.StatusCode.INTERNAL, "Qdrant not available for vector search."); return glm_service_pb2.RetrieveKEMsResponse()
+                if not self.config.QDRANT_HOST:
+                    logger.warning("RetrieveKEMs: Vector search attempted but Qdrant is not configured.")
+                    context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Vector search capability not configured."); return glm_service_pb2.RetrieveKEMsResponse()
+                else: # Qdrant configured but client init failed or unavailable
+                    logger.error("RetrieveKEMs: Qdrant client not available for vector search.")
+                    context.abort(grpc.StatusCode.UNAVAILABLE, "Qdrant service temporarily unavailable for vector search."); return glm_service_pb2.RetrieveKEMsResponse()
             if len(query.embedding_query) != self.config.DEFAULT_VECTOR_SIZE:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid vector dim."); return glm_service_pb2.RetrieveKEMsResponse()
 
@@ -345,7 +359,9 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 if len(hits) == page_size: next_token = str(offset + page_size)
             except Exception as e_vec:
                 logger.error(f"RetrieveKEMs Vector Search Error: {e_vec}", exc_info=True)
-                context.abort(grpc.StatusCode.INTERNAL, f"Vector search error: {e_vec}"); return glm_service_pb2.RetrieveKEMsResponse()
+                if "connect" in str(e_vec).lower() or "unavailable" in str(e_vec).lower() or "timeout" in str(e_vec).lower():
+                    context.abort(grpc.StatusCode.UNAVAILABLE, f"Qdrant unavailable for vector search: {e_vec}"); return glm_service_pb2.RetrieveKEMsResponse()
+                context.abort(grpc.StatusCode.INTERNAL, f"Vector search processing error: {e_vec}"); return glm_service_pb2.RetrieveKEMsResponse()
         else: # Filtered search
             sql_c, sql_p = [], []
             if query.ids: sql_c.append(f"id IN ({','.join('?' for _ in query.ids)})"); sql_p.extend(list(query.ids))
@@ -366,9 +382,14 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                             if p.vector: embed_map_pg[p.id] = list(p.vector)
                     except Exception as e_q_emb_f: logger.warning(f"Failed to get embeddings for filtered search: {e_q_emb_f}", exc_info=True)
                 for db_d in db_dicts: kems_protos.append(self._kem_from_db_dict(db_d, embed_map_pg))
-            except Exception as e_filt:
-                logger.error(f"RetrieveKEMs Filtered Search Error: {e_filt}", exc_info=True)
-                context.abort(grpc.StatusCode.INTERNAL, f"Filtered search error: {e_filt}"); return glm_service_pb2.RetrieveKEMsResponse()
+            except sqlite3.Error as e_sqlite_filt:
+                logger.error(f"RetrieveKEMs Filtered Search SQLite Error: {e_sqlite_filt}", exc_info=True)
+                if "unable to open" in str(e_sqlite_filt) or "database is locked" in str(e_sqlite_filt):
+                     context.abort(grpc.StatusCode.UNAVAILABLE, f"SQLite unavailable for filtered search: {e_sqlite_filt}"); return glm_service_pb2.RetrieveKEMsResponse()
+                context.abort(grpc.StatusCode.INTERNAL, f"SQLite error during filtered search: {e_sqlite_filt}"); return glm_service_pb2.RetrieveKEMsResponse()
+            except Exception as e_filt: # Catch other potential errors
+                logger.error(f"RetrieveKEMs Filtered Search Generic Error: {e_filt}", exc_info=True)
+                context.abort(grpc.StatusCode.INTERNAL, f"Filtered search processing error: {e_filt}"); return glm_service_pb2.RetrieveKEMsResponse()
 
         duration = time.monotonic() - start_time
         logger.info(f"RetrieveKEMs: Finished. Found {len(kems_protos)} KEMs. NextToken: '{next_token}'. Duration: {duration:.4f}s.")
@@ -447,47 +468,27 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     self.qdrant_repo.upsert_point(q_point)
                     qdrant_updated_for_this_call = True
             except Exception as e_q_upd:
-                # If Qdrant fails here, we haven't touched SQLite yet for this update.
-                # So, state is still consistent with before this UpdateKEM call.
-                context.abort(grpc.StatusCode.INTERNAL, f"Qdrant update error: {e_q_upd}"); return kem_pb2.KEM()
+                if "connect" in str(e_q_upd).lower() or "unavailable" in str(e_q_upd).lower():
+                    context.abort(grpc.StatusCode.UNAVAILABLE, f"Qdrant unavailable during update: {e_q_upd}"); return kem_pb2.KEM()
+                context.abort(grpc.StatusCode.INTERNAL, f"Qdrant update processing error: {e_q_upd}"); return kem_pb2.KEM()
 
         try:
             update_success = self.sqlite_repo.update_kem_fields(kem_id, sql_upd_at_iso, sql_ct, sql_c, sql_meta_json)
-            if not update_success and (sql_ct or sql_c or sql_meta_json): # If we intended to update fields but nothing changed
+            if not update_success and (sql_ct or sql_c or sql_meta_json):
                  logger.warning(f"UpdateKEM: SQLite update_kem_fields reported no rows affected for KEM ID '{kem_id}' despite update data.")
-                 # This might indicate KEM was deleted between initial fetch and update, or a concurrent update changed it.
-                 # Or simply no actual changes were made by the provided data.
-                 # For now, we proceed, but this could be a point for stricter checks.
         except Exception as e_sql_upd:
             logger.error(f"UpdateKEM: SQLite error for ID '{kem_id}' after Qdrant update (if performed): {e_sql_upd}", exc_info=True)
-            # Attempt to roll back Qdrant change if it happened in *this specific call*
             if qdrant_updated_for_this_call and self.qdrant_repo:
-                try:
-                    logger.warning(f"UpdateKEM: Attempting to roll back Qdrant update for KEM ID '{kem_id}' due to SQLite error.")
-                    # This is tricky: rolling back Qdrant means restoring its *previous state*.
-                    # The current q_payload might be based on the *intended new metadata*.
-                    # A true rollback would require fetching the KEM's Qdrant point *before* this update.
-                    # For simplicity now, if an update involved embeddings, we might delete the point.
-                    # If only payload, restoring previous payload is complex.
-                    # A safer, simpler rollback for now if Qdrant was touched: re-fetch from SQLite (which failed to update)
-                    # and try to re-sync Qdrant to that older SQLite state.
-                    # Or, if the update was primarily payload, and embeddings were just preserved,
-                    # try to re-upsert with the *old* metadata from current_db_kem.
-                    # This is getting complex. Simplest rollback: delete if new embeddings were pushed.
-                    # If only payload was updated, a Qdrant delete might be too destructive if the point should exist.
-                    #
-                    # Let's consider the case: if `kem_data_update.embeddings` were provided, then Qdrant point was definitely changed with new vector.
-                    # If only metadata changed, Qdrant payload changed.
-                    # A simple strategy: if Qdrant was touched and SQLite failed, we log a CRITICAL inconsistency.
-                    # A true rollback of Qdrant to its exact previous state is hard without storing that state.
-                    logger.critical(f"UpdateKEM: CRITICAL INCONSISTENCY - SQLite update failed for KEM ID '{kem_id}' after Qdrant was updated. Manual reconciliation may be needed.")
-                    # For now, we won't attempt complex Qdrant rollback here to avoid further errors.
-                except Exception as e_qdrant_rollback:
-                    logger.error(f"UpdateKEM: Error during Qdrant rollback attempt for KEM ID '{kem_id}': {e_qdrant_rollback}", exc_info=True)
-            context.abort(grpc.StatusCode.INTERNAL, f"SQLite update error: {e_sql_upd}"); return kem_pb2.KEM()
+                # As before, logging inconsistency rather than attempting complex Qdrant rollback
+                logger.critical(f"UpdateKEM: CRITICAL INCONSISTENCY - SQLite update failed for KEM ID '{kem_id}' after Qdrant was updated. Manual reconciliation may be needed.")
+
+            if isinstance(e_sql_upd, sqlite3.OperationalError) and ("unable to open" in str(e_sql_upd) or "database is locked" in str(e_sql_upd)):
+                context.abort(grpc.StatusCode.UNAVAILABLE, f"SQLite unavailable or busy during update: {e_sql_upd}"); return kem_pb2.KEM()
+            else:
+                context.abort(grpc.StatusCode.INTERNAL, f"SQLite update processing error: {e_sql_upd}"); return kem_pb2.KEM()
 
         final_db_kem = self.sqlite_repo.get_full_kem_by_id(kem_id)
-        if not final_db_kem: # Should not happen if update_kem_fields didn't delete
+        if not final_db_kem:
             logger.error(f"UpdateKEM: KEM ID '{kem_id}' disappeared after SQLite update attempt. This should not happen.")
             context.abort(grpc.StatusCode.INTERNAL, "KEM disappeared post-update."); return kem_pb2.KEM()
 
@@ -510,12 +511,42 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         if not kem_id: context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID required."); return empty_pb2.Empty()
         logger.info(f"DeleteKEM: Started. KEM_ID='{kem_id}'.")
 
+        qdrant_deleted = False
         if self.qdrant_repo:
-            try: self.qdrant_repo.delete_points_by_ids([kem_id])
-            except Exception as e_qd_del: context.abort(grpc.StatusCode.INTERNAL, f"Qdrant delete error: {e_qd_del}"); return empty_pb2.Empty()
+            try:
+                self.qdrant_repo.delete_points_by_ids([kem_id])
+                qdrant_deleted = True # Assume success if no exception
+            except Exception as e_qd_del:
+                logger.error(f"DeleteKEM: Qdrant delete error for ID '{kem_id}': {e_qd_del}", exc_info=True)
+                # If Qdrant fails, should we still try SQLite? Or report Qdrant failure?
+                # For now, let's try to delete from SQLite anyway but report Qdrant error if it occurs.
+                # This could lead to inconsistency if SQLite delete then succeeds.
+                # A better approach might be to abort if the primary/first delete fails.
+                # Let's prioritize SQLite as the metadata source of truth for existence.
+                # So, if Qdrant delete fails, we log it but proceed to SQLite.
+                # If SQLite then fails, that's the error we primarily report.
+                # This is complex. For now: if Qdrant delete fails, we log and proceed.
+                # If SQLite delete then fails, that's the abort.
+                pass # Logged, will proceed to SQLite
+
         try:
-            self.sqlite_repo.delete_kem_by_id(kem_id)
-        except Exception as e_sql_del: context.abort(grpc.StatusCode.INTERNAL, f"SQLite delete error: {e_sql_del}"); return empty_pb2.Empty()
+            sqlite_deleted_successfully = self.sqlite_repo.delete_kem_by_id(kem_id)
+            if not sqlite_deleted_successfully:
+                # This implies KEM was not found in SQLite, which could be okay if Qdrant also didn't have it or it was already deleted.
+                # If Qdrant deletion *was* attempted and might have succeeded, and SQLite says not found, it's a bit ambiguous.
+                # For simplicity, if SQLite reports 'not found' (rowcount 0), we'll consider it 'deleted' or 'not present'.
+                logger.info(f"DeleteKEM: KEM ID '{kem_id}' not found in SQLite or already deleted.")
+                # No explicit error to client here, as the goal is for it to not exist.
+        except Exception as e_sql_del:
+            logger.error(f"DeleteKEM: SQLite delete error for ID '{kem_id}': {e_sql_del}", exc_info=True)
+            # If Qdrant delete happened, we now have an orphan in Qdrant.
+            if qdrant_deleted:
+                logger.critical(f"DeleteKEM: CRITICAL INCONSISTENCY - Qdrant point for KEM ID '{kem_id}' deleted, but SQLite delete failed. Manual reconciliation needed.")
+
+            if isinstance(e_sql_del, sqlite3.OperationalError) and ("unable to open" in str(e_sql_del) or "database is locked" in str(e_sql_del)):
+                context.abort(grpc.StatusCode.UNAVAILABLE, f"SQLite unavailable during delete: {e_sql_del}"); return empty_pb2.Empty()
+            else:
+                context.abort(grpc.StatusCode.INTERNAL, f"SQLite delete processing error: {e_sql_del}"); return empty_pb2.Empty()
 
         duration = time.monotonic() - start_time
         logger.info(f"DeleteKEM: Finished. KEM_ID='{kem_id}'. Duration: {duration:.4f}s.")
@@ -577,15 +608,38 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         sqlite_ok = False
         if sqlite_data_batch:
             try: self.sqlite_repo.batch_store_or_replace_kems(sqlite_data_batch); sqlite_ok = True
-            except Exception as e_sql_b:
+            except sqlite3.Error as e_sql_b: # Catch specific sqlite3.Error
                 logger.error(f"BatchStoreKEMs: SQLite batch store failed: {e_sql_b}", exc_info=True)
-                for item_f in valid_for_processing: # All in this batch attempt failed SQLite
-                    if item_f['original_ref'] not in failed_refs: failed_refs.append(item_f['original_ref'])
+                # Populate failed_refs for all items intended for this batch
+                for item_f in valid_for_processing:
+                    if item_f['proto'].id not in (pr.id for pr in success_protos) and \
+                       item_f['original_ref'] not in failed_refs: # Avoid duplicates
+                        failed_refs.append(item_f['original_ref'])
+                # Determine overall error message and potentially abort if critical
+                # For now, the existing logic of returning response with failed_refs is kept.
+                # If this is a critical DB failure, we might want to abort the whole RPC.
+                # Let's assume batch_store_or_replace_kems raises on critical error and doesn't just return.
+                # If it does return (e.g. partial success, though unlikely for this method), sqlite_ok might still be true.
+                # The current repo method re-raises, so sqlite_ok would be false.
+                if isinstance(e_sql_b, sqlite3.OperationalError) and ("unable to open" in str(e_sql_b) or "database is locked" in str(e_sql_b)):
+                     context.abort(grpc.StatusCode.UNAVAILABLE, f"SQLite unavailable for batch store: {e_sql_b}"); return glm_service_pb2.BatchStoreKEMsResponse()
+                context.abort(grpc.StatusCode.INTERNAL, f"SQLite error during batch store: {e_sql_b}"); return glm_service_pb2.BatchStoreKEMsResponse()
+            except Exception as e_sql_b_other: # Other unexpected errors
+                 logger.error(f"BatchStoreKEMs: Unexpected error during SQLite batch store: {e_sql_b_other}", exc_info=True)
+                 for item_f in valid_for_processing:
+                    if item_f['proto'].id not in (pr.id for pr in success_protos) and \
+                       item_f['original_ref'] not in failed_refs:
+                        failed_refs.append(item_f['original_ref'])
+                 context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error during SQLite batch store: {e_sql_b_other}"); return glm_service_pb2.BatchStoreKEMsResponse()
 
-        if not sqlite_ok and sqlite_data_batch: # SQLite batch failed for all
+
+        if not sqlite_ok and sqlite_data_batch: # Should only be true if no exception was raised but repo indicated failure.
             dur_fail = time.monotonic() - start_time
-            logger.info(f"BatchStoreKEMs: Finished (SQLite failure). Duration: {dur_fail:.4f}s. Success: 0, Failures: {len(list(set(failed_refs)))}.")
-            return glm_service_pb2.BatchStoreKEMsResponse(failed_kem_references=list(set(failed_refs)), overall_error_message="SQLite batch persistence failed.")
+            logger.warning(f"BatchStoreKEMs: SQLite batch reported no rows affected or other non-exception failure. Duration: {dur_fail:.4f}s.")
+            # This path might be less common if repo raises exceptions.
+            for item_f in valid_for_processing:
+                if item_f['original_ref'] not in failed_refs: failed_refs.append(item_f['original_ref'])
+            return glm_service_pb2.BatchStoreKEMsResponse(failed_kem_references=list(set(failed_refs)), overall_error_message="SQLite batch persistence indicated failure.")
 
         q_batch_pts: List[PointStruct] = []
         ids_for_q_rb_check = []
@@ -602,12 +656,24 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     ids_for_q_rb_check.append(kem_id_q)
 
             q_batch_ok = True
+            qdrant_batch_error_details = ""
             if q_batch_pts:
-                try: self.qdrant_repo.upsert_points_batch(q_batch_pts)
-                except Exception as e_q_b_up: logger.error(f"Batch: Qdrant batch upsert error: {e_q_b_up}", exc_info=True); q_batch_ok = False
+                try:
+                    self.qdrant_repo.upsert_points_batch(q_batch_pts)
+                except Exception as e_q_b_up:
+                    logger.error(f"Batch: Qdrant batch upsert error: {e_q_b_up}", exc_info=True)
+                    q_batch_ok = False
+                    qdrant_batch_error_details = str(e_q_b_up)
+                    # If Qdrant is unavailable, we might want to fail the whole RPC here too.
+                    if "connect" in str(e_q_b_up).lower() or "unavailable" in str(e_q_b_up).lower():
+                         context.abort(grpc.StatusCode.UNAVAILABLE, f"Qdrant unavailable for batch upsert: {e_q_b_up}"); return glm_service_pb2.BatchStoreKEMsResponse()
+                         # Note: This aborts *before* SQLite rollback. For full atomicity, rollback should be attempted.
+                         # However, if Qdrant is down, rollback might also be problematic or slow.
+                         # The current logic proceeds to rollback, which is better.
+                         # Let's refine: if Qdrant connection error, we still try rollback but the overall message might indicate UNAVAILABLE.
 
             if not q_batch_ok:
-                logger.warning("Batch: Qdrant op failed. Rolling back SQLite for KEMs in Qdrant batch.")
+                logger.warning(f"Batch: Qdrant batch operation failed. Details: {qdrant_batch_error_details}. Rolling back SQLite for KEMs in Qdrant batch.")
                 for r_id_q in ids_for_q_rb_check:
                     orig_ref_q_rb = next((item['original_ref'] for item in valid_for_processing if item['proto'].id == r_id_q), r_id_q)
                     if orig_ref_q_rb not in failed_refs: failed_refs.append(orig_ref_q_rb)

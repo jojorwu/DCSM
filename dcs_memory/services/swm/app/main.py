@@ -40,22 +40,26 @@ else:
 # config instance is created after setup_logging is defined, so pass it then.
 # logger will be configured by setup_logging.
 
-from .config import SWMConfig # Moved up to be available for setup_logging type hint
+from .config import SWMConfig
+from pythonjsonlogger import jsonlogger # Ensure this is imported if used by setup_logging
 
 # Centralized logging setup
-def setup_logging(log_config: SWMConfig): # Type hint SWMConfig
+def setup_logging(log_config: SWMConfig):
     handlers_list = []
-    formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
+
+    if log_config.LOG_OUTPUT_MODE in ["json_stdout", "json_file"]:
+        json_fmt_str = getattr(log_config, 'LOG_JSON_FORMAT', log_config.LOG_FORMAT)
+        formatter = jsonlogger.JsonFormatter(fmt=json_fmt_str, datefmt=log_config.LOG_DATE_FORMAT)
+    else: # For "stdout", "file"
+        formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
 
     if log_config.LOG_OUTPUT_MODE in ["stdout", "json_stdout"]:
-        # TODO: JSON Formatter for json_stdout
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
         handlers_list.append(stream_handler)
 
     if log_config.LOG_OUTPUT_MODE in ["file", "json_file"]:
         if log_config.LOG_FILE_PATH:
-            # TODO: JSON Formatter for json_file, directory creation, rotation
             try:
                 file_handler = logging.FileHandler(log_config.LOG_FILE_PATH)
                 file_handler.setFormatter(formatter)
@@ -121,7 +125,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         self.aio_glm_channel: Optional[grpc_aio.Channel] = None
         self.aio_glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None
 
-        self.glm_circuit_breaker: Optional[pybreaker.CircuitBreaker] = None # Added from previous step
+        self.glm_circuit_breaker: Optional[pybreaker.CircuitBreaker] = None
         if pybreaker and self.config.CIRCUIT_BREAKER_ENABLED:
             self.glm_circuit_breaker = pybreaker.CircuitBreaker(
                 fail_max=self.config.CIRCUIT_BREAKER_FAIL_MAX,
@@ -130,6 +134,21 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             logger.info(f"SWM: GLM client circuit breaker enabled: fail_max={self.config.CIRCUIT_BREAKER_FAIL_MAX}, reset_timeout={self.config.CIRCUIT_BREAKER_RESET_TIMEOUT_S}s")
         else:
             logger.info(f"SWM: GLM client circuit breaker is disabled (pybreaker not installed or CIRCUIT_BREAKER_ENABLED=False).")
+
+        # GLM Client for Health Check (separate, simpler channel)
+        self.glm_health_check_channel: typing.Optional[grpc_aio.Channel] = None
+        self.glm_health_check_stub: typing.Optional[health_pb2_grpc.HealthStub] = None
+        if self.config.GLM_SERVICE_ADDRESS:
+            try:
+                health_check_grpc_options = [ # Simplified options for health check client
+                    ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS),
+                    ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
+                ]
+                self.glm_health_check_channel = grpc_aio.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=health_check_grpc_options)
+                self.glm_health_check_stub = health_pb2_grpc.HealthStub(self.glm_health_check_channel)
+                logger.info(f"SWM: GLM health check client initialized for target: {self.config.GLM_SERVICE_ADDRESS}")
+            except Exception as e_hc_client:
+                logger.error(f"SWM: Error initializing GLM health check client: {e_hc_client}", exc_info=True)
 
         try: # Main GLM client for operations
             if self.config.GLM_SERVICE_ADDRESS:

@@ -38,6 +38,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
     *   Updating and deleting existing KEMs.
     *   **Write Conflict Handling**: When saving KEMs (`StoreKEM`, `BatchStoreKEMs`) with an existing ID, the data is overwritten (logic of `INSERT OR REPLACE` in SQLite and `upsert` in Qdrant).
     *   **Batch Storing and Consistency (`BatchStoreKEMs`)**: The `BatchStoreKEMs` method attempts to save each KEM in the batch. If embeddings for any KEM (if present) cannot be saved to Qdrant, the corresponding record for that KEM is deleted from SQLite to maintain basic consistency between metadata and vector stores. Internally, Qdrant updates for batches are optimized by sending points to Qdrant in a single batch call where possible.
+    *   **Error Handling**: GLM aims to handle errors during its operations (especially multi-datastore writes involving SQLite and Qdrant) gracefully. It attempts compensating actions where appropriate and returns standard gRPC status codes like `INVALID_ARGUMENT` for bad requests, `NOT_FOUND` if a KEM doesn't exist for an update/delete, `UNAVAILABLE` if a backend like Qdrant is temporarily down, or `INTERNAL` for other unexpected server-side issues.
 *   **Technologies (current implementation):**
     *   gRPC for API definition and serving.
     *   Qdrant: Used as a vector database for storing embeddings and performing similarity searches.
@@ -60,9 +61,9 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **Technologies (current implementation):**
     *   gRPC for API.
     *   `sentence-transformers`: for generating embeddings.
-    *   GLM gRPC client: This client is equipped with retry mechanisms (`@retry_grpc_call`) and circuit breaker patterns for resilience. It also supports client-side load balancing (e.g., `round_robin` via DNS service discovery when GLM is scaled) configurable via shared gRPC client settings. For effective DNS load balancing, the `GRPC_DNS_RESOLVER=ares` environment variable should be set for the KPS service.
+    *   GLM gRPC client: This client is equipped with retry mechanisms (`@retry_grpc_call`) and circuit breaker patterns for resilience. These features help KPS handle transient GLM issues gracefully and contribute to KPS returning meaningful error statuses (e.g., `UNAVAILABLE` or `INTERNAL`) to its own clients if GLM is persistently failing or returns an error. It also supports client-side load balancing (e.g., `round_robin` via DNS service discovery when GLM is scaled) configurable via shared gRPC client settings. For effective DNS load balancing, the `GRPC_DNS_RESOLVER=ares` environment variable should be set for the KPS service.
 *   **API (gRPC - `kps_service.proto`):**
-    *   `ProcessRawData`: Accepts raw data and metadata, processes them, and initiates storage in GLM. Returns the ID of the saved KEM and the operation status.
+    *   `ProcessRawData`: Accepts raw data and metadata, processes them, and initiates storage in GLM. Returns the ID of the saved KEM and the operation status, using standard gRPC status codes like `INVALID_ARGUMENT` for bad input or `INTERNAL` / `UNAVAILABLE` if downstream processing fails.
 
 ### 3.4. Shared Working Memory Service (SWM)
 
@@ -88,10 +89,11 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **Technologies (current implementation):**
     *   gRPC for API.
     *   Redis: For the primary KEM cache and secondary indexes. Uses the `aioredis` client.
-    *   GLM gRPC client (asynchronous): This client also incorporates retry mechanisms (`@async_retry_grpc_call`) and circuit breakers. It supports client-side load balancing (e.g., `round_robin` via DNS) similarly to the KPS GLM client, requiring appropriate configuration and the `GRPC_DNS_RESOLVER=ares` environment variable for the SWM service.
+    *   GLM gRPC client (asynchronous): This client also incorporates retry mechanisms (`@async_retry_grpc_call`) and circuit breakers, which help SWM manage GLM unavailability or errors, impacting responses for operations like `LoadKEMsFromGLM` or the background persistence worker. It supports client-side load balancing (e.g., `round_robin` via DNS) similarly to the KPS GLM client, requiring appropriate configuration and the `GRPC_DNS_RESOLVER=ares` environment variable for the SWM service.
     *   Internal `asyncio.Queue` for SWM's Pub/Sub mechanism and for the GLM persistence queue.
+    *   **Error Handling**: SWM's own gRPC methods use standard codes like `INVALID_ARGUMENT` for malformed requests, `NOT_FOUND` if a resource (e.g., a lock) isn't found, `UNAVAILABLE` if a backend like Redis is down, or `INTERNAL` for other unexpected issues.
 *   **API (gRPC - `swm_service.proto`):**
-    *   `PublishKEMToSWM`: Publishes a KEM to SWM (Redis). Optionally queues it for asynchronous persistence to GLM.
+    *   `PublishKEMToSWM`: Publishes a KEM to SWM (Redis). Optionally queues it for asynchronous persistence to GLM. Returns status indicating success or issues (e.g., if queueing for GLM fails).
     *   `SubscribeToSWMEvents`: Subscribes to SWM events.
     *   `QuerySWM`: Queries KEMs from the SWM cache (Redis) with filtering.
     *   `LoadKEMsFromGLM`: Initiates loading of KEMs from GLM into the SWM cache (Redis).
@@ -309,6 +311,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
         *   The GLM service will not start if Qdrant is unavailable at startup. KPS and SWM log warnings if GLM is unavailable at their startup but may continue with limited functionality. SWM also has a critical dependency on Redis.
         *   SWM includes a Dead Letter Queue (DLQ) for KEMs that fail persistence to GLM after multiple retries.
         *   KPS includes an optional idempotency check for `ProcessRawData` requests based on `data_id`.
+        *   Services now more consistently utilize standard gRPC status codes (e.g., `INVALID_ARGUMENT`, `NOT_FOUND`, `UNAVAILABLE`, `INTERNAL`, `ALREADY_EXISTS`) to communicate the outcome of operations and the nature of any errors, enhancing client understanding and diagnosability.
     *   **Development Directions**:
         *   More granular error handling and rollback strategies, particularly for GLM's multi-datastore operations.
         *   Further refinement of circuit breaker interaction with specific gRPC error codes if needed.

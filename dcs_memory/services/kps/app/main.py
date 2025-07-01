@@ -385,6 +385,26 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
     def ProcessRawData(self, request: kps_service_pb2.ProcessRawDataRequest, context) -> kps_service_pb2.ProcessRawDataResponse:
         logger.info(f"KPS: ProcessRawData called for data_id='{request.data_id}', content_type='{request.content_type}'")
 
+        if not self.glm_stub:
+            msg = "KPS Misconfiguration: GLM service client not initialized."
+            logger.error(msg)
+            # This is a setup issue for KPS itself.
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, msg)
+            return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+
+        if not self.embedding_model:
+            msg = "KPS Misconfiguration: Embedding model not loaded."
+            logger.error(msg)
+            # If model is essential for all KPS ops, this is a FAILED_PRECONDITION.
+            # If KPS could proceed for non-text data without model, then it's more nuanced.
+            # Assuming for text, model is essential.
+            if request.content_type.startswith("text/"):
+                 context.abort(grpc.StatusCode.FAILED_PRECONDITION, msg)
+                 return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+            else:
+                 logger.warning(f"{msg} Proceeding without embeddings for non-text content.")
+
+
         # Idempotency Check
         if self.config.KPS_IDEMPOTENCY_CHECK_ENABLED and request.data_id:
             idempotency_key = self.config.KPS_IDEMPOTENCY_METADATA_KEY
@@ -395,31 +415,26 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             retrieve_request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1)
 
             try:
-                # Use a shorter timeout for this check compared to StoreKEM? Or make it configurable.
-                # For now, using the same StoreKEM timeout as a general GLM interaction timeout.
-                # TODO: Consider a specific KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S
-                response = self._glm_retrieve_kems_with_retry(retrieve_request, timeout=self.config.GLM_STORE_KEM_TIMEOUT_S)
+                timeout_check = getattr(self.config, "KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S", self.config.GLM_STORE_KEM_TIMEOUT_S)
+                response = self._glm_retrieve_kems_with_retry(retrieve_request, timeout=timeout_check)
                 if response and response.kems:
                     existing_kem_id = response.kems[0].id
                     logger.info(f"KPS: Idempotency check positive. Data_id '{request.data_id}' already processed as KEM ID '{existing_kem_id}'.")
                     return kps_service_pb2.ProcessRawDataResponse(
                         kem_id=existing_kem_id,
-                        success=True,
+                        success=True, # Still success, but indicates pre-existence
                         status_message=f"Data already processed (KEM ID: {existing_kem_id})."
                     )
-            except grpc.RpcError as e_rpc:
-                logger.warning(f"KPS: Idempotency check failed with gRPC error (Code: {e_rpc.code()}): {e_rpc.details()}. Proceeding with processing.", exc_info=True)
             except pybreaker.CircuitBreakerError as e_cb:
-                 logger.warning(f"KPS: Idempotency check failed due to GLM circuit breaker open: {e_cb}. Proceeding with processing (will likely fail at StoreKEM).", exc_info=True)
+                 logger.warning(f"KPS: Idempotency check skipped due to GLM circuit breaker open: {e_cb}. Proceeding with processing (StoreKEM will likely also fail if CB remains open).")
+                 # Fail-open for idempotency check if CB is open for GLM.
+            except grpc.RpcError as e_rpc:
+                # If GLM is UNAVAILABLE or DEADLINE_EXCEEDED during check, log and proceed (fail-open for check).
+                # Other GLM errors during check might indicate issues but we still proceed.
+                logger.warning(f"KPS: Idempotency check GLM query failed (Code: {e_rpc.code()}): {e_rpc.details()}. Proceeding with processing.", exc_info=False) # Log less verbosely
             except Exception as e_generic:
-                logger.warning(f"KPS: Idempotency check failed with unexpected error: {e_generic}. Proceeding with processing.", exc_info=True)
+                logger.warning(f"KPS: Idempotency check failed with unexpected error: {e_generic}. Proceeding with processing.", exc_info=False)
 
-        if not self.glm_stub:
-            msg = "GLM service is unavailable to KPS (GLM client not initialized)."
-            logger.error(msg)
-            context.abort(grpc.StatusCode.INTERNAL, msg)
-            # This return is technically unreachable due to abort, but good for linters/type checkers.
-            return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
 
         try:
             content_to_embed = ""
@@ -445,19 +460,22 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     logger.info(f"Embeddings generated by model (dimension: {len(embeddings)}).")
 
                     if len(embeddings) != self.config.DEFAULT_VECTOR_SIZE:
-                        msg = (f"Critical error: Model '{self.config.SENTENCE_TRANSFORMER_MODEL}' returned embedding of dimension {len(embeddings)}, "
-                               f"but DEFAULT_VECTOR_SIZE from KPS config is {self.config.DEFAULT_VECTOR_SIZE}. "
-                               f"Ensure this matches GLM's vector database configuration.")
+                        # This is an internal KPS configuration or model setup error.
+                        msg = (f"KPS Internal Error: Model '{self.config.EMBEDDING_MODEL_NAME}' output dimension {len(embeddings)} "
+                               f"mismatches configured DEFAULT_VECTOR_SIZE {self.config.DEFAULT_VECTOR_SIZE}.")
                         logger.error(msg)
-                        context.abort(grpc.StatusCode.INTERNAL, "Embedding dimension configuration mismatch.")
-                        return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
-                except Exception as e:
-                    msg = f"Error during embedding generation by model: {e}"
+                        context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Embedding dimension configuration mismatch in KPS.")
+                        return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+                except Exception as e_embed: # Catch specific model errors if possible
+                    msg = f"Error during embedding generation by model: {e_embed}"
                     logger.error(msg, exc_info=True)
-                    context.abort(grpc.StatusCode.INTERNAL, msg)
-                    return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
-            elif is_text_content and not self.embedding_model:
-                logger.warning("Embedding model not loaded; embeddings will not be generated for text content.")
+                    context.abort(grpc.StatusCode.INTERNAL, f"Embedding generation failed: {e_embed}")
+                    return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+            elif is_text_content and not self.embedding_model: # Model loading failed earlier, and it's text
+                # This case should have been caught by FAILED_PRECONDITION at the start of RPC if model is essential for text.
+                # If we reach here, it implies model is optional or non-text.
+                logger.warning("KPS: Embedding model not available; embeddings will not be generated for text content.")
+
 
             kem_to_store = kem_pb2.KEM(
                 content_type=request.content_type,
@@ -496,19 +514,36 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     msg = "Error: GLM.StoreKEM did not return an expected KEM object or KEM ID."
                     logger.error(msg)
                     # Return a clear failure if the response is not as expected after successful RPC.
-                    return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
-            except grpc.RpcError as e_glm:
-                logger.error(f"KPS: gRPC error from GLM after retries: code={e_glm.code()}, details={e_glm.details()}")
-                return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=f"Error interacting with GLM: {e_glm.details()}")
-            except Exception as e_other_after_glm: # Catch any other unexpected errors after GLM call
-                 logger.error(f"KPS: Unexpected error after GLM call in ProcessRawData: {e_other_after_glm}", exc_info=True)
-                 context.abort(grpc.StatusCode.INTERNAL, f"Internal KPS error after GLM call: {e_other_after_glm}")
-                 return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=f"Internal KPS error: {e_other_after_glm}")
+                    return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg) # RPC is OK, but operation failed.
 
-        except Exception as e: # Broad exception catch for the entire method
-            logger.error(f"KPS: Unexpected error in ProcessRawData: {e}", exc_info=True)
+            except pybreaker.CircuitBreakerError as e_cb_store:
+                msg = f"KPS: GLM service unavailable (circuit breaker open) for StoreKEM. Data_id='{request.data_id}'"
+                logger.error(f"{msg}: {e_cb_store}")
+                context.abort(grpc.StatusCode.UNAVAILABLE, msg) # Abort KPS RPC
+                return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+            except grpc.RpcError as e_glm_store:
+                logger.error(f"KPS: gRPC error from GLM StoreKEM (Data_id='{request.data_id}', Code: {e_glm_store.code()}): {e_glm_store.details()}", exc_info=False)
+                # Propagate specific error from GLM if possible, or map to a suitable KPS error.
+                # Example: If GLM says INVALID_ARGUMENT because KPS formed a bad KEM, KPS might return INTERNAL.
+                # If GLM says UNAVAILABLE, KPS returns UNAVAILABLE.
+                mapped_code = e_glm_store.code()
+                if mapped_code == grpc.StatusCode.INVALID_ARGUMENT: # If GLM says KEM is bad
+                     mapped_code = grpc.StatusCode.INTERNAL # KPS should have formed it correctly
+                context.abort(mapped_code, f"Failed to store KEM in GLM: {e_glm_store.details()}")
+                return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+            except Exception as e_store_other:
+                 logger.error(f"KPS: Unexpected error during GLM StoreKEM (Data_id='{request.data_id}'): {e_store_other}", exc_info=True)
+                 context.abort(grpc.StatusCode.INTERNAL, f"Unexpected internal error storing KEM: {e_store_other}")
+                 return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+
+        except UnicodeDecodeError as e_decode: # Already handled above, but as a safeguard if logic changes
+            logger.error(f"KPS: Unicode decode error for data_id '{request.data_id}': {e_decode}", exc_info=True) # Should not be reached if handled earlier
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid UTF-8 content for data_id '{request.data_id}'.")
+            return kps_service_pb2.ProcessRawDataResponse()
+        except Exception as e_main_process:
+            logger.error(f"KPS: Unexpected error in ProcessRawData for data_id '{request.data_id}': {e_main_process}", exc_info=True)
             context.abort(grpc.StatusCode.INTERNAL, "Internal KPS error during data processing.")
-            return kps_service_pb2.ProcessRawDataResponse(success=False, status_message="Internal KPS error.")
+            return kps_service_pb2.ProcessRawDataResponse() # Unreachable
 
     def __del__(self):
         if self.glm_channel:
