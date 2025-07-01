@@ -3,7 +3,7 @@
 import sqlite3
 import logging
 import threading # Added for thread-local storage
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Literal # Added Literal
 from qdrant_client import QdrantClient, models
 from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -28,7 +28,7 @@ class SqliteKemRepository:
             try:
                 # Each thread gets its own connection object.
                 # Default check_same_thread=True is appropriate and safe here.
-                conn = sqlite3.connect(self.db_path, timeout=10) # Increased timeout for busy DBs
+                conn = sqlite3.connect(self.db_path, timeout=self.config.SQLITE_CONNECT_TIMEOUT_S) # Use configured timeout
 
                 # Apply PRAGMA settings once per connection
                 cursor = conn.cursor()
@@ -58,7 +58,7 @@ class SqliteKemRepository:
         try:
             # Use a temporary connection for schema initialization
             # This is separate from the thread-local connections used for operations.
-            with sqlite3.connect(self.db_path, timeout=10) as conn:
+            with sqlite3.connect(self.db_path, timeout=self.config.SQLITE_CONNECT_TIMEOUT_S) as conn: # Use configured timeout
                 cursor = conn.cursor()
                 # Set PRAGMAs for this schema initialization connection as well,
                 # especially WAL mode, as it can affect how the DB file is structured initially.
@@ -265,30 +265,50 @@ class SqliteKemRepository:
 
 
 class QdrantKemRepository:
-    def __init__(self, qdrant_client: QdrantClient, collection_name: str, default_vector_size: int):
+    def __init__(self, qdrant_client: QdrantClient, collection_name: str, default_vector_size: int, default_distance_metric: str): # Added default_distance_metric
         self.client = qdrant_client
         self.collection_name = collection_name
         self.default_vector_size = default_vector_size
-        # self._ensure_qdrant_collection() # Servicer can call this after successful client connection
+        self.default_distance_metric_str = default_distance_metric.upper() # Store configured metric string
+
+    def _get_qdrant_distance_metric(self) -> models.Distance:
+        """Converts string distance metric from config to Qdrant's models.Distance enum."""
+        if self.default_distance_metric_str == "COSINE":
+            return models.Distance.COSINE
+        elif self.default_distance_metric_str == "DOT":
+            return models.Distance.DOT
+        elif self.default_distance_metric_str == "EUCLID":
+            return models.Distance.EUCLID
+        else:
+            logger.warning(
+                f"Unsupported Qdrant distance metric '{self.default_distance_metric_str}' in config. "
+                f"Defaulting to COSINE. Supported: COSINE, DOT, EUCLID."
+            )
+            return models.Distance.COSINE
 
     def ensure_collection(self):
-        # Logic to be moved from GlobalLongTermMemoryServicerImpl
         logger.info(f"Repository: Ensuring Qdrant collection '{self.collection_name}' exists.")
         try:
             self.client.get_collection(collection_name=self.collection_name)
             logger.info(f"Repository: Qdrant collection '{self.collection_name}' already exists.")
-            # TODO: Add detailed config check if necessary, like in the servicer
         except Exception as e:
-            if "not found" in str(e).lower() or (hasattr(e, 'status_code') and e.status_code == 404):
+            # More robust check for "not found" type errors from Qdrant client
+            is_not_found_error = ("not found" in str(e).lower() or
+                                  "404" in str(e).lower() or
+                                  (hasattr(e, 'status_code') and e.status_code == 404) or
+                                  (isinstance(e, ValueError) and "Collection" in str(e) and "not found" in str(e)) # For some client versions
+                                 )
+            if is_not_found_error:
                 logger.info(f"Repository: Qdrant collection '{self.collection_name}' not found. Creating...")
+                distance_metric = self._get_qdrant_distance_metric() # Use configured metric
                 self.client.recreate_collection(
                     collection_name=self.collection_name,
-                    vectors_config=models.VectorParams(size=self.default_vector_size, distance=models.Distance.COSINE)
+                    vectors_config=models.VectorParams(size=self.default_vector_size, distance=distance_metric)
                 )
-                logger.info(f"Repository: Qdrant collection '{self.collection_name}' created.")
+                logger.info(f"Repository: Qdrant collection '{self.collection_name}' created with distance metric {distance_metric}.")
             else:
                 logger.error(f"Repository: Error checking/creating Qdrant collection '{self.collection_name}': {e}", exc_info=True)
-                raise # Re-raise to signal failure
+                raise
 
     def upsert_point(self, point: models.PointStruct) -> None:
         """Upserts a single point to Qdrant."""

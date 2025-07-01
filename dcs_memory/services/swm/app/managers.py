@@ -257,11 +257,14 @@ class DistributedLockManager:
         if self._cleanup_task and not self._cleanup_task.done():
             logger.info("DistributedLockManager: Stopping expired lock cleanup task...")
             self._stop_event.set()
-            self.lock_condition.notify_all() # Wake up loop if it's sleeping on condition
+            async with self.lock_condition: # Acquire lock before notifying
+                self.lock_condition.notify_all() # Wake up loop if it's sleeping on condition
             try:
-                await asyncio.wait_for(self._cleanup_task, timeout=self.config.LOCK_CLEANUP_INTERVAL_S + 2)
+                # Use configured shutdown grace period for the cleanup task
+                await asyncio.wait_for(self._cleanup_task, timeout=self.config.LOCK_CLEANUP_INTERVAL_S + self.config.LOCK_CLEANUP_SHUTDOWN_GRACE_S)
             except asyncio.TimeoutError:
                 logger.warning("DistributedLockManager: Expired lock cleanup task did not finish in time during shutdown.")
+                # self._cleanup_task.cancel() # Optionally cancel if it didn't stop
             except asyncio.CancelledError:
                  logger.info("DistributedLockManager: Expired lock cleanup task cancelled during shutdown.")
         self._cleanup_task = None
@@ -272,13 +275,22 @@ class DistributedLockManager:
         while not self._stop_event.is_set():
             try:
                 # Wait for the shorter of stop_event or cleanup_interval
-                await asyncio.wait_for(self._stop_event.wait(), timeout=self.config.LOCK_CLEANUP_INTERVAL_S)
-                if self._stop_event.is_set(): break # Exit if stop was signaled
-            except asyncio.TimeoutError:
-                 # Timeout means it's time to cleanup
-                if self._stop_event.is_set(): break
-                logger.debug("DistributedLockManager: Performing periodic cleanup of expired locks...")
+                # Use lock_condition.wait() with timeout to handle notifications properly
                 async with self.lock_condition:
+                    try:
+                        await asyncio.wait_for(
+                            self.lock_condition.wait_for(lambda: self._stop_event.is_set()),
+                            timeout=self.config.LOCK_CLEANUP_INTERVAL_S
+                        )
+                        if self._stop_event.is_set(): break # Exit if stop was signaled by notification
+                    except asyncio.TimeoutError:
+                        # Timeout means it's time to cleanup (or stop_event was not set within timeout)
+                        pass # Proceed to cleanup logic below
+
+                if self._stop_event.is_set(): break # Check again after potential timeout
+
+                logger.debug("DistributedLockManager: Performing periodic cleanup of expired locks...")
+                async with self.lock_condition: # Acquire lock for modification
                     now_ms = int(time.time() * 1000)
                     expired_ids = [
                         rid for rid, linfo in self.locks.items()
@@ -286,13 +298,12 @@ class DistributedLockManager:
                     ]
                     if expired_ids:
                         cleaned_count = 0
-                        for resource_id in expired_ids:
-                            # Re-check condition as lock might have been renewed or released
-                            lock_to_check = self.locks.get(resource_id)
+                        for resource_id_expired in expired_ids: # Use different variable name
+                            lock_to_check = self.locks.get(resource_id_expired) # Check current state
                             if lock_to_check and lock_to_check.lease_duration_ms > 0 and now_ms >= lock_to_check.lease_expires_at_unix_ms:
-                                del self.locks[resource_id]
+                                del self.locks[resource_id_expired]
                                 logger.info(f"DistributedLockManager Cleanup: Expired lock for '{lock_to_check.resource_id}' (agent '{lock_to_check.agent_id}') removed.")
-                                self.lock_condition.notify_all() # Notify waiters as a resource is free
+                                self.lock_condition.notify_all()
                                 cleaned_count +=1
                         if cleaned_count > 0:
                              logger.info(f"DistributedLockManager Cleanup: Removed {cleaned_count} expired locks.")
@@ -303,9 +314,10 @@ class DistributedLockManager:
                 break
             except Exception as e:
                 logger.error(f"DistributedLockManager: Error in lock cleanup loop: {e}", exc_info=True)
-                # Avoid busy loop on persistent error
                 if not self._stop_event.is_set():
-                    await asyncio.sleep(self.config.LOCK_CLEANUP_INTERVAL_S)
+                    try: # Defensive sleep to avoid tight loop on unexpected errors
+                        await asyncio.sleep(self.config.LOCK_CLEANUP_INTERVAL_S)
+                    except asyncio.CancelledError: break
         logger.info("DistributedLockManager: Async expired lock cleanup loop stopped.")
 
     async def acquire_lock(self, resource_id: str, agent_id: str, timeout_ms: int, lease_duration_ms: int) -> swm_service_pb2.AcquireLockResponse:

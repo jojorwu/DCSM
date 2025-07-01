@@ -267,7 +267,11 @@ class RedisCacheTransactionError(RedisCacheError):
         new_created_at_ts = kem.created_at.seconds
         new_updated_at_ts = kem.updated_at.seconds
 
-        max_retries = 3
+        max_retries = self.config.REDIS_TRANSACTION_MAX_RETRIES
+        initial_delay = self.config.REDIS_TRANSACTION_RETRY_INITIAL_DELAY_S
+        backoff_factor = self.config.REDIS_TRANSACTION_RETRY_BACKOFF_FACTOR
+        current_delay = initial_delay
+
         for attempt in range(max_retries):
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
@@ -296,12 +300,13 @@ class RedisCacheTransactionError(RedisCacheError):
                     logger.info(f"RedisKemCache: KEM ID '{kem_id}' set successfully with index updates.")
                     return
                 except aioredis.exceptions.WatchError: # type: ignore
-                    logger.warning(f"RedisKemCache: WATCH error for KEM ID '{kem_id}', attempt {attempt + 1}/{max_retries}. Retrying.")
+                    logger.warning(f"RedisKemCache: WATCH error for KEM ID '{kem_id}', attempt {attempt + 1}/{max_retries}. Retrying in {current_delay:.3f}s.")
                     if attempt == max_retries - 1:
                         err_msg = f"RedisKemCache: KEM ID '{kem_id}' failed after max WatchError retries."
                         logger.error(err_msg)
                         raise RedisCacheTransactionError(err_msg)
-                    await asyncio.sleep(0.01 * (2**attempt))
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff_factor
                     continue
                 except Exception as e_exec:
                     logger.error(f"RedisKemCache: Error during SET transaction for KEM ID '{kem_id}': {e_exec}", exc_info=True)

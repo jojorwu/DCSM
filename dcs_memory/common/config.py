@@ -28,6 +28,10 @@ class BaseServiceConfig(BaseSettings):
     RETRY_INITIAL_DELAY_S: float = Field(default=1.0, description="Initial delay before retrying in seconds.")
     RETRY_BACKOFF_FACTOR: float = Field(default=2.0, description="Multiplier for exponential backoff of delay.")
     RETRY_JITTER_FRACTION: float = Field(default=0.1, description="Jitter fraction to randomize delays.")
+    # General gRPC server settings - can be overridden by service-specific if needed
+    GRPC_SERVER_MAX_WORKERS: int = Field(default=10, description="Default max_workers for synchronous gRPC servers.")
+    GRPC_SERVER_SHUTDOWN_GRACE_S: int = Field(default=5, description="Default shutdown grace period for gRPC servers in seconds.")
+
 
     @classmethod
     def settings_customise_sources(
@@ -140,8 +144,13 @@ class GLMConfig(BaseServiceConfig):
     DEFAULT_VECTOR_SIZE: int = Field(description="Default vector dimension for Qdrant.")
     DEFAULT_PAGE_SIZE: int = Field(description="Default page size for RetrieveKEMs.")
     SQLITE_BUSY_TIMEOUT: int = Field(default=7500, description="SQLite busy timeout in milliseconds.")
-    # GRPC_LISTEN_ADDRESS is inherited from BaseServiceConfig, will use its default
-    # or value from YAML's 'glm' section or 'shared' section, or GLM_GRPC_LISTEN_ADDRESS env var.
+    SQLITE_CONNECT_TIMEOUT_S: int = Field(default=10, description="SQLite connection timeout in seconds.")
+
+    QDRANT_CLIENT_TIMEOUT_S: int = Field(default=10, description="Timeout for Qdrant client operations in seconds.")
+    QDRANT_DEFAULT_DISTANCE_METRIC: Literal["COSINE", "DOT", "EUCLID"] = Field(default="COSINE", description="Default distance metric for Qdrant collections.")
+    QDRANT_PREFLIGHT_CHECK_TIMEOUT_S: int = Field(default=2, description="Timeout for Qdrant pre-flight check in seconds.")
+    # GRPC_SERVER_MAX_WORKERS can be inherited from Base or overridden here if GLM needs specific value
+    # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited or overridden
 
 
 # Configuration for KPS service
@@ -150,11 +159,12 @@ class KPSConfig(BaseServiceConfig):
     model_config = SettingsConfigDict(env_prefix='KPS_', extra='ignore')
 
     GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service KPS connects to.")
-    # Renamed from SENTENCE_TRANSFORMER_MODEL to EMBEDDING_MODEL_NAME to match example YAML
     EMBEDDING_MODEL_NAME: str = Field(description="Name or path to the sentence-transformer model.")
     DEFAULT_VECTOR_SIZE: int = Field(description="Expected/generated embedding dimension.")
     DEFAULT_PROCESSING_BATCH_SIZE: int = Field(default=32, description="Default batch size for processing documents.")
-    # GRPC_LISTEN_ADDRESS inherited
+    GLM_STORE_KEM_TIMEOUT_S: int = Field(default=15, description="Timeout for KPS calling GLM's StoreKEM, in seconds.")
+    # GRPC_SERVER_MAX_WORKERS can be inherited or overridden
+    # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited or overridden
 
 
 # Configuration for SWM service
@@ -163,27 +173,53 @@ class SWMConfig(BaseServiceConfig):
     model_config = SettingsConfigDict(env_prefix='SWM_', extra='ignore')
 
     GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service for SWM.")
-    # Renamed from CACHE_MAX_SIZE to MAX_CACHE_SIZE_KEMS to match example YAML
-    MAX_CACHE_SIZE_KEMS: int = Field(description="Maximum number of KEMs in SWM's LRU cache.")
-    DEFAULT_KEM_TTL_SECONDS: int = Field(default=3600, description="Default TTL for KEMs in cache in seconds.")
-    # DEFAULT_PAGE_SIZE: int = Field(default=20, description="Default page size for QuerySWM.") # This was in old SWMConfig, check YAML
+    MAX_CACHE_SIZE_KEMS: int = Field(description="Maximum number of KEMs in SWM's LRU cache (conceptual for Redis, actual eviction by Redis policies).")
+    DEFAULT_KEM_TTL_SECONDS: int = Field(default=3600, description="Default TTL for KEMs in cache in seconds (used by RedisKemCache).")
 
     REDIS_HOST: str = Field(description="Redis host for SWM.")
     REDIS_PORT: int = Field(default=6379, description="Redis port for SWM.")
-    REDIS_DB_PUBSUB: int = Field(default=0, description="Redis DB number for Pub/Sub.")
-    REDIS_DB_CACHE_INDEX: int = Field(default=1, description="Redis DB number for Cache Index & Data.")
-    REDIS_DB_LOCKS_COUNTERS: int = Field(default=2, description="Redis DB number for Locks and Counters.")
+    SWM_REDIS_PASSWORD: Optional[str] = Field(default=None, description="Password for Redis connection, if any.") # Added for completeness
+    SWM_REDIS_DB: int = Field(default=0, description="Default Redis DB number for SWM main data (used by RedisKemCache if specific DBs not set).") # Placeholder, specific DBs below are better
+    REDIS_DB_PUBSUB: int = Field(default=0, description="Redis DB number for Pub/Sub.") # Already exists, kept for clarity
+    REDIS_DB_CACHE_INDEX: int = Field(default=1, description="Redis DB number for Cache Index & Data.") # Already exists
+    REDIS_DB_LOCKS_COUNTERS: int = Field(default=2, description="Redis DB number for Locks and Counters.") # Already exists
 
-    SWM_INDEXED_METADATA_KEYS: List[str] = Field(
-        default_factory=list,
-        description="Comma-separated list of KEM metadata keys to be indexed by SWM's internal cache."
-    )
-    LOCK_CLEANUP_INTERVAL_S: int = Field(
-        default=60,
-        description="Interval in seconds for the background task that cleans up expired distributed locks."
-    )
-    # GRPC_LISTEN_ADDRESS inherited
-    # GLM_RETRY_* fields inherited from BaseServiceConfig, SWM can use them or define its own with SWM_ prefix
+    # GLM Client specific timeouts for SWM
+    GLM_RETRIEVE_TIMEOUT_S: int = Field(default=20, description="Timeout for SWM calling GLM RetrieveKEMs (async).")
+    GLM_STORE_TIMEOUT_S: int = Field(default=10, description="Timeout for SWM calling GLM StoreKEM (async).")
+    GLM_BATCH_STORE_TIMEOUT_S: int = Field(default=30, description="Timeout for SWM calling GLM BatchStoreKEMs (async).")
+
+    # GLM Persistence Worker settings
+    GLM_PERSISTENCE_QUEUE_MAX_SIZE: int = Field(default=1000, description="Max size of the GLM persistence queue.")
+    GLM_PERSISTENCE_FLUSH_INTERVAL_S: float = Field(default=5.0, description="Interval to check/flush persistence queue.")
+    GLM_PERSISTENCE_BATCH_SIZE: int = Field(default=50, description="Batch size for sending KEMs to GLM from persistence queue.")
+    GLM_PERSISTENCE_BATCH_MAX_RETRIES: int = Field(default=3, description="Max retries for a failed batch in persistence worker.")
+    GLM_PERSISTENCE_WORKER_SHUTDOWN_GRACE_S: int = Field(default=5, description="Grace period for persistence worker shutdown.")
+
+    # Redis Pub/Sub Listener settings
+    REDIS_PUBSUB_GET_MESSAGE_TIMEOUT_S: float = Field(default=1.0, description="Timeout for getting a message from Redis pub/sub.")
+    REDIS_PUBSUB_ERROR_SLEEP_S: float = Field(default=1.0, description="Sleep duration after an error in pub/sub listener.")
+    REDIS_MAX_PUBSUB_RETRIES: int = Field(default=5, description="Max consecutive retries for Redis pub/sub connection/subscription.")
+    REDIS_RECONNECT_DELAY_S: float = Field(default=5.0, description="Delay before attempting to reconnect to Redis pub/sub.")
+
+    # Subscriber settings
+    SUBSCRIBER_MIN_QUEUE_SIZE: int = Field(default=10, description="Minimum queue size for an event subscriber.")
+    SUBSCRIBER_DEFAULT_QUEUE_SIZE: int = Field(default=100, description="Default queue size for an event subscriber.")
+    SUBSCRIBER_MAX_QUEUE_SIZE: int = Field(default=1000, description="Maximum queue size for an event subscriber.")
+    SUBSCRIBER_IDLE_CHECK_INTERVAL_S: float = Field(default=5.0, description="Interval to check subscriber stream for idleness.")
+    SUBSCRIBER_IDLE_TIMEOUT_THRESHOLD: int = Field(default=6, description="Number of idle check intervals before deeming a subscriber inactive.") # e.g., 6 * 5s = 30s
+
+    # Lock Manager settings
+    # LOCK_CLEANUP_INTERVAL_S is already in SWMConfig
+    LOCK_CLEANUP_SHUTDOWN_GRACE_S: int = Field(default=2, description="Grace period for lock cleanup task shutdown.")
+
+    # Redis Transaction settings (for RedisKemCache)
+    REDIS_TRANSACTION_MAX_RETRIES: int = Field(default=3, description="Max retries for Redis WATCH/MULTI/EXEC transactions.")
+    REDIS_TRANSACTION_RETRY_INITIAL_DELAY_S: float = Field(default=0.01, description="Initial delay for Redis transaction retry.")
+    REDIS_TRANSACTION_RETRY_BACKOFF_FACTOR: float = Field(default=2.0, description="Backoff factor for Redis transaction retry delay.")
+
+    # SWM_INDEXED_METADATA_KEYS is already in SWMConfig
+    # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited from BaseServiceConfig for SWM (async server)
 
 
     @field_validator("SWM_INDEXED_METADATA_KEYS", mode="before")

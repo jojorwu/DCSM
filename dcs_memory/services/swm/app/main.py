@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 import typing
 from typing import Optional, List, Set, Dict, Callable, AsyncGenerator, Tuple
 
+from dcs_memory.common.grpc_utils import async_retry_grpc_call # Import async retry decorator
+
 # Attempt to import aioredis
 try:
     import aioredis # type: ignore
@@ -50,10 +52,8 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
         self.aio_glm_channel: Optional[grpc_aio.Channel] = None
         self.aio_glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None
-        self.retryable_error_codes = (
-            grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED,
-            grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED
-        )
+        # Retryable error codes are handled by the async_retry_grpc_call decorator by default.
+        # If specific codes are needed for SWM's GLM calls, they can be configured and passed.
         try:
             if self.config.GLM_SERVICE_ADDRESS:
                 self.aio_glm_channel = grpc_aio.insecure_channel(self.config.GLM_SERVICE_ADDRESS)
@@ -266,74 +266,55 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                  logger.error(f"SWM Redis Eviction Listener: Error during final pubsub cleanup: {e_final_unsub}", exc_info=True)
         logger.info("SWM Redis Eviction Listener: Stopped.")
 
-    # --- GLM Client Methods --- (rest of the file is the same)
-    async def _glm_retrieve_kems_async(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int = 20) -> glm_service_pb2.RetrieveKEMsResponse:
+    # --- GLM Client Methods (using async_retry_grpc_call decorator) ---
+    @async_retry_grpc_call(
+        max_attempts=config.RETRY_MAX_ATTEMPTS,
+        initial_delay_s=config.RETRY_INITIAL_DELAY_S,
+        backoff_factor=config.RETRY_BACKOFF_FACTOR,
+        jitter_fraction=config.RETRY_JITTER_FRACTION
+    )
+    async def _glm_retrieve_kems_async_with_retry(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int) -> glm_service_pb2.RetrieveKEMsResponse:
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for RetrieveKEMs.")
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM client not available")
-        current_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
-        for attempt in range(1, self.config.GLM_RETRY_MAX_ATTEMPTS + 1):
-            try:
-                logger.debug(f"Attempt {attempt} to call GLM RetrieveKEMs (async).")
-                return await self.aio_glm_stub.RetrieveKEMs(request, timeout=timeout)
-            except grpc_aio.AioRpcError as e:
-                if e.code() in self.retryable_error_codes:
-                    if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS:
-                        logger.error(f"GLM call RetrieveKEMs failed after {self.config.GLM_RETRY_MAX_ATTEMPTS} attempts. Last error: {e.code()} - {e.details()}", exc_info=False); raise
-                    jitter_fraction = 0.1; jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                    actual_delay_s = max(0, current_delay_s + jitter_value)
-                    logger.warning(f"GLM call RetrieveKEMs failed (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}) with status {e.code()}. Retrying in {actual_delay_s:.2f}s. Details: {e.details()}", exc_info=False)
-                    await asyncio.sleep(actual_delay_s)
-                    current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
-                else: logger.error(f"GLM call RetrieveKEMs failed with non-retryable status {e.code()}. Details: {e.details()}", exc_info=True); raise
-            except Exception as e_generic:
-                logger.error(f"A non-gRPC error occurred during GLM call RetrieveKEMs (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}): {e_generic}", exc_info=True)
-                if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS: raise
-                jitter_fraction = 0.1; jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                actual_delay_s = max(0, current_delay_s + jitter_value)
-                logger.info(f"Retrying GLM RetrieveKEMs after non-gRPC error in {actual_delay_s:.2f}s.")
-                await asyncio.sleep(actual_delay_s); current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
-        logger.error("GLM RetrieveKEMs exhausted attempts unexpectedly."); raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM RetrieveKEMs exhausted attempts")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+        logger.debug(f"Calling GLM RetrieveKEMs (async, with retry). Timeout: {timeout}s")
+        return await self.aio_glm_stub.RetrieveKEMs(request, timeout=timeout)
 
-    async def _glm_store_kem_async(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
+    @async_retry_grpc_call(
+        max_attempts=config.RETRY_MAX_ATTEMPTS,
+        initial_delay_s=config.RETRY_INITIAL_DELAY_S,
+        backoff_factor=config.RETRY_BACKOFF_FACTOR,
+        jitter_fraction=config.RETRY_JITTER_FRACTION
+    )
+    async def _glm_store_kem_async_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int) -> glm_service_pb2.StoreKEMResponse:
         if not self.aio_glm_stub:
-            logger.error("SWM: GLM async client not available for StoreKEM."); raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM client not available")
-        current_delay_s = self.config.GLM_RETRY_INITIAL_DELAY_S
-        for attempt in range(1, self.config.GLM_RETRY_MAX_ATTEMPTS + 1):
-            try:
-                logger.debug(f"Attempt {attempt} to call GLM StoreKEM (async).")
-                return await self.aio_glm_stub.StoreKEM(request, timeout=timeout)
-            except grpc_aio.AioRpcError as e:
-                if e.code() in self.retryable_error_codes:
-                    if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS:
-                        logger.error(f"GLM call StoreKEM failed after {self.config.GLM_RETRY_MAX_ATTEMPTS} attempts. Last error: {e.code()} - {e.details()}", exc_info=False); raise
-                    jitter_fraction = 0.1; jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                    actual_delay_s = max(0, current_delay_s + jitter_value)
-                    logger.warning(f"GLM call StoreKEM failed (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}) with status {e.code()}. Retrying in {actual_delay_s:.2f}s. Details: {e.details()}", exc_info=False)
-                    await asyncio.sleep(actual_delay_s); current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
-                else: logger.error(f"GLM call StoreKEM failed with non-retryable status {e.code()}. Details: {e.details()}", exc_info=True); raise
-            except Exception as e_generic:
-                logger.error(f"A non-gRPC error occurred during GLM call StoreKEM (attempt {attempt}/{self.config.GLM_RETRY_MAX_ATTEMPTS}): {e_generic}", exc_info=True)
-                if attempt == self.config.GLM_RETRY_MAX_ATTEMPTS: raise
-                jitter_fraction = 0.1; jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                actual_delay_s = max(0, current_delay_s + jitter_value)
-                logger.info(f"Retrying GLM StoreKEM after non-gRPC error in {actual_delay_s:.2f}s.")
-                await asyncio.sleep(actual_delay_s); current_delay_s *= self.config.GLM_RETRY_BACKOFF_FACTOR
-        logger.error("GLM StoreKEM exhausted attempts unexpectedly."); raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "GLM StoreKEM exhausted attempts")
+            logger.error("SWM: GLM async client not available for StoreKEM.");
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+        logger.debug(f"Calling GLM StoreKEM (async, with retry). Timeout: {timeout}s")
+        return await self.aio_glm_stub.StoreKEM(request, timeout=timeout)
 
-    async def _glm_batch_store_kems_async(self, kems_batch: List[kem_pb2.KEM], timeout: int = 30) -> Optional[glm_service_pb2.BatchStoreKEMsResponse]:
-        if not self.aio_glm_stub: logger.error("SWM: GLM async client not available for BatchStoreKEMs."); return None
-        if not kems_batch: return None
-        request = glm_service_pb2.BatchStoreKEMsRequest(kems=kems_batch)
-        try:
-            logger.info(f"SWM: Calling GLM BatchStoreKEMs with {len(kems_batch)} KEMs.")
-            response = await self.aio_glm_stub.BatchStoreKEMs(request, timeout=timeout)
-            if response.failed_kem_references: logger.warning(f"SWM: GLM BatchStoreKEMs reported {len(response.failed_kem_references)} failures. Refs: {response.failed_kem_references}")
-            logger.info(f"SWM: GLM BatchStoreKEMs processed. Success: {len(response.successfully_stored_kems)}, Failures: {len(response.failed_kem_references)}")
-            return response
-        except grpc_aio.AioRpcError as e: logger.error(f"SWM: gRPC error during GLM BatchStoreKEMs: {e.code()} - {e.details()}", exc_info=True)
-        except Exception as e_generic: logger.error(f"SWM: Non-gRPC error during GLM BatchStoreKEMs: {e_generic}", exc_info=True)
-        return None
+    @async_retry_grpc_call(
+        max_attempts=config.RETRY_MAX_ATTEMPTS,
+        initial_delay_s=config.RETRY_INITIAL_DELAY_S,
+        backoff_factor=config.RETRY_BACKOFF_FACTOR,
+        jitter_fraction=config.RETRY_JITTER_FRACTION
+    )
+    async def _glm_batch_store_kems_async_with_retry(self, request: glm_service_pb2.BatchStoreKEMsRequest, timeout: int) -> glm_service_pb2.BatchStoreKEMsResponse:
+        if not self.aio_glm_stub:
+            logger.error("SWM: GLM async client not available for BatchStoreKEMs.");
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+        logger.debug(f"Calling GLM BatchStoreKEMs (async, with retry). KEMs: {len(request.kems)}, Timeout: {timeout}s")
+        # The decorator handles retries, so the direct try-except for RpcError here is less critical
+        # unless for very specific non-retryable error handling within the method itself.
+        # For now, let the decorator handle it.
+        response = await self.aio_glm_stub.BatchStoreKEMs(request, timeout=timeout)
+        if response and response.failed_kem_references: # Check if response is not None
+             logger.warning(f"SWM: GLM BatchStoreKEMs (after retry) reported {len(response.failed_kem_references)} failures. Refs: {response.failed_kem_references}")
+        elif response:
+             logger.info(f"SWM: GLM BatchStoreKEMs (after retry) processed. Success: {len(response.successfully_stored_kems)}, Failures: {len(response.failed_kem_references if response.failed_kem_references else [])}")
+        # If decorator exhausts retries, it will raise an exception, which will be caught by the caller of this method.
+        return response
+
 
     async def _glm_persistence_worker(self):
         logger.info("SWM: GLM Persistence Worker started.")
@@ -372,12 +353,28 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
                 glm_batch_call_successful = False
                 glm_response = None
+                request_for_glm_batch = glm_service_pb2.BatchStoreKEMsRequest(kems=kems_for_glm_call)
 
                 if self.aio_glm_stub:
-                    glm_response = await self._glm_batch_store_kems_async(kems_for_glm_call)
-                    if glm_response:
-                        glm_batch_call_successful = True
-                        successfully_processed_in_glm_ids = {k.id for k in glm_response.successfully_stored_kems}
+                    try:
+                        glm_response = await self._glm_batch_store_kems_async_with_retry( # Use retry method
+                            request_for_glm_batch,
+                            timeout=self.config.GLM_BATCH_STORE_TIMEOUT_S # Use configured timeout
+                        )
+                        if glm_response: # Check if response itself is not None
+                            glm_batch_call_successful = True # Indicates the call completed, check content for partial fails
+                            successfully_processed_in_glm_ids = {k.id for k in glm_response.successfully_stored_kems}
+                        # If glm_response is None (can happen if decorator returns None on exhaustion, though it should raise)
+                        # or if an exception occurred that wasn't an RpcError handled by decorator,
+                        # glm_batch_call_successful remains False.
+                    except grpc_aio.AioRpcError as e_batch_call:
+                        logger.error(f"SWM: GLM Persistence Worker: BatchStoreKEMs call failed with gRPC error: {e_batch_call.code()} - {e_batch_call.details()}")
+                        # glm_batch_call_successful remains False
+                    except Exception as e_generic_batch_call:
+                        logger.error(f"SWM: GLM Persistence Worker: BatchStoreKEMs call failed with non-gRPC error: {e_generic_batch_call}", exc_info=True)
+                        # glm_batch_call_successful remains False
+
+                    if glm_batch_call_successful and glm_response:
 
                         if glm_response.successfully_stored_kems:
                             logger.info(f"SWM: GLM Worker: {len(glm_response.successfully_stored_kems)} KEMs confirmed persisted by GLM. Updating SWM cache.")
@@ -405,23 +402,28 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                                 else: logger.error(f"SWM: GLM Worker: Failed to re-queue KEM ID '{item_to_requeue[0].id}' (GLM specific fail), queue full. KEM may be lost."); break
 
                 if not glm_batch_call_successful:
+                    # This block handles cases where the BatchStoreKEMs call itself failed (e.g. network, GLM unavailable)
+                    # or if self.aio_glm_stub was None to begin with.
                     if not self.aio_glm_stub:
                         logger.error("SWM: GLM Persistence Worker: GLM stub not available. Batch not persisted.")
-                    else:
-                        logger.error(f"SWM: GLM Persistence Worker: Entire batch of {len(kems_for_glm_call)} KEMs failed GLM processing (batch call failed).")
+                    else: # Implies call failed or glm_response was None/empty
+                        logger.error(f"SWM: GLM Persistence Worker: Batch of {len(kems_for_glm_call)} KEMs potentially failed GLM processing (call failed or empty/error response).")
 
                     logger.warning(f"SWM: GLM Persistence Worker: Re-queueing {len(current_batch_items_with_retry)} items from failed/unprocessed batch.")
                     for kem_proto_retry, retry_count_retry in reversed(current_batch_items_with_retry):
                         if retry_count_retry < self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES:
                             if not self.glm_persistence_queue.full():
                                 await self.glm_persistence_queue.put((kem_proto_retry, retry_count_retry + 1))
-                                logger.info(f"SWM: GLM Persistence Worker: Re-queued KEM ID '{kem_proto_retry.id}' (batch fail, attempt {retry_count_retry + 1}).")
-                            else: logger.error(f"SWM: GLM Persistence Worker: Failed to re-queue KEM ID '{kem_proto_retry.id}', queue full. KEM may be lost."); break
+                                logger.info(f"SWM: GLM Persistence Worker: Re-queued KEM ID '{kem_proto_retry.id}' (batch processing failure, next attempt {retry_count_retry + 1}).")
+                            else:
+                                logger.error(f"SWM: GLM Persistence Worker: Failed to re-queue KEM ID '{kem_proto_retry.id}', queue full. KEM may be lost.")
+                                break # Stop trying to re-queue if queue is full
                         else:
-                            logger.error(f"SWM: GLM Persistence Worker: KEM ID '{kem_proto_retry.id}' (batch fail) reached max retries ({self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES}). Discarding.")
+                            logger.error(f"SWM: GLM Persistence Worker: KEM ID '{kem_proto_retry.id}' (batch processing failure) reached max retries ({self.config.GLM_PERSISTENCE_BATCH_MAX_RETRIES}). Discarding.")
 
             if self._stop_event.is_set() and self.glm_persistence_queue.empty():
-                 logger.info("SWM: GLM Persistence Worker stopping as stop event is set and queue is empty."); break
+                 logger.info("SWM: GLM Persistence Worker stopping as stop event is set and queue is empty.")
+                 break
 
         if not self.glm_persistence_queue.empty():
             logger.info(f"SWM: GLM Persistence Worker - processing remaining {self.glm_persistence_queue.qsize()} items on shutdown...")
@@ -433,14 +435,25 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                     final_batch_to_send.append(kem_tuple_final[0])
                     self.glm_persistence_queue.task_done(); processed_during_shutdown_count +=1
                     if len(final_batch_to_send) >= self.config.GLM_PERSISTENCE_BATCH_SIZE:
-                        if self.aio_glm_stub: logger.info(f"SWM (Shutdown): Sending batch of {len(final_batch_to_send)} KEMs."); await self._glm_batch_store_kems_async(final_batch_to_send)
-                        else: logger.error(f"SWM (Shutdown): GLM stub gone, cannot send {len(final_batch_to_send)} KEMs.")
+                        if self.aio_glm_stub:
+                            logger.info(f"SWM (Shutdown): Sending batch of {len(final_batch_to_send)} KEMs.");
+                            final_req = glm_service_pb2.BatchStoreKEMsRequest(kems=final_batch_to_send)
+                            try:
+                                await self._glm_batch_store_kems_async_with_retry(final_req, timeout=self.config.GLM_BATCH_STORE_TIMEOUT_S)
+                            except Exception as e_final_batch:
+                                logger.error(f"SWM (Shutdown): Error sending final batch: {e_final_batch}", exc_info=True)
+                        else:
+                            logger.error(f"SWM (Shutdown): GLM stub gone, cannot send {len(final_batch_to_send)} KEMs.")
                         final_batch_to_send.clear()
                 except asyncio.QueueEmpty: break
 
             if final_batch_to_send and self.aio_glm_stub:
                 logger.info(f"SWM: GLM Persistence Worker - sending final batch of {len(final_batch_to_send)} KEMs to GLM during shutdown.")
-                await self._glm_batch_store_kems_async(final_batch_to_send)
+                final_req_on_exit = glm_service_pb2.BatchStoreKEMsRequest(kems=final_batch_to_send)
+                try:
+                    await self._glm_batch_store_kems_async_with_retry(final_req_on_exit, timeout=self.config.GLM_BATCH_STORE_TIMEOUT_S)
+                except Exception as e_final_batch_exit:
+                    logger.error(f"SWM (Shutdown): Error sending final batch on exit: {e_final_batch_exit}", exc_info=True)
             elif final_batch_to_send:
                 logger.error(f"SWM: GLM Persistence Worker - GLM stub not available for final batch of {len(final_batch_to_send)} KEMs during shutdown. Data may be lost.")
             logger.info(f"SWM: GLM Persistence Worker processed {processed_during_shutdown_count} items during shutdown flush.")
@@ -601,7 +614,10 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
         try:
             logger.info(f"SWM: Requesting GLM.RetrieveKEMs with: {glm_req}")
-            glm_response = await self._glm_retrieve_kems_async(glm_req, timeout=30)
+        glm_response = await self._glm_retrieve_kems_async_with_retry( # Use retry method
+            glm_req,
+            timeout=self.config.GLM_RETRIEVE_TIMEOUT_S # Use configured timeout
+        )
 
             if glm_response and glm_response.kems:
                 queried_in_glm_count = len(glm_response.kems)
@@ -700,7 +716,9 @@ async def serve():
         if 'servicer_instance' in locals() and servicer_instance:
             await servicer_instance.stop_background_tasks()
         logger.info("SWM server: Stopping gRPC server...")
-        await server.stop(grace=5)
+        # Use configured grace period, ensure servicer_instance exists for config access
+        grace_period = servicer_instance.config.GRPC_SERVER_SHUTDOWN_GRACE_S if 'servicer_instance' in locals() and servicer_instance else 5
+        await server.stop(grace=grace_period)
         logger.info("SWM server stopped.")
 
 if __name__=='__main__':

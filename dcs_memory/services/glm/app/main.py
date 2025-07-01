@@ -49,11 +49,20 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         self.qdrant_repo = None
         try:
             if self.config.QDRANT_HOST:
-                qdrant_client = QdrantClient(host=self.config.QDRANT_HOST, port=self.config.QDRANT_PORT, timeout=10)
-                qdrant_client.get_collections()
-                logger.info(f"Qdrant client successfully connected to {self.config.QDRANT_HOST}:{self.config.QDRANT_PORT}")
+                qdrant_client = QdrantClient(
+                    host=self.config.QDRANT_HOST,
+                    port=self.config.QDRANT_PORT,
+                    timeout=self.config.QDRANT_CLIENT_TIMEOUT_S # Use configured timeout
+                )
+                qdrant_client.get_collections() # Test connection
+                logger.info(f"Qdrant client successfully connected to {self.config.QDRANT_HOST}:{self.config.QDRANT_PORT} with timeout {self.config.QDRANT_CLIENT_TIMEOUT_S}s.")
 
-                self.qdrant_repo = QdrantKemRepository(qdrant_client, self.config.QDRANT_COLLECTION, self.config.DEFAULT_VECTOR_SIZE)
+                self.qdrant_repo = QdrantKemRepository(
+                    qdrant_client=qdrant_client,
+                    collection_name=self.config.QDRANT_COLLECTION,
+                    default_vector_size=self.config.DEFAULT_VECTOR_SIZE,
+                    default_distance_metric=self.config.QDRANT_DEFAULT_DISTANCE_METRIC # Pass new config
+                )
                 self.qdrant_repo.ensure_collection()
                 logger.info("QdrantKemRepository initialized successfully.")
             else:
@@ -436,14 +445,18 @@ def serve():
 
     if config.QDRANT_HOST: # Pre-flight check only if Qdrant is configured
         try:
-            client_test = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT, timeout=2)
+            client_test = QdrantClient(
+                host=config.QDRANT_HOST,
+                port=config.QDRANT_PORT,
+                timeout=config.QDRANT_PREFLIGHT_CHECK_TIMEOUT_S # Use configured timeout
+            )
             client_test.get_collections()
-            logger.info(f"Qdrant pre-flight check OK: {config.QDRANT_HOST}:{config.QDRANT_PORT}.")
+            logger.info(f"Qdrant pre-flight check OK: {config.QDRANT_HOST}:{config.QDRANT_PORT} (timeout: {config.QDRANT_PREFLIGHT_CHECK_TIMEOUT_S}s).")
         except Exception as e_preflight:
             logger.critical(f"CRITICAL: Qdrant unavailable at {config.QDRANT_HOST}:{config.QDRANT_PORT}. {e_preflight}. Server NOT STARTED if Qdrant is essential.")
             return # Exit if Qdrant is configured but unavailable
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=config.GRPC_SERVER_MAX_WORKERS)) # Use configured max_workers
     try:
         servicer_instance = GlobalLongTermMemoryServicerImpl()
     except Exception as e_servicer_init:
@@ -461,7 +474,7 @@ def serve():
     except KeyboardInterrupt:
         logger.info("GLM server stopping via KeyboardInterrupt...")
     finally:
-        server.stop(grace=5)
+        server.stop(grace=config.GRPC_SERVER_SHUTDOWN_GRACE_S) # Use configured grace period
         logger.info("GLM server stopped.")
 
 if __name__ == '__main__':

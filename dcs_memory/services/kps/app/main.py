@@ -79,12 +79,16 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             logger.error(f"Error initializing GLM client in KPS: {e}")
             self.glm_stub = None # Ensure stub is None if channel creation failed
 
-    @retry_grpc_call
-    def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
+    @retry_grpc_call( # Pass configured retry parameters
+        max_attempts=config.RETRY_MAX_ATTEMPTS,
+        initial_delay_s=config.RETRY_INITIAL_DELAY_S,
+        backoff_factor=config.RETRY_BACKOFF_FACTOR,
+        jitter_fraction=config.RETRY_JITTER_FRACTION
+        # retryable_error_codes can use the decorator's default or be configured too if needed
+    )
+    def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int) -> glm_service_pb2.StoreKEMResponse: # timeout will be passed from caller
         if not self.glm_stub:
             logger.error("KPS._glm_store_kem_with_retry: GLM stub is not initialized. This is a KPS internal configuration error.")
-            # This indicates a setup/configuration problem within KPS.
-            # Raising RuntimeError as it's an internal state issue, not a gRPC communication failure at this point.
             raise RuntimeError("KPS Internal Error: GLM client stub not available for storing KEM.")
         return self.glm_stub.StoreKEM(request, timeout=timeout)
 
@@ -150,7 +154,11 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             store_kem_request = glm_service_pb2.StoreKEMRequest(kem=kem_to_store)
 
             try:
-                store_kem_response = self._glm_store_kem_with_retry(store_kem_request, timeout=15) # Increased timeout for GLM store
+                # Use configured timeout for this specific call
+                store_kem_response = self._glm_store_kem_with_retry(
+                    store_kem_request,
+                    timeout=self.config.GLM_STORE_KEM_TIMEOUT_S
+                )
 
                 if store_kem_response and store_kem_response.kem and store_kem_response.kem.id:
                     kem_id_from_glm = store_kem_response.kem.id
@@ -195,7 +203,7 @@ def serve():
     if not servicer_instance.glm_stub:
         logger.warning("KPS server starting WITHOUT a GLM CLIENT. KEM persistence will be impossible.")
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=config.GRPC_SERVER_MAX_WORKERS)) # Use configured max_workers
     kps_service_pb2_grpc.add_KnowledgeProcessorServiceServicer_to_server(
         servicer_instance, server
     )
@@ -208,7 +216,7 @@ def serve():
     except KeyboardInterrupt:
         logger.info("Stopping KPS server...")
     finally:
-        server.stop(None) # Graceful stop
+        server.stop(config.GRPC_SERVER_SHUTDOWN_GRACE_S) # Use configured grace period
         logger.info("KPS server stopped.")
 
 if __name__ == '__main__':
