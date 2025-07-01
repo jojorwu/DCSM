@@ -26,6 +26,18 @@ class KPSConfig(BaseServiceConfig):
     GLM_RETRY_INITIAL_DELAY_S: float = Field(default=1.0, alias="KPS_GLM_RETRY_INITIAL_DELAY_S")
     GLM_RETRY_BACKOFF_FACTOR: float = Field(default=2.0, alias="KPS_GLM_RETRY_BACKOFF_FACTOR")
 
+    # Timeout for KPS making StoreKEM calls to GLM
+    GLM_STORE_KEM_TIMEOUT_S: int = Field(default=15, description="Timeout for KPS calling GLM's StoreKEM, in seconds.")
+
+    # KPS Idempotency Settings
+    KPS_IDEMPOTENCY_CHECK_ENABLED: bool = Field(default=True, description="Enable idempotency checks for ProcessRawData based on data_id.")
+    KPS_IDEMPOTENCY_METADATA_KEY: str = Field(default="source_data_id", description="Metadata key used to store/check data_id for idempotency.")
+    KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S: float = Field(default=5.0, description="Timeout in seconds for the GLM query during idempotency check.")
+
+    # KPS Health Check Settings
+    HEALTH_CHECK_GLM_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for KPS health checking GLM.")
+
+
 if __name__ == '__main__':
     print("--- Тестирование KPSConfig ---")
 

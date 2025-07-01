@@ -227,23 +227,29 @@ class RedisCacheTransactionError(RedisCacheError):
         # 2. Getting old timestamp *scores* (seconds) to remove from ZSETs.
         # It appears the current `hmget` fetches the ISO string date fields, then converts them to seconds.
         # This is correct for getting the seconds value if only ISO strings were stored.
-        raw_fields = await self.redis.hmget(kem_key, "metadata", "created_at", "updated_at")
+        # Corrected: Fetch *_ts fields directly.
+        raw_fields = await self.redis.hmget(kem_key, "metadata", "created_at_ts", "updated_at_ts")
         if raw_fields:
-            if raw_fields[0] is not None:
-                try: old_data["metadata"] = json.loads(raw_fields[0].decode('utf-8'))
-                except: pass
-            if raw_fields[1] is not None:
+            if raw_fields[0] is not None: # metadata
                 try:
-                    ts = Timestamp(); ts_iso_str = raw_fields[1].decode('utf-8')
-                    ts.FromJsonString(ts_iso_str + ("Z" if not ts_iso_str.endswith("Z") and 'T' in ts_iso_str else ""))
-                    old_data["created_at_ts"] = ts.seconds
-                except: pass
-            if raw_fields[2] is not None:
+                    old_data["metadata"] = json.loads(raw_fields[0].decode('utf-8'))
+                except json.JSONDecodeError:
+                    logger.warning(f"Could not parse metadata JSON from {kem_key} during _get_old_indexed_fields: {raw_fields[0].decode('utf-8', errors='ignore')}")
+                    # Keep metadata as empty dict if parsing fails
+                except Exception as e_meta: # Catch other potential errors during metadata processing
+                    logger.warning(f"Unexpected error processing metadata from {kem_key} during _get_old_indexed_fields: {e_meta}", exc_info=True)
+
+            if raw_fields[1] is not None: # created_at_ts
                 try:
-                    ts = Timestamp(); ts_iso_str = raw_fields[2].decode('utf-8')
-                    ts.FromJsonString(ts_iso_str + ("Z" if not ts_iso_str.endswith("Z") and 'T' in ts_iso_str else ""))
-                    old_data["updated_at_ts"] = ts.seconds
-                except: pass
+                    old_data["created_at_ts"] = int(raw_fields[1].decode('utf-8'))
+                except (ValueError, TypeError) as e_ts_created:
+                    logger.warning(f"Could not parse created_at_ts (expected int) from {kem_key}: '{raw_fields[1].decode('utf-8', errors='ignore')}'. Error: {e_ts_created}")
+
+            if raw_fields[2] is not None: # updated_at_ts
+                try:
+                    old_data["updated_at_ts"] = int(raw_fields[2].decode('utf-8'))
+                except (ValueError, TypeError) as e_ts_updated:
+                    logger.warning(f"Could not parse updated_at_ts (expected int) from {kem_key}: '{raw_fields[2].decode('utf-8', errors='ignore')}'. Error: {e_ts_updated}")
         return old_data
 
     async def set(self, kem_id: str, kem: kem_pb2.KEM) -> None:

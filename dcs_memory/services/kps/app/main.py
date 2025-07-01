@@ -458,7 +458,9 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             retrieve_request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1)
 
             try:
-                timeout_check = getattr(self.config, "KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S", self.config.GLM_STORE_KEM_TIMEOUT_S)
+                # timeout_check = getattr(self.config, "KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S", self.config.GLM_STORE_KEM_TIMEOUT_S)
+                # Directly use the new config field after adding it to KPSConfig
+                timeout_check = self.config.KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S
                 response = self._glm_retrieve_kems_with_retry(retrieve_request, timeout=timeout_check)
                 if response and response.kems:
                     existing_kem_id = response.kems[0].id
