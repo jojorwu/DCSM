@@ -76,6 +76,16 @@ class BaseServiceConfig(BaseSettings):
     # Optional: For JSON logging, specify if default log record fields should be renamed or if specific ones are desired
     # For now, we'll rely on python-json-logger's defaults and ability to add extra fields via logging calls.
 
+    # TLS Configuration (Paths to PEM-encoded files)
+    # For Servers:
+    GRPC_SERVER_CERT_PATH: Optional[str] = Field(default=None, description="Path to the gRPC server's SSL certificate file (PEM format).")
+    GRPC_SERVER_KEY_PATH: Optional[str] = Field(default=None, description="Path to the gRPC server's SSL private key file (PEM format).")
+    # For Clients (e.g., a service acting as a client to another, or for mTLS server config):
+    GRPC_CLIENT_ROOT_CA_CERT_PATH: Optional[str] = Field(default=None, description="Path to the root CA certificate file (PEM format) for verifying server certificates.")
+    GRPC_CLIENT_CERT_PATH: Optional[str] = Field(default=None, description="Path to the gRPC client's SSL certificate file (PEM format) for mTLS.")
+    GRPC_CLIENT_KEY_PATH: Optional[str] = Field(default=None, description="Path to the gRPC client's SSL private key file (PEM format) for mTLS.")
+
+
     @classmethod
     def settings_customise_sources(
         cls,

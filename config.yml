@@ -36,8 +36,26 @@ shared:
   LOG_OUTPUT_MODE: "stdout" # Options: "stdout", "file", "json_stdout", "json_file"
   LOG_FILE_PATH: null # Example: "/var/log/dcsm/dcsm_service.log" (used if mode is 'file' or 'json_file')
 
+  # TLS Configuration (Paths are examples, adjust for your deployment)
+  # These are paths *within the container* if using Docker, assuming certs are mounted to /certs
+  # For server-side TLS (each service exposing its endpoint securely):
+  # GRPC_SERVER_CERT_PATH: null # Example: "/certs/service_name/server.crt"
+  # GRPC_SERVER_KEY_PATH: null  # Example: "/certs/service_name/server.key"
+  # For client-side TLS (services acting as clients to other secure services):
+  # GRPC_CLIENT_ROOT_CA_CERT_PATH: null # Example: "/certs/ca/ca.crt" # Path to CA cert to verify servers
+  # For mTLS (client also presents a certificate - not implemented in this step):
+  # GRPC_CLIENT_CERT_PATH: null # Example: "/certs/client_name/client.crt"
+  # GRPC_CLIENT_KEY_PATH: null  # Example: "/certs/client_name/client.key"
+
 glm:
-  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY from shared
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY,
+  # and TLS paths from shared. Override here if specific paths are needed for GLM.
+  # Example for enabling TLS for GLM server:
+  # GRPC_SERVER_CERT_PATH: "/certs/glm/server.crt"
+  # GRPC_SERVER_KEY_PATH: "/certs/glm/server.key"
+  # If GLM were a client to another service and needed to verify that service's CA:
+  # GRPC_CLIENT_ROOT_CA_CERT_PATH: "/certs/ca/ca.crt"
+
   DB_FILENAME: "glm_prod_metadata.sqlite3"
   QDRANT_HOST: "dcsm_qdrant" # For Qdrant client in GLM, LB is not typical for DB connection from a single service.
   QDRANT_PORT: 6333
@@ -56,7 +74,14 @@ glm:
   HEALTH_CHECK_QDRANT_TIMEOUT_S: 2.0
 
 kps:
-  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY from shared
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY,
+  # and TLS paths from shared. Override here if specific paths are needed for KPS.
+  # Example for enabling TLS for KPS server:
+  # GRPC_SERVER_CERT_PATH: "/certs/kps/server.crt"
+  # GRPC_SERVER_KEY_PATH: "/certs/kps/server.key"
+  # KPS is a client to GLM. To verify GLM's server cert (if GLM TLS is enabled):
+  # GRPC_CLIENT_ROOT_CA_CERT_PATH: "/certs/ca/ca.crt"
+
   GLM_SERVICE_ADDRESS: "dns:///dcsm_glm:50051" # Example for enabling client-side LB if dcsm_glm is scaled
   EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
   DEFAULT_VECTOR_SIZE: 384
@@ -70,8 +95,15 @@ kps:
   HEALTH_CHECK_GLM_TIMEOUT_S: 2.0
 
 swm:
-  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_SHUTDOWN_GRACE_S, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY from shared
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_SHUTDOWN_GRACE_S, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY,
+  # and TLS paths from shared. Override here if specific paths are needed for SWM.
   # GRPC_SERVER_MAX_WORKERS from shared is not applicable to SWM's async server
+  # Example for enabling TLS for SWM server:
+  # GRPC_SERVER_CERT_PATH: "/certs/swm/server.crt"
+  # GRPC_SERVER_KEY_PATH: "/certs/swm/server.key"
+  # SWM is a client to GLM. To verify GLM's server cert (if GLM TLS is enabled):
+  # GRPC_CLIENT_ROOT_CA_CERT_PATH: "/certs/ca/ca.crt"
+
   GLM_SERVICE_ADDRESS: "dns:///dcsm_glm:50051" # Example for enabling client-side LB if dcsm_glm is scaled
   MAX_CACHE_SIZE_KEMS: 1000 # Conceptual for Redis, actual eviction by Redis policies
   DEFAULT_KEM_TTL_SECONDS: 3600

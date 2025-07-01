@@ -166,12 +166,55 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             # No code change here for GRPC_DNS_RESOLVER, it's an environment setup.
             logger.info(f"KPS: GLM client attempting to connect to: {target_address} with LB policy: {self.config.GRPC_CLIENT_LB_POLICY or 'default (pick_first)'}")
 
-            self.glm_channel = grpc.insecure_channel(target_address, options=grpc_options)
-            self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
-            logger.info(f"GLM client for KPS initialized, target: {target_address}, options: {grpc_options}")
+            if self.config.GRPC_CLIENT_ROOT_CA_CERT_PATH:
+                logger.info(f"KPS: Attempting to create SECURE gRPC channel to GLM at {target_address}")
+                try:
+                    with open(self.config.GRPC_CLIENT_ROOT_CA_CERT_PATH, 'rb') as f:
+                        root_ca_cert = f.read()
+                    # For mTLS, client_key and client_cert would be loaded here too.
+                    # client_key = None; client_cert = None
+                    # if self.config.GRPC_CLIENT_KEY_PATH and self.config.GRPC_CLIENT_CERT_PATH:
+                    #     with open(self.config.GRPC_CLIENT_KEY_PATH, 'rb') as f: client_key = f.read()
+                    #     with open(self.config.GRPC_CLIENT_CERT_PATH, 'rb') as f: client_cert = f.read()
+
+                    channel_credentials = grpc.ssl_channel_credentials(root_certificates=root_ca_cert)
+                    # For mTLS:
+                    # channel_credentials = grpc.ssl_channel_credentials(root_certificates=root_ca_cert, private_key=client_key, certificate_chain=client_cert)
+
+                    self.glm_channel = grpc.secure_channel(target_address, channel_credentials, options=grpc_options)
+                    self.glm_health_check_channel = grpc.secure_channel(target_address, channel_credentials, options=health_check_grpc_options) # Also secure health check client
+                    logger.info(f"KPS: SECURE GLM client channels initialized for target: {target_address}")
+                except FileNotFoundError as e_certs:
+                    logger.critical(f"KPS: CRITICAL - Root CA or client cert/key file not found for GLM client: {e_certs}. KPS will likely fail to connect to GLM if GLM is secure.")
+                    # Fallback to insecure if certs are specified but not found? Or fail hard?
+                    # For now, let's allow fallback to insecure if this was a misconfiguration but paths were set.
+                    # Better: if paths set, they must be valid. If not set, then insecure.
+                    # The current logic will make it try secure, fail, and then KPS might not work.
+                    # This is acceptable for "enabling TLS" - if configured, it must work.
+                    self.glm_channel = None # Prevent use
+                    self.glm_health_check_channel = None # Prevent use
+                    raise RuntimeError(f"Failed to load TLS credentials for GLM client: {e_certs}") from e_certs
+                except Exception as e_secure_channel:
+                    logger.critical(f"KPS: CRITICAL - Failed to create SECURE gRPC channel to GLM: {e_secure_channel}.", exc_info=True)
+                    self.glm_channel = None
+                    self.glm_health_check_channel = None
+                    raise RuntimeError(f"Failed to create secure gRPC channel to GLM: {e_secure_channel}") from e_secure_channel
+            else:
+                logger.info(f"KPS: Creating INSECURE gRPC channel to GLM at {target_address} (no client CA cert path provided).")
+                self.glm_channel = grpc.insecure_channel(target_address, options=grpc_options)
+                self.glm_health_check_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=health_check_grpc_options) # Health check also insecure
+
+            if self.glm_channel:
+                self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
+            if self.glm_health_check_channel:
+                 self.glm_health_check_stub = health_pb2_grpc_health.HealthStub(self.glm_health_check_channel)
+
+            logger.info(f"GLM client for KPS initialized (channel type determined by TLS config). Target: {target_address}, options: {grpc_options}")
+
         except Exception as e:
             logger.error(f"Error initializing GLM client in KPS: {e}", exc_info=True)
-            self.glm_stub = None # Ensure stub is None if channel creation failed
+            self.glm_stub = None
+            self.glm_health_check_stub = None
 
     @retry_grpc_call(
         max_attempts=config.RETRY_MAX_ATTEMPTS, # These are now correctly sourced from config by the decorator through the instance
@@ -601,8 +644,26 @@ def serve():
     kps_health_servicer = KPSHealthServicer(servicer_instance, servicer_instance.check_overall_health())
     health_pb2_grpc.add_HealthServicer_to_server(kps_health_servicer, server)
 
-    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting KPS (Knowledge Processor Service) on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled...")
+    if config.GRPC_SERVER_CERT_PATH and config.GRPC_SERVER_KEY_PATH:
+        try:
+            with open(config.GRPC_SERVER_KEY_PATH, 'rb') as f:
+                server_key = f.read()
+            with open(config.GRPC_SERVER_CERT_PATH, 'rb') as f:
+                server_cert = f.read()
+
+            server_credentials = grpc.ssl_server_credentials([(server_key, server_cert)])
+            server.add_secure_port(config.GRPC_LISTEN_ADDRESS, server_credentials)
+            logger.info(f"Starting KPS (Knowledge Processor Service) SECURELY on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled.")
+        except FileNotFoundError as e_certs:
+            logger.critical(f"CRITICAL: TLS certificate/key file not found for KPS server: {e_certs}. KPS server NOT STARTED securely.")
+            return
+        except Exception as e_tls_setup:
+            logger.critical(f"CRITICAL: Error setting up TLS for KPS server: {e_tls_setup}. KPS server NOT STARTED securely.", exc_info=True)
+            return
+    else:
+        server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
+        logger.info(f"Starting KPS (Knowledge Processor Service) INSECURELY on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled (TLS cert/key not configured).")
+
     server.start()
     logger.info(f"KPS started and listening for connections on {config.GRPC_LISTEN_ADDRESS}.")
     try:

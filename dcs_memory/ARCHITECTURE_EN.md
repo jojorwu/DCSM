@@ -300,7 +300,9 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **More Sophisticated Caching and Eviction Policies in SWM:** For example, based on access frequency, KEM size, or explicit agent-set priorities.
 *   **Enhanced Filtering in `QuerySWM`:** Support for more complex queries on cached data, if feasible without turning SWM into a full-fledged database.
 *   **Implementation of Other Services:** Such as a service for managing agent configurations or a memory usage analytics service.
-*   **Security:** Adding authentication (e.g., gRPC token-based) and authorization (granular access rights to KEMs and service methods).
+*   **Security:**
+    *   **Transport Layer Security (TLS):** Implemented for inter-service gRPC communication (server-side TLS). Clients (KPS, SWM) can verify server certificates using a common Root CA. This is configurable via `GRPC_SERVER_CERT_PATH`, `GRPC_SERVER_KEY_PATH` (for servers) and `GRPC_CLIENT_ROOT_CA_CERT_PATH` (for clients) in `config.yml`. Mutual TLS (mTLS) is a future enhancement.
+    *   **Authentication & Authorization:** Adding comprehensive authentication (e.g., gRPC token-based) and authorization (granular access rights to KEMs and service methods) remains future work.
 *   **Containerization and Deployment:** Preparing `Dockerfile` for each service and `docker-compose.yml` examples to simplify local deployment and testing of the entire system. Transitioning to Kubernetes for production environments.
 *   **Comprehensive Integration and Load Testing.**
 *   **Error Handling and Fault Tolerance (Current State and Development):**

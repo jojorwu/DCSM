@@ -787,8 +787,37 @@ def serve():
     glm_health_servicer = GLMHealthServicer(servicer_instance, servicer_instance.check_overall_health())
     health_pb2_grpc.add_HealthServicer_to_server(glm_health_servicer, server)
 
-    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting GLM server on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled.")
+    if config.GRPC_SERVER_CERT_PATH and config.GRPC_SERVER_KEY_PATH:
+        try:
+            with open(config.GRPC_SERVER_KEY_PATH, 'rb') as f:
+                server_key = f.read()
+            with open(config.GRPC_SERVER_CERT_PATH, 'rb') as f:
+                server_cert = f.read()
+
+            # For now, server-side TLS only. mTLS would require root_certificates and require_client_auth=True.
+            # root_ca_bundle = None
+            # if config.GRPC_CLIENT_ROOT_CA_CERT_PATH: # This would be for mTLS client cert validation
+            #     with open(config.GRPC_CLIENT_ROOT_CA_CERT_PATH, 'rb') as f:
+            #         root_ca_bundle = f.read()
+
+            server_credentials = grpc.ssl_server_credentials(
+                private_key_certificate_chain_pairs=[(server_key, server_cert)]
+                # root_certificates=root_ca_bundle, # Uncomment for mTLS
+                # require_client_auth=True if root_ca_bundle else False # Uncomment for mTLS
+            )
+            server.add_secure_port(config.GRPC_LISTEN_ADDRESS, server_credentials)
+            logger.info(f"Starting GLM server SECURELY on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled.")
+        except FileNotFoundError as e_certs:
+            logger.critical(f"CRITICAL: TLS certificate/key file not found: {e_certs}. GLM server NOT STARTED securely. Check paths in config.")
+            # Decide if to fallback to insecure or exit. For enabling TLS, exiting is safer if certs are specified but missing.
+            return # Exit if certs are specified but not found
+        except Exception as e_tls_setup:
+            logger.critical(f"CRITICAL: Error setting up TLS for GLM server: {e_tls_setup}. GLM server NOT STARTED securely.", exc_info=True)
+            return # Exit on other TLS setup errors
+    else:
+        server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
+        logger.info(f"Starting GLM server INSECURELY on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled (TLS cert/key not configured).")
+
     server.start()
     logger.info(f"GLM server started and listening on {config.GRPC_LISTEN_ADDRESS}.")
 
