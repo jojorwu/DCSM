@@ -1,6 +1,5 @@
 grpcio
 grpcio-tools
 protobuf
-qdrant-client # Для клиента GLM, если он будет частью SDK, который KPS может использовать, или если KPS напрямую импортирует типы GLM, связанные с Qdrant. Для безопасности.
+# qdrant-client # KPS interacts with GLM, GLM handles Qdrant. Not directly needed by KPS.
 sentence-transformers
-# numpy # sentence-transformers может его потребовать неявно, но лучше указать

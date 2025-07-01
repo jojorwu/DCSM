@@ -1,0 +1,116 @@
+# Central Configuration for DCSM Services
+
+# Shared settings - these can be overridden by service-specific settings below,
+# or by environment variables.
+shared:
+  LOG_LEVEL: "INFO" # Default log level for all services unless overridden
+  RETRY_MAX_ATTEMPTS: 3
+  RETRY_INITIAL_DELAY_S: 1.0
+  RETRY_BACKOFF_FACTOR: 2.0
+  RETRY_JITTER_FRACTION: 0.1
+  GRPC_SERVER_MAX_WORKERS: 10 # Default for sync gRPC servers (GLM, KPS)
+  GRPC_SERVER_SHUTDOWN_GRACE_S: 5 # Default shutdown grace period in seconds
+
+  # gRPC Keepalive and Channel/Server Options (applied to clients and servers where applicable)
+  GRPC_KEEPALIVE_TIME_MS: 60000                    # e.g., 1 minute
+  GRPC_KEEPALIVE_TIMEOUT_MS: 10000                 # e.g., 10 seconds
+  GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS: true      # true or false
+  GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS: 30000 # e.g., 30 seconds (client-side)
+  GRPC_MAX_RECEIVE_MESSAGE_LENGTH: 4194304         # 4MB (4 * 1024 * 1024)
+  GRPC_MAX_SEND_MESSAGE_LENGTH: 4194304            # 4MB
+  GRPC_SERVER_MAX_CONNECTION_IDLE_MS: 0            # 0 for infinite (server-side)
+  GRPC_SERVER_MAX_CONNECTION_AGE_MS: 0             # 0 for infinite (server-side)
+  GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: 0       # 0 for infinite (server-side)
+
+  # Advanced Logging Configuration
+  LOG_FORMAT: "%(asctime)s - %(name)s - %(levelname)-8s - %(message)s" # Default: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  LOG_DATE_FORMAT: "%Y-%m-%d %H:%M:%S,%03d" # Default
+  LOG_OUTPUT_MODE: "stdout" # Options: "stdout", "file", "json_stdout", "json_file"
+  LOG_FILE_PATH: null # Example: "/var/log/dcsm/dcsm_service.log" (used if mode is 'file' or 'json_file')
+
+glm:
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_* from shared unless overridden
+  GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS: true      # true or false
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_* from shared unless overridden
+  DB_FILENAME: "glm_prod_metadata.sqlite3"
+  QDRANT_HOST: "dcsm_qdrant"
+  QDRANT_PORT: 6333
+  QDRANT_COLLECTION: "glm_kems_production_v1"
+  DEFAULT_VECTOR_SIZE: 384
+  DEFAULT_PAGE_SIZE: 20
+  GRPC_LISTEN_ADDRESS: "[::]:50051"
+  SQLITE_BUSY_TIMEOUT: 7500
+  SQLITE_CONNECT_TIMEOUT_S: 10
+  QDRANT_CLIENT_TIMEOUT_S: 10
+  QDRANT_DEFAULT_DISTANCE_METRIC: "COSINE" # COSINE, DOT, or EUCLID
+  QDRANT_PREFLIGHT_CHECK_TIMEOUT_S: 2
+  # Example: Override GRPC_SERVER_MAX_WORKERS for GLM if needed
+  # GRPC_SERVER_MAX_WORKERS: 15
+
+kps:
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_* from shared unless overridden
+  GLM_SERVICE_ADDRESS: "dcsm_glm:50051"
+  EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
+  DEFAULT_VECTOR_SIZE: 384
+  DEFAULT_PROCESSING_BATCH_SIZE: 32
+  GRPC_LISTEN_ADDRESS: "[::]:50052"
+  GLM_STORE_KEM_TIMEOUT_S: 15 # Timeout for KPS calling GLM StoreKEM
+
+swm:
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_SHUTDOWN_GRACE_S, GRPC_KEEPALIVE_* from shared
+  # GRPC_SERVER_MAX_WORKERS from shared is not applicable to SWM's async server
+  GLM_SERVICE_ADDRESS: "dcsm_glm:50051"
+  MAX_CACHE_SIZE_KEMS: 1000 # Conceptual for Redis, actual eviction by Redis policies
+  DEFAULT_KEM_TTL_SECONDS: 3600
+  GRPC_LISTEN_ADDRESS: "[::]:50053"
+
+  REDIS_HOST: "dcsm_swm_redis"
+  REDIS_PORT: 6379
+  SWM_REDIS_PASSWORD: null # Set password if Redis requires it, e.g., "yourpassword"
+  SWM_REDIS_DB: 0
+  REDIS_DB_PUBSUB: 0
+  REDIS_DB_CACHE_INDEX: 1
+  REDIS_DB_LOCKS_COUNTERS: 2
+
+  GLM_RETRIEVE_TIMEOUT_S: 20
+  GLM_STORE_TIMEOUT_S: 10
+  GLM_BATCH_STORE_TIMEOUT_S: 30
+
+  GLM_PERSISTENCE_QUEUE_MAX_SIZE: 1000
+  GLM_PERSISTENCE_FLUSH_INTERVAL_S: 5.0
+  GLM_PERSISTENCE_BATCH_SIZE: 50
+  GLM_PERSISTENCE_BATCH_MAX_RETRIES: 3
+  GLM_PERSISTENCE_WORKER_SHUTDOWN_GRACE_S: 5
+
+  REDIS_PUBSUB_GET_MESSAGE_TIMEOUT_S: 1.0
+  REDIS_PUBSUB_ERROR_SLEEP_S: 1.0
+  REDIS_MAX_PUBSUB_RETRIES: 5
+  REDIS_RECONNECT_DELAY_S: 5.0
+
+  SUBSCRIBER_MIN_QUEUE_SIZE: 10
+  SUBSCRIBER_DEFAULT_QUEUE_SIZE: 100
+  SUBSCRIBER_MAX_QUEUE_SIZE: 1000
+  SUBSCRIBER_IDLE_CHECK_INTERVAL_S: 5.0
+  SUBSCRIBER_IDLE_TIMEOUT_THRESHOLD: 6
+
+  LOCK_CLEANUP_INTERVAL_S: 60
+  LOCK_CLEANUP_SHUTDOWN_GRACE_S: 2
+
+  REDIS_TRANSACTION_MAX_RETRIES: 3
+  REDIS_TRANSACTION_RETRY_INITIAL_DELAY_S: 0.01
+  REDIS_TRANSACTION_RETRY_BACKOFF_FACTOR: 2.0
+
+  SWM_INDEXED_METADATA_KEYS: ["type", "source_system", "project_id"]
+
+  SWM_EVICTION_SOURCE_AGENT_ID: "SWM_REDIS_EVICTION"
+  REDIS_KEM_KEY_PREFIX: "swm_kem:"
+  REDIS_INDEX_META_KEY_PREFIX: "swm_idx:meta:"
+  REDIS_INDEX_DATE_CREATED_KEY: "swm_idx:date:created_at"
+  REDIS_INDEX_DATE_UPDATED_KEY: "swm_idx:date:updated_at"
+  REDIS_QUERY_TEMP_KEY_PREFIX: "swm_query_tmp:"
+
+  # SWM specific GLM client retry settings (overrides shared RETRY_*)
+  RETRY_MAX_ATTEMPTS: 4
+  RETRY_INITIAL_DELAY_S: 0.8
+  RETRY_BACKOFF_FACTOR: 1.5
+```

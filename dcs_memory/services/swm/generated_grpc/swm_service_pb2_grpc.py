@@ -26,7 +26,7 @@ if _version_not_supported:
 
 
 class SharedWorkingMemoryServiceStub(object):
-    """Сервис Общей Рабочей Памяти (Shared Working Memory Service)
+    """Shared Working Memory Service (SWM)
     """
 
     def __init__(self, channel):
@@ -83,72 +83,72 @@ class SharedWorkingMemoryServiceStub(object):
 
 
 class SharedWorkingMemoryServiceServicer(object):
-    """Сервис Общей Рабочей Памяти (Shared Working Memory Service)
+    """Shared Working Memory Service (SWM)
     """
 
     def PublishKEMToSWM(self, request, context):
-        """Публикует КЕП в SWM. Может также инициировать сохранение/обновление в GLM.
+        """Publishes a KEM to SWM. May also initiate persistence/update in GLM.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def SubscribeToSWMEvents(self, request, context):
-        """Подписывается на события, происходящие в SWM (например, появление новых КЕП).
+        """Subscribes to events occurring in SWM (e.g., new KEMs appearing).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def QuerySWM(self, request, context):
-        """Запрашивает активные КЕП непосредственно из SWM (из ее кэша).
+        """Queries active KEMs directly from SWM (from its cache).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def LoadKEMsFromGLM(self, request, context):
-        """Запрашивает загрузку КЕП из GLM в SWM (в кэш SWM).
+        """Requests loading of KEMs from GLM into SWM (into SWM's cache).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def AcquireLock(self, request, context):
-        """--- RPC для управления блокировками ---
-        Пытается получить блокировку на ресурс.
+        """--- RPCs for Distributed Lock Management ---
+        Attempts to acquire a lock on a resource.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def ReleaseLock(self, request, context):
-        """Освобождает ранее полученную блокировку.
+        """Releases a previously acquired lock.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetLockInfo(self, request, context):
-        """Получает информацию о текущем состоянии блокировки для ресурса.
+        """Gets information about the current lock status for a resource.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def IncrementCounter(self, request, context):
-        """--- RPC для распределенных счетчиков ---
-        Атомарно инкрементирует (или декрементирует) значение счетчика.
-        Если счетчик не существует, он создается со значением increment_by.
+        """--- RPCs for Distributed Counters ---
+        Atomically increments (or decrements) the value of a counter.
+        If the counter does not exist, it is created with the value of increment_by.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetCounter(self, request, context):
-        """Получает текущее значение счетчика.
-        Если счетчик не существует, может вернуть ошибку или значение по умолчанию (например, 0).
-        TODO: Добавить DeleteCounter(DistributedCounterRequest) returns (google.protobuf.Empty) в будущем.
+        """Gets the current value of a counter.
+        If the counter does not exist, may return an error or a default value (e.g., 0).
+        TODO: Add DeleteCounter(DistributedCounterRequest) returns (google.protobuf.Empty) in the future.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -211,7 +211,7 @@ def add_SharedWorkingMemoryServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class SharedWorkingMemoryService(object):
-    """Сервис Общей Рабочей Памяти (Shared Working Memory Service)
+    """Shared Working Memory Service (SWM)
     """
 
     @staticmethod

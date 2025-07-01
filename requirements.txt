@@ -2,3 +2,5 @@ grpcio
 grpcio-tools
 protobuf
 pydantic-settings
+PyYAML>=5.4 # Added for centralized YAML configuration
+python-json-logger>=2.0 # For JSON logging

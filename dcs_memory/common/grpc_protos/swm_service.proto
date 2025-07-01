@@ -47,10 +47,10 @@ message PublishKEMToSWMRequest {
 }
 
 message PublishKEMToSWMResponse {
-  string kem_id = 1; // ID of the published KEM (could be GLM-generated if persist_to_glm=true and ID was initially empty).
-  bool published_to_swm = 2; // Whether successfully published to SWM's cache.
-  bool persistence_triggered_to_glm = 3; // Whether a call to GLM was initiated.
-  string status_message = 4; // Additional status message.
+  string kem_id_swm = 1; // The ID of the KEM as known and stored in SWM's cache.
+  bool published_to_swm = 2; // True if successfully published/updated in SWM's cache.
+  bool queued_for_glm_persistence = 3; // True if KEM was successfully queued for persistence to GLM (if requested).
+  string status_message = 4; // Overall status message, may include info about queueing.
 }
 
 // --- Messages for SubscribeToSWMEvents ---
@@ -64,11 +64,13 @@ message SubscriptionTopic {
   string filter_criteria = 2; // Filter criteria for the topic (e.g., "metadata.topic='project_x'" or "kem_id='id123'").
                               // The format of criteria needs to be defined (e.g., simple DSL or JSONPath).
                               // For KEM_LIFECYCLE_EVENTS, this could be a filter by ID, content type, metadata.
+  repeated SWMMemoryEvent.EventType desired_event_types = 3; // If empty, all event types for this topic/filter match.
 }
 
 message SubscribeToSWMEventsRequest {
   string agent_id = 1; // Identifier of the subscribing agent (for logging and subscription management).
   repeated SubscriptionTopic topics = 2; // List of topics the agent subscribes to.
+  int32 requested_queue_size = 3; // Optional: Client's requested size for its event queue. Server may apply bounds. Default 0 means server default.
 }
 
 message SWMMemoryEvent {

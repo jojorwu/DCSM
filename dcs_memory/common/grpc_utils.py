@@ -95,14 +95,94 @@ def retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
 
             # This part should not be reached if max_attempts >= 1,
             # as the loop will either return a successful result or raise an exception.
-            # It's here for logical completeness, or if max_attempts could be 0.
-            logger.error(f"gRPC call to {func.__name__} exhausted attempts without success or specific error handling.")
+    logger.error(f"Sync gRPC call to {func.__name__} exhausted attempts without success or specific error handling.")
             return None # Should ideally not happen with proper error raising.
         return wrapper
     return decorator
 
+def async_retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
+                          initial_delay_s=DEFAULT_INITIAL_DELAY_S,
+                          backoff_factor=DEFAULT_BACKOFF_FACTOR,
+                          jitter_fraction=DEFAULT_JITTER_FRACTION,
+                          retryable_error_codes=RETRYABLE_ERROR_CODES): # Uses same default retryable codes
+    """
+    Decorator to automatically retry an ASYNCHRONOUS gRPC call upon specific, typically transient, errors.
+    Uses asyncio.sleep for non-blocking delays.
+    Make sure to import grpc.aio for AioRpcError.
+    """
+    def decorator(async_func):
+        @wraps(async_func)
+        async def wrapper(*args, **kwargs):
+            current_delay_s = initial_delay_s
+            # Attempt to import grpc.aio.AioRpcError dynamically or ensure it's available
+            # This is to avoid import error if grpc.aio is not always installed/used,
+            # though for an async decorator, it's a strong prerequisite.
+            try:
+                from grpc.aio import AioRpcError
+            except ImportError:
+                # Fallback or raise error if grpc.aio is not available
+                logger.error("grpc.aio.AioRpcError not found. async_retry_grpc_call requires grpc.aio.")
+                # Default to standard RpcError if AioRpcError is not available, though this is not ideal
+                # as async functions should raise AioRpcError.
+                AioRpcError = grpc.RpcError # This is a fallback, not a good one.
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return await async_func(*args, **kwargs)
+                except AioRpcError as e: # Specifically catch AioRpcError
+                    rpc_code = e.code() if hasattr(e, 'code') and callable(e.code) else None
+                    if rpc_code in retryable_error_codes:
+                        if attempt == max_attempts:
+                            logger.error(
+                                f"Async gRPC call to {async_func.__name__} failed after {max_attempts} attempts. "
+                                f"Last error: {rpc_code} - {e.details()}", exc_info=False
+                            )
+                            raise
+                        jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
+                        actual_delay_s = max(0, current_delay_s + jitter_value)
+                        logger.warning(
+                            f"Async gRPC call to {async_func.__name__} failed (attempt {attempt}/{max_attempts}) "
+                            f"with status {rpc_code}. Retrying in {actual_delay_s:.2f}s. "
+                            f"Details: {e.details()}", exc_info=False
+                        )
+                        await asyncio.sleep(actual_delay_s) # Use asyncio.sleep
+                        current_delay_s *= backoff_factor
+                    else:
+                        logger.error(
+                            f"Async gRPC call to {async_func.__name__} failed with non-retryable status "
+                            f"{rpc_code if rpc_code else 'N/A'}. Details: {e.details() if hasattr(e, 'details') and callable(e.details) else str(e)}",
+                            exc_info=True
+                        )
+                        raise
+                except Exception as e_generic:
+                    logger.error(
+                        f"A non-gRPC error occurred during async call to {async_func.__name__} (attempt {attempt}/{max_attempts}): {e_generic}",
+                        exc_info=True
+                    )
+                    if attempt == max_attempts:
+                        raise
+                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
+                    actual_delay_s = max(0, current_delay_s + jitter_value)
+                    logger.info(f"Retrying async {async_func.__name__} after non-gRPC error in {actual_delay_s:.2f}s.")
+                    await asyncio.sleep(actual_delay_s) # Use asyncio.sleep
+                    current_delay_s *= backoff_factor
+
+            logger.error(f"Async gRPC call to {async_func.__name__} exhausted attempts.") # Should be unreachable
+            return None # Should ideally not happen
+        return wrapper
+    return decorator
+
+
 # Example of how to use the decorator (for testing or reference)
 if __name__ == '__main__':
+    # Ensure asyncio is imported for async examples
+    import asyncio
+    # Assume grpc.aio is available for AioRpcError testing
+    try:
+        from grpc.aio import AioRpcError
+    except ImportError:
+        AioRpcError = grpc.RpcError # Fallback for environments without grpc.aio, for basic testing
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     class MockStub:

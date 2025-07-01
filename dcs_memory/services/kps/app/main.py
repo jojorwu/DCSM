@@ -10,14 +10,57 @@ from sentence_transformers import SentenceTransformer
 from .config import KPSConfig
 
 # Global configuration instance
+from pythonjsonlogger import jsonlogger # Import for JSON logging
+
 config = KPSConfig()
 
 # --- Logging Setup ---
-logging.basicConfig(
-    level=config.get_log_level_int(),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+def setup_logging(log_config: KPSConfig): # Changed type hint
+    handlers_list = []
+
+    if log_config.LOG_OUTPUT_MODE in ["json_stdout", "json_file"]:
+        json_fmt_str = getattr(log_config, 'LOG_JSON_FORMAT', log_config.LOG_FORMAT)
+        formatter = jsonlogger.JsonFormatter(fmt=json_fmt_str, datefmt=log_config.LOG_DATE_FORMAT)
+    else: # For "stdout", "file"
+        formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
+
+    if log_config.LOG_OUTPUT_MODE in ["stdout", "json_stdout"]:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        handlers_list.append(stream_handler)
+
+    if log_config.LOG_OUTPUT_MODE in ["file", "json_file"]:
+        if log_config.LOG_FILE_PATH:
+            try:
+                file_handler = logging.FileHandler(log_config.LOG_FILE_PATH)
+                file_handler.setFormatter(formatter)
+                handlers_list.append(file_handler)
+            except Exception as e:
+                print(f"Error setting up file logger at {log_config.LOG_FILE_PATH}: {e}. Falling back to stdout.", file=sys.stderr)
+                if not any(isinstance(h, logging.StreamHandler) for h in handlers_list):
+                    stream_handler_fallback = logging.StreamHandler(sys.stdout)
+                    stream_handler_fallback.setFormatter(formatter)
+                    handlers_list.append(stream_handler_fallback)
+        else:
+            print(f"LOG_OUTPUT_MODE is '{log_config.LOG_OUTPUT_MODE}' but LOG_FILE_PATH is not set. Defaulting to stdout.", file=sys.stderr)
+            if not handlers_list:
+                stream_handler_default = logging.StreamHandler(sys.stdout)
+                stream_handler_default.setFormatter(formatter)
+                handlers_list.append(stream_handler_default)
+
+    if not handlers_list:
+        print("Warning: No logging handlers configured. Defaulting to basic stdout.", file=sys.stderr)
+        logging.basicConfig(level=log_config.get_log_level_int())
+        return
+
+    logging.basicConfig(
+        level=log_config.get_log_level_int(),
+        handlers=handlers_list,
+        force=True
+    )
+    # Note: format and datefmt in basicConfig are less relevant when handlers are specified with their own formatters.
+
+setup_logging(config)
 logger = logging.getLogger(__name__)
 # --- End Logging Setup ---
 
@@ -72,19 +115,31 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             self.embedding_model = None # Ensure model is None if loading failed
 
         try:
-            self.glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS)
+            grpc_options = [
+                ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS),
+                ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
+                ('grpc.keepalive_permit_without_calls', 1 if self.config.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS else 0),
+                ('grpc.http2.min_ping_interval_without_data_ms', self.config.GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS),
+                ('grpc.max_receive_message_length', self.config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
+                ('grpc.max_send_message_length', self.config.GRPC_MAX_SEND_MESSAGE_LENGTH),
+            ]
+            self.glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=grpc_options)
             self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
-            logger.info(f"GLM client for KPS initialized, target address: {self.config.GLM_SERVICE_ADDRESS}")
+            logger.info(f"GLM client for KPS initialized, target: {self.config.GLM_SERVICE_ADDRESS}, options: {grpc_options}")
         except Exception as e:
-            logger.error(f"Error initializing GLM client in KPS: {e}")
+            logger.error(f"Error initializing GLM client in KPS: {e}", exc_info=True)
             self.glm_stub = None # Ensure stub is None if channel creation failed
 
-    @retry_grpc_call
-    def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int = 10) -> glm_service_pb2.StoreKEMResponse:
+    @retry_grpc_call( # Pass configured retry parameters
+        max_attempts=config.RETRY_MAX_ATTEMPTS,
+        initial_delay_s=config.RETRY_INITIAL_DELAY_S,
+        backoff_factor=config.RETRY_BACKOFF_FACTOR,
+        jitter_fraction=config.RETRY_JITTER_FRACTION
+        # retryable_error_codes can use the decorator's default or be configured too if needed
+    )
+    def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int) -> glm_service_pb2.StoreKEMResponse: # timeout will be passed from caller
         if not self.glm_stub:
             logger.error("KPS._glm_store_kem_with_retry: GLM stub is not initialized. This is a KPS internal configuration error.")
-            # This indicates a setup/configuration problem within KPS.
-            # Raising RuntimeError as it's an internal state issue, not a gRPC communication failure at this point.
             raise RuntimeError("KPS Internal Error: GLM client stub not available for storing KEM.")
         return self.glm_stub.StoreKEM(request, timeout=timeout)
 
@@ -150,7 +205,11 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             store_kem_request = glm_service_pb2.StoreKEMRequest(kem=kem_to_store)
 
             try:
-                store_kem_response = self._glm_store_kem_with_retry(store_kem_request, timeout=15) # Increased timeout for GLM store
+                # Use configured timeout for this specific call
+                store_kem_response = self._glm_store_kem_with_retry(
+                    store_kem_request,
+                    timeout=self.config.GLM_STORE_KEM_TIMEOUT_S
+                )
 
                 if store_kem_response and store_kem_response.kem and store_kem_response.kem.id:
                     kem_id_from_glm = store_kem_response.kem.id
@@ -195,7 +254,7 @@ def serve():
     if not servicer_instance.glm_stub:
         logger.warning("KPS server starting WITHOUT a GLM CLIENT. KEM persistence will be impossible.")
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=config.GRPC_SERVER_MAX_WORKERS)) # Use configured max_workers
     kps_service_pb2_grpc.add_KnowledgeProcessorServiceServicer_to_server(
         servicer_instance, server
     )
@@ -208,7 +267,7 @@ def serve():
     except KeyboardInterrupt:
         logger.info("Stopping KPS server...")
     finally:
-        server.stop(None) # Graceful stop
+        server.stop(config.GRPC_SERVER_SHUTDOWN_GRACE_S) # Use configured grace period
         logger.info("KPS server stopped.")
 
 if __name__ == '__main__':

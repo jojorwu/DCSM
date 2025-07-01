@@ -1,5 +1,7 @@
 grpcio
 grpcio-tools
 protobuf
-cachetools
-qdrant-client # Для клиента GLM, если он будет частью SDK или если SWM напрямую импортирует типы GLM, связанные с Qdrant.
+# cachetools # No longer needed by SWM directly if IndexedLRUCache is fully replaced
+# readerwriterlock>=1.0.9 # No longer needed if IndexedLRUCache with custom RWLock is replaced
+aioredis>=2.0.0 # For asynchronous Redis client
+# qdrant-client # SWM interacts with GLM, GLM handles Qdrant. Not directly needed by SWM.

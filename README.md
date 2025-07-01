@@ -126,6 +126,22 @@ To run the DCSM system locally, you will need Docker and docker-compose.
     ```
     This command will build Docker images for all services (if not already built) and start them.
 
+### System Configuration
+
+DCSM services are configured through a central YAML file, typically named `config.yml` at the root of the project. This file is mounted into each service container at `/app/config.yml`. Services look for this file based on the `DCSM_CONFIG_FILE` environment variable, which defaults to `config.yml` if not set (but is set to `/app/config.yml` in the provided `docker-compose.yml`).
+
+The `config.yml` allows for defining shared settings and service-specific configurations for GLM, KPS, and SWM. An example `config.yml` is provided in the repository root.
+
+**Configuration Precedence:**
+The system loads configurations with the following priority (highest to lowest):
+1.  Values passed directly to configuration model constructors (programmatic override).
+2.  Environment variables (e.g., `GLM_QDRANT_HOST=my.qdrant.host`). Service-specific variables are prefixed (e.g., `GLM_`, `KPS_`, `SWM_`).
+3.  Values from a `.env` file in the service's working directory (if present).
+4.  Values from the central `config.yml` file.
+5.  Default values defined in the Pydantic configuration models.
+
+This means environment variables can always override settings in `config.yml`.
+
 After successful startup, the following services will be available:
 *   **Qdrant**: Vector DB (gRPC port 6333, HTTP 6334)
 *   **GLM Service**: gRPC on port 50051

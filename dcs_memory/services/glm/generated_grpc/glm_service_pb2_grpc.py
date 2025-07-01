@@ -7,7 +7,7 @@ import glm_service_pb2 as glm__service__pb2
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 import kem_pb2 as kem__pb2
 
-GRPC_GENERATED_VERSION = '1.73.0'
+GRPC_GENERATED_VERSION = '1.73.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -67,37 +67,37 @@ class GlobalLongTermMemoryServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def StoreKEM(self, request, context):
-        """Сохраняет одну КЕП. Если ID в КЕП не указан, сервер его генерирует.
-        Возвращает полную сохраненную КЕП, включая ID и временные метки.
+        """Stores a single KEM. If the ID in KEM is not specified, the server generates it.
+        Returns the complete stored KEM, including ID and timestamps.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def RetrieveKEMs(self, request, context):
-        """Извлекает КЕП из GLM на основе различных критериев с пагинацией.
+        """Retrieves KEMs from GLM based on various criteria with pagination.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def UpdateKEM(self, request, context):
-        """Обновляет существующую КЕП. ID должен быть указан.
-        Возвращает обновленную КЕП.
+        """Updates an existing KEM. ID must be specified.
+        Returns the updated KEM.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def DeleteKEM(self, request, context):
-        """Удаляет КЕП из GLM по ID.
+        """Deletes a KEM from GLM by ID.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def BatchStoreKEMs(self, request, context):
-        """Пакетное сохранение КЕП
+        """Batch stores KEMs.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

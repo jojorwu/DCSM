@@ -1,6 +1,6 @@
 from .generated_grpc_code import kem_pb2
 from google.protobuf.json_format import MessageToDict, ParseDict
-import base64 # Для корректной обработки поля content, если оно бинарное
+import base64 # For correct processing of the content field, if it is binary
 
 def kem_dict_to_proto(kem_data: dict) -> kem_pb2.KEM:
     """
