@@ -86,15 +86,21 @@ try:
     import pybreaker
 except ImportError:
     pybreaker = None
+
+# For Health Checks
+from grpc_health.v1 import health_pb2 as health_pb2_types
+from grpc_health.v1 import health_pb2_grpc as health_pb2_grpc_health
+from grpc_health.v1.health_pb2 import HealthCheckRequest as HC_Request
 # --- End gRPC Code Import Block ---
 
 class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServiceServicer):
     def __init__(self):
         logger.info("Initializing KnowledgeProcessorServiceImpl...")
-        self.config: KPSConfig = config # Store config instance with type hint
+        self.config: KPSConfig = config
         self.glm_channel = None
         self.glm_stub = None
         self.embedding_model: typing.Optional[SentenceTransformer] = None
+        self._model_loaded_successfully: bool = False # Health check flag
 
         self.glm_circuit_breaker: typing.Optional[pybreaker.CircuitBreaker] = None
         if pybreaker and self.config.CIRCUIT_BREAKER_ENABLED:
@@ -106,15 +112,14 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
         else:
             logger.info(f"KPS: GLM client circuit breaker is disabled (pybreaker not installed or CIRCUIT_BREAKER_ENABLED=False).")
 
-
         try:
-            logger.info(f"Loading sentence-transformer model: {self.config.EMBEDDING_MODEL_NAME}...") # Use updated config name
+            logger.info(f"Loading sentence-transformer model: {self.config.EMBEDDING_MODEL_NAME}...")
             self.embedding_model = SentenceTransformer(self.config.EMBEDDING_MODEL_NAME)
 
             # Perform a test encoding to check model and get vector dimension
             test_embedding = self.embedding_model.encode(["test"])[0]
             model_vector_size = len(test_embedding)
-            logger.info(f"Model {self.config.SENTENCE_TRANSFORMER_MODEL} loaded. Vector dimension: {model_vector_size}")
+            logger.info(f"Model {self.config.EMBEDDING_MODEL_NAME} loaded. Vector dimension: {model_vector_size}")
 
             if model_vector_size != self.config.DEFAULT_VECTOR_SIZE:
                 logger.warning(
@@ -122,11 +127,29 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     f"does not match KPS_DEFAULT_VECTOR_SIZE ({self.config.DEFAULT_VECTOR_SIZE}) from config. "
                     f"This may lead to issues when storing in GLM if GLM's vector DB is configured differently."
                 )
+            self._model_loaded_successfully = True
         except Exception as e:
-            logger.error(f"Error loading sentence-transformer model '{self.config.SENTENCE_TRANSFORMER_MODEL}': {e}", exc_info=True)
-            self.embedding_model = None # Ensure model is None if loading failed
+            logger.error(f"Error loading sentence-transformer model '{self.config.EMBEDDING_MODEL_NAME}': {e}", exc_info=True)
+            self.embedding_model = None
+            self._model_loaded_successfully = False
 
-        try:
+        # GLM Client for Health Check (separate, simpler channel)
+        self.glm_health_check_channel: typing.Optional[grpc.Channel] = None
+        self.glm_health_check_stub: typing.Optional[health_pb2_grpc_health.HealthStub] = None # Correct stub type
+        if self.config.GLM_SERVICE_ADDRESS:
+            try:
+                # Options for health check client channel can be simpler or use a subset of main client options
+                health_check_grpc_options = [
+                    ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS), # Reuse for consistency
+                    ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
+                ]
+                self.glm_health_check_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=health_check_grpc_options)
+                self.glm_health_check_stub = health_pb2_grpc_health.HealthStub(self.glm_health_check_channel)
+                logger.info(f"KPS: GLM health check client initialized for target: {self.config.GLM_SERVICE_ADDRESS}")
+            except Exception as e_hc_client:
+                logger.error(f"KPS: Error initializing GLM health check client: {e_hc_client}", exc_info=True)
+
+        try: # Main GLM client for operations
             grpc_options = [
                 ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS),
                 ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
@@ -312,6 +335,45 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
         else:
             return actual_glm_call()
 
+    def _check_model_loaded(self) -> bool:
+        return self.embedding_model is not None and self._model_loaded_successfully
+
+    def _check_glm_connectivity(self) -> bool:
+        if not self.glm_health_check_stub:
+            logger.warning("KPS Health Check: GLM health check client not available.")
+            return False
+        try:
+            timeout = getattr(self.config, "HEALTH_CHECK_GLM_TIMEOUT_S", 2.0)
+            health_check_req = HC_Request(service="") # Check overall GLM health
+            # Note: GLM server itself needs to have grpc_health_checking enabled.
+            # This assumes GLM's health check endpoint is standard.
+            response = self.glm_health_check_stub.Check(health_check_req, timeout=timeout)
+            if response.status == health_pb2_types.HealthCheckResponse.SERVING:
+                return True
+            else:
+                logger.warning(f"KPS Health Check: GLM reported status {health_pb2_types.HealthCheckResponse.ServingStatus.Name(response.status)}.")
+                return False
+        except grpc.RpcError as e:
+            logger.warning(f"KPS Health Check: GLM connectivity check failed with gRPC error: Code={e.code()}, Details='{e.details()}'.")
+            return False
+        except Exception as e_glm_check: # Catch other potential errors during check
+            logger.warning(f"KPS Health Check: GLM connectivity check failed with unexpected error: {e_glm_check}")
+            return False
+
+    def check_overall_health(self) -> health_pb2_types.HealthCheckResponse.ServingStatus:
+        model_ok = self._check_model_loaded()
+        glm_ok = self._check_glm_connectivity()
+
+        if model_ok and glm_ok:
+            return health_pb2_types.HealthCheckResponse.SERVING
+
+        if not model_ok:
+             logger.warning("KPS Health Status: Potentially NOT_SERVING due to embedding model not loaded.")
+        if not glm_ok: # Only log GLM failure if it's configured
+             logger.warning("KPS Health Status: Potentially NOT_SERVING due to GLM connectivity issue.")
+        return health_pb2_types.HealthCheckResponse.NOT_SERVING
+
+
     def ProcessRawData(self, request: kps_service_pb2.ProcessRawDataRequest, context) -> kps_service_pb2.ProcessRawDataResponse:
         logger.info(f"KPS: ProcessRawData called for data_id='{request.data_id}', content_type='{request.content_type}'")
 
@@ -443,7 +505,11 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
     def __del__(self):
         if self.glm_channel:
             self.glm_channel.close()
-            logger.info("GLM client channel in KPS closed.")
+            logger.info("KPS: Main GLM client channel closed.")
+        if self.glm_health_check_channel: # Also close the health check channel
+            self.glm_health_check_channel.close()
+            logger.info("KPS: GLM health check client channel closed.")
+
 
 def serve():
     logger.info(f"KPS Configuration: GLM Address={config.GLM_SERVICE_ADDRESS}, KPS Listen Address={config.GRPC_LISTEN_ADDRESS}, "
@@ -462,15 +528,27 @@ def serve():
     )
 
     # Add Health Servicer
-    from grpc_health.v1 import health, health_pb2_grpc
-    health_servicer = health.HealthServicer()
-    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
-    # TODO: Implement more detailed health checks for KPS (e.g., model loaded, GLM connectivity).
-    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+    from grpc_health.v1 import health, health_pb2, health_pb2_grpc # Ensure health_pb2 for enums
+    # from grpc_health.v1.health_pb2 import HealthCheckRequest as HC_Request # Already imported above for class
 
+    # Custom HealthServicer for KPS
+    class KPSHealthServicer(health.HealthServicer):
+        def __init__(self, kps_service_instance: KnowledgeProcessorServiceImpl, initial_status: health_pb2_types.HealthCheckResponse.ServingStatus = health_pb2_types.HealthCheckResponse.SERVING):
+            super().__init__()
+            self._kps_service = kps_service_instance
+            self.set("", initial_status)
+            logger.info(f"KPS Initial Health Status set to: {health_pb2_types.HealthCheckResponse.ServingStatus.Name(initial_status)}")
+
+        def Check(self, request: health_pb2.HealthCheckRequest, context) -> health_pb2.HealthCheckResponse:
+            current_status = self._kps_service.check_overall_health()
+            self.set(request.service, current_status) # Update status for the requested service (or "" for overall)
+            return super().Check(request, context)
+
+    kps_health_servicer = KPSHealthServicer(servicer_instance, servicer_instance.check_overall_health())
+    health_pb2_grpc.add_HealthServicer_to_server(kps_health_servicer, server)
 
     server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting KPS (Knowledge Processor Service) on {config.GRPC_LISTEN_ADDRESS} with health checks enabled...")
+    logger.info(f"Starting KPS (Knowledge Processor Service) on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled...")
     server.start()
     logger.info(f"KPS started and listening for connections on {config.GRPC_LISTEN_ADDRESS}.")
     try:

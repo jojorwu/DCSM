@@ -310,7 +310,11 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
         *   More granular error handling and rollback strategies for complex operations involving multiple services.
         *   Implementation of "circuit breaker" patterns to prevent cascading failures.
         *   Improved service behavior logique during prolonged unavailability of critical dependencies (e.g., queuing strategies for deferred processing).
-        *   **Health Checks**: All gRPC services (GLM, KPS, SWM) expose standard gRPC health check endpoints (`grpc.health.v1.Health/Check`). This allows orchestrators and monitoring systems to verify service health. Initial implementations report a basic SERVING status, with TODOs to add more detailed dependency checks.
+        *   **Health Checks**: All gRPC services (GLM, KPS, SWM) expose standard gRPC health check endpoints (`grpc.health.v1.Health/Check`). These checks now verify critical dependencies:
+            *   **GLM**: Checks SQLite and Qdrant connectivity.
+            *   **KPS**: Checks embedding model loading and GLM service connectivity (via GLM's health check).
+            *   **SWM**: Checks Redis connectivity and GLM service connectivity (via GLM's health check).
+            This allows orchestrators and monitoring systems to get a more accurate assessment of service health.
 
 ### 3.6. The `IndexedLRUCache` Mechanism
 

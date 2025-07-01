@@ -186,6 +186,17 @@ class GLMConfig(BaseServiceConfig):
     QDRANT_CLIENT_TIMEOUT_S: int = Field(default=10, description="Timeout for Qdrant client operations in seconds.")
     QDRANT_DEFAULT_DISTANCE_METRIC: Literal["COSINE", "DOT", "EUCLID"] = Field(default="COSINE", description="Default distance metric for Qdrant collections.")
     QDRANT_PREFLIGHT_CHECK_TIMEOUT_S: int = Field(default=2, description="Timeout for Qdrant pre-flight check in seconds.")
+
+    # GLM Health Check Settings
+    HEALTH_CHECK_SQLITE_QUERY: str = Field(default="SELECT 1", description="SQLite query for health check.")
+    # HEALTH_CHECK_QDRANT_TIMEOUT_S is implicitly covered by QDRANT_CLIENT_TIMEOUT_S for now,
+    # as the check uses the existing client. If a separate timeout for health check calls to Qdrant is needed,
+    # it could be added, but might require a separate Qdrant client instance for health checks.
+    # For simplicity, we assume the main client timeout is acceptable for health pings.
+    # Let's add it for explicit control if desired, though the implementation might just use main client.
+    HEALTH_CHECK_QDRANT_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for Qdrant health check operation.")
+
+
     # GRPC_SERVER_MAX_WORKERS can be inherited from Base or overridden here if GLM needs specific value
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited or overridden
 
@@ -204,7 +215,11 @@ class KPSConfig(BaseServiceConfig):
     # KPS Idempotency Settings
     KPS_IDEMPOTENCY_CHECK_ENABLED: bool = Field(default=True, description="Enable idempotency checks for ProcessRawData based on data_id.")
     KPS_IDEMPOTENCY_METADATA_KEY: str = Field(default="source_data_id", description="Metadata key used to store/check data_id for idempotency.")
+
+    # KPS Health Check Settings
+    HEALTH_CHECK_GLM_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for KPS health checking GLM.")
     # TODO: Consider KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S if a separate timeout is needed for this specific GLM query.
+
 
     # GRPC_SERVER_MAX_WORKERS can be inherited or overridden
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited or overridden
@@ -279,6 +294,10 @@ class SWMConfig(BaseServiceConfig):
     REDIS_LOCK_DEFAULT_LEASE_MS: int = Field(default=30000, description="Default lease time for distributed locks in milliseconds.")
     REDIS_LOCK_ACQUIRE_POLL_INTERVAL_S: float = Field(default=0.1, description="Polling interval when trying to acquire a distributed lock, in seconds.")
     REDIS_COUNTER_KEY_PREFIX: str = Field(default="dcsm:counter:", description="Prefix for distributed counter keys in Redis.")
+
+    # SWM Health Check Settings
+    HEALTH_CHECK_REDIS_TIMEOUT_S: float = Field(default=1.0, description="Timeout in seconds for SWM health checking Redis (PING).")
+    HEALTH_CHECK_GLM_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for SWM health checking GLM.")
 
     # SWM_INDEXED_METADATA_KEYS is already in SWMConfig
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited from BaseServiceConfig for SWM (async server)

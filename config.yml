@@ -51,6 +51,8 @@ glm:
   QDRANT_PREFLIGHT_CHECK_TIMEOUT_S: 2
   # Example: Override GRPC_SERVER_MAX_WORKERS for GLM if needed
   # GRPC_SERVER_MAX_WORKERS: 15
+  HEALTH_CHECK_SQLITE_QUERY: "SELECT 1"
+  HEALTH_CHECK_QDRANT_TIMEOUT_S: 2.0
 
 kps:
   # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_* from shared unless overridden
@@ -64,6 +66,7 @@ kps:
   # KPS Idempotency Settings
   KPS_IDEMPOTENCY_CHECK_ENABLED: true # true or false
   KPS_IDEMPOTENCY_METADATA_KEY: "source_data_id" # Metadata key for storing/checking data_id
+  HEALTH_CHECK_GLM_TIMEOUT_S: 2.0
 
 swm:
   # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_SHUTDOWN_GRACE_S, GRPC_KEEPALIVE_* from shared

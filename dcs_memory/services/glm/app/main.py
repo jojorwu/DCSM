@@ -91,11 +91,12 @@ from generated_grpc import kem_pb2
 from generated_grpc import glm_service_pb2
 from generated_grpc import glm_service_pb2_grpc
 from google.protobuf import empty_pb2
+from grpc_health.v1 import health_pb2 # For HealthCheckResponse.ServingStatus enum
 
 class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemoryServicer):
     def __init__(self):
         logger.info("Initializing GlobalLongTermMemoryServicerImpl...")
-        self.config = config
+        self.config: GLMConfig = config # Type hint for self.config
 
         db_path = os.path.join(app_dir, self.config.DB_FILENAME)
         try:
@@ -131,6 +132,54 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             self.qdrant_repo = None
 
         logger.info("GLM servicer initialized.")
+
+    def _check_sqlite_health(self) -> bool:
+        try:
+            conn = self.sqlite_repo._get_sqlite_conn()
+            cursor = conn.cursor()
+            sqlite_query = getattr(self.config, "HEALTH_CHECK_SQLITE_QUERY", "SELECT 1")
+            cursor.execute(sqlite_query)
+            cursor.fetchone()
+            return True
+        except Exception as e_sqlite_check:
+            logger.warning(f"GLM Health Check: SQLite check failed: {e_sqlite_check}")
+            return False
+
+    def _check_qdrant_health(self) -> bool:
+        if self.qdrant_repo and self.qdrant_repo.client:
+            try:
+                # Qdrant client's get_collections can act as a ping for health check.
+                # The client itself has a timeout configured during its initialization (QDRANT_CLIENT_TIMEOUT_S)
+                # A specific health check timeout (HEALTH_CHECK_QDRANT_TIMEOUT_S) could be used if we
+                # created a temporary client or if the client API allowed per-call timeout override for this.
+                # For now, relying on existing client with its configured timeout.
+                self.qdrant_repo.client.get_collections()
+                return True
+            except Exception as e_qdrant_check:
+                logger.warning(f"GLM Health Check: Qdrant check failed: {e_qdrant_check}")
+                return False
+        elif not self.config.QDRANT_HOST:
+            return True # If Qdrant isn't configured, it's not a dependency to check for health
+        else:
+             logger.warning("GLM Health Check: Qdrant configured but client not available for check.")
+             return False
+
+    def check_overall_health(self) -> health_pb2.HealthCheckResponse.ServingStatus:
+        # This method is called by the custom HealthServicer.
+        sqlite_healthy = self._check_sqlite_health()
+        qdrant_healthy = self._check_qdrant_health()
+
+        if sqlite_healthy and qdrant_healthy:
+            return health_pb2.HealthCheckResponse.SERVING
+
+        # Log specific reasons for not serving if any dependency fails
+        if not sqlite_healthy:
+            logger.warning("GLM Health Status: Potentially NOT_SERVING due to SQLite unavailability.")
+        if not qdrant_healthy and self.config.QDRANT_HOST:
+            logger.warning("GLM Health Status: Potentially NOT_SERVING due to Qdrant unavailability.")
+
+        return health_pb2.HealthCheckResponse.NOT_SERVING
+
 
     def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
         kem_data_copy = kem_data.copy()
@@ -604,18 +653,38 @@ def serve():
     glm_service_pb2_grpc.add_GlobalLongTermMemoryServicer_to_server(servicer_instance, server)
 
     # Add Health Servicer
-    from grpc_health.v1 import health, health_pb2_grpc
-    health_servicer = health.HealthServicer()
-    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
-    # For now, set overall health to SERVING.
-    # TODO: Implement more detailed health checks for dependencies (SQLite, Qdrant).
-    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
-    # Set specific service health if needed, though "" usually covers the whole server.
-    # health_servicer.set(glm_service_pb2.DESCRIPTOR.services_by_name['GlobalLongTermMemory'].full_name, health_pb2.HealthCheckResponse.SERVING)
+    from grpc_health.v1 import health, health_pb2, health_pb2_grpc # Ensure health_pb2 for enums
 
+    # Custom HealthServicer for GLM
+    class GLMHealthServicer(health.HealthServicer):
+        def __init__(self, glm_service_instance: GlobalLongTermMemoryServicerImpl, initial_status: health_pb2.HealthCheckResponse.ServingStatus = health_pb2.HealthCheckResponse.SERVING):
+            super().__init__()
+            self._glm_service = glm_service_instance
+            # Set initial overall status; can be updated by Check calls
+            self.set("", initial_status)
+            logger.info(f"GLM Initial Health Status set to: {health_pb2.HealthCheckResponse.ServingStatus.Name(initial_status)}")
+
+        def Check(self, request: health_pb2.HealthCheckRequest, context) -> health_pb2.HealthCheckResponse:
+            # request.service can be used to check specific sub-services if defined.
+            # For GLM, we'll report overall health based on dependencies.
+            current_status = self._glm_service.check_overall_health()
+
+            # Update the status stored by the library HealthServicer.
+            # This ensures that if a client uses the Watch API, it gets updates.
+            # And also ensures that the Check response is based on the latest check.
+            self.set(request.service, current_status) # Use request.service to allow specific service checks if ever needed
+                                                 # For now, "" (overall) is what we update via check_overall_health.
+                                                 # If client sends empty string for service, it gets overall status.
+
+            # The super().Check will use the status that was just set (or previously set for a specific service name)
+            # logger.debug(f"GLM Health Check RPC for service '{request.service}': Status {health_pb2.HealthCheckResponse.ServingStatus.Name(current_status)}")
+            return super().Check(request, context)
+
+    glm_health_servicer = GLMHealthServicer(servicer_instance, servicer_instance.check_overall_health())
+    health_pb2_grpc.add_HealthServicer_to_server(glm_health_servicer, server)
 
     server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting GLM server on {config.GRPC_LISTEN_ADDRESS} with health checks enabled...")
+    logger.info(f"Starting GLM server on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled.")
     server.start()
     logger.info(f"GLM server started and listening on {config.GRPC_LISTEN_ADDRESS}.")
 
@@ -624,7 +693,9 @@ def serve():
     except KeyboardInterrupt:
         logger.info("GLM server stopping via KeyboardInterrupt...")
     finally:
-        server.stop(grace=config.GRPC_SERVER_SHUTDOWN_GRACE_S) # Use configured grace period
+        # No specific background tasks like periodic health checks were started in this revised sync model for GLM
+        # servicer_instance.stop_background_tasks()
+        server.stop(grace=config.GRPC_SERVER_SHUTDOWN_GRACE_S)
         logger.info("GLM server stopped.")
 
 if __name__ == '__main__':
