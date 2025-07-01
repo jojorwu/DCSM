@@ -247,18 +247,25 @@ else
 end
 """
 
+RENEW_LOCK_LUA_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  return 1
+else
+  return 0
+end
+"""
+
 class DistributedLockManager:
     def __init__(self, config: SWMConfig, redis_client: any): # 'any' for aioredis.Redis type hint if not globally available
         self.config = config
         self.redis = redis_client # Store the aioredis client
-        # self.locks: Dict[str, LockInfoInternalSWM] = {} # No longer needed, Redis is source of truth
-        # self.lock_condition = asyncio.Condition() # No longer needed for Redis implementation with polling
-        self._stop_event = asyncio.Event() # Kept if _expired_lock_cleanup_loop is adapted
-        self._cleanup_task: Optional[asyncio.Task] = None # Cleanup loop might be removed or simplified
+        self._stop_event = asyncio.Event()
+        self._cleanup_task: Optional[asyncio.Task] = None
 
-        # Load Lua script for releasing locks
         self._release_script_sha: Optional[str] = None
-        asyncio.create_task(self._load_lua_scripts()) # Load scripts in background
+        self._renew_script_sha: Optional[str] = None
+        asyncio.create_task(self._load_lua_scripts())
 
         logger.info("DistributedLockManager initialized to use Redis.")
 
@@ -266,10 +273,11 @@ class DistributedLockManager:
         try:
             if self.redis:
                 self._release_script_sha = await self.redis.script_load(RELEASE_LOCK_LUA_SCRIPT)
-                logger.info(f"DistributedLockManager: Loaded Redis Lua script for lock release (SHA: {self._release_script_sha}).")
+                logger.info(f"DistributedLockManager: Loaded Lua script for lock release (SHA: {self._release_script_sha}).")
+                self._renew_script_sha = await self.redis.script_load(RENEW_LOCK_LUA_SCRIPT)
+                logger.info(f"DistributedLockManager: Loaded Lua script for lock renewal (SHA: {self._renew_script_sha}).")
         except Exception as e:
             logger.error(f"DistributedLockManager: Failed to load Lua scripts into Redis: {e}", exc_info=True)
-            # Application might still work but lock release won't be atomic via script if SHA is None.
 
     async def start_cleanup_task(self):
         # With Redis TTLs, an explicit cleanup loop for expired locks is less critical.
@@ -332,23 +340,50 @@ class DistributedLockManager:
                 existing_lock_value_bytes = await self.redis.get(lock_key)
                 if existing_lock_value_bytes:
                     existing_lock_value = existing_lock_value_bytes.decode('utf-8', errors='ignore')
-                    if existing_lock_value.startswith(f"{agent_id}:"): # Check if current agent holds it
-                        # Attempt to renew by re-setting with XX and new PX.
-                        # This is an optimistic renewal. A more robust renewal might use Lua.
-                        renewed = await self.redis.set(lock_key, existing_lock_value, xx=True, px=effective_lease_ms)
-                        if renewed:
-                            acquired_at_unix_ms = now_unix_ms # Or fetch original acquisition time if stored separately
-                            expires_at = now_unix_ms + effective_lease_ms
-                            logger.info(f"LockManager: Lock on '{resource_id}' already held by '{agent_id}', lease renewed. Expires: {expires_at}")
-                            return swm_service_pb2.AcquireLockResponse(
-                                resource_id=resource_id, agent_id=agent_id, status=swm_service_pb2.LockStatusValue.ALREADY_HELD_BY_YOU,
-                                lock_id=existing_lock_value, acquired_at_unix_ms=acquired_at_unix_ms, # This acquired_at is renewal time
-                                lease_expires_at_unix_ms=expires_at, message="Lock already held; lease renewed."
-                            )
-                        else: # Renewal failed (e.g. key expired between GET and SET XX)
-                            logger.warning(f"LockManager: Failed to renew lock for '{resource_id}' held by '{agent_id}' (key might have expired). Retrying acquisition.")
-                            # Continue loop to attempt fresh acquisition
-                    # else: Lock held by another agent (or value format is unexpected)
+                    # Check if the current agent holds the lock by comparing the full lock_value (which is the lock_id)
+                    # This requires the agent to pass its current lock_id if it's trying to renew.
+                    # The acquire_lock RPC doesn't have a field for "current_lock_id_if_renewing".
+                    # So, we can only reliably check if the agent_id part matches.
+                    # The Lua script for renewal (if we were to use it here) would need the exact current lock_value.
+                    #
+                    # Current logic: If `SET NX` fails, it means lock exists.
+                    # If an agent calls `acquire_lock` again for a lock it might hold,
+                    # the `lock_value` generated in this call will be new.
+                    # So, simply trying `SET NX PX` again is the correct path for a "fresh" acquire.
+                    # The "renewal" part is if the agent *knew* it held the lock and wanted to extend it.
+                    # The current API `acquire_lock` doesn't distinguish well between "acquire new" and "renew existing for me".
+                    #
+                    # Let's assume the current interpretation: if SET NX PX fails, and the lock *is* held by the current agent_id
+                    # (by parsing the agent_id from the stored lock_value), then it's a renewal scenario.
+                    # The `lock_value` generated for THIS call is `agent_id:new_uuid`.
+                    # The `existing_lock_value` is `agent_id:old_uuid`.
+                    #
+                    # To use the Lua renewal script, the agent would need to provide its *current* `lock_id` (which is `existing_lock_value`).
+                    # Since `acquire_lock` doesn't take `current_lock_id`, we can't use the Lua renewal script directly here
+                    # without changing the API or how `lock_value` is constructed/used.
+                    #
+                    # The previous optimistic renewal `await self.redis.set(lock_key, existing_lock_value, xx=True, px=effective_lease_ms)`
+                    # was attempting to renew the *existing_lock_value* if it was found.
+                    # This is more like a "refresh lease if I still own it".
+                    #
+                    # Let's stick to the behavior that `acquire_lock` always tries to get a *new* lock or fail/timeout.
+                    # If an agent wants to renew, it should perhaps use a different method or `acquire_lock`
+                    # could be made smarter if it gets the *same* agent_id trying to acquire again.
+                    #
+                    # For now, if `lock_acquired` is false, it means it's held by someone (could be self with old UUID, or other).
+                    # The polling loop will just keep trying `SET NX PX` with the *new* `lock_value`.
+                    # This means an agent calling `acquire_lock` again for a resource it holds will effectively
+                    # try to acquire it "fresh" if its old lease expires. This is simpler and avoids complex renewal logic here.
+                    # The `ALREADY_HELD_BY_YOU` status would only be returned if the *exact same* `lock_value` somehow was attempted to be set again,
+                    # which is unlikely with UUIDs.
+                    #
+                    # The Lua script for renewal is better suited for an explicit `renew_lock(resource_id, current_lock_id, new_lease_ms)` API.
+                    # Given the current API, the polling loop for `SET NX PX` is the path.
+                    # The `ALREADY_HELD_BY_YOU` part of the original in-memory logic is harder to map directly
+                    # to `SET NX PX` without an explicit renewal call.
+                    #
+                    # If `SET NX PX` fails, the lock is held. We just wait and retry.
+                    pass # Fall through to polling logic
 
                 # If timeout is 0, don't wait/retry
                 if timeout_ms == 0:
