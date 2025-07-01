@@ -158,9 +158,17 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                 ('grpc.max_receive_message_length', self.config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
                 ('grpc.max_send_message_length', self.config.GRPC_MAX_SEND_MESSAGE_LENGTH),
             ]
-            self.glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=grpc_options)
+            if self.config.GRPC_CLIENT_LB_POLICY:
+                grpc_options.append(('grpc.lb_policy_name', self.config.GRPC_CLIENT_LB_POLICY))
+
+            target_address = self.config.GLM_SERVICE_ADDRESS
+            # Ensure GRPC_DNS_RESOLVER=ares is set in the environment for dns:/// scheme to work reliably with round_robin.
+            # No code change here for GRPC_DNS_RESOLVER, it's an environment setup.
+            logger.info(f"KPS: GLM client attempting to connect to: {target_address} with LB policy: {self.config.GRPC_CLIENT_LB_POLICY or 'default (pick_first)'}")
+
+            self.glm_channel = grpc.insecure_channel(target_address, options=grpc_options)
             self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
-            logger.info(f"GLM client for KPS initialized, target: {self.config.GLM_SERVICE_ADDRESS}, options: {grpc_options}")
+            logger.info(f"GLM client for KPS initialized, target: {target_address}, options: {grpc_options}")
         except Exception as e:
             logger.error(f"Error initializing GLM client in KPS: {e}", exc_info=True)
             self.glm_stub = None # Ensure stub is None if channel creation failed

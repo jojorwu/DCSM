@@ -141,12 +141,18 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                     ('grpc.max_receive_message_length', self.config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
                     ('grpc.max_send_message_length', self.config.GRPC_MAX_SEND_MESSAGE_LENGTH),
                 ]
+                if self.config.GRPC_CLIENT_LB_POLICY:
+                    grpc_options.append(('grpc.lb_policy_name', self.config.GRPC_CLIENT_LB_POLICY))
+
+                target_address = self.config.GLM_SERVICE_ADDRESS
+                logger.info(f"SWM: GLM client (async) attempting to connect to: {target_address} with LB policy: {self.config.GRPC_CLIENT_LB_POLICY or 'default (pick_first)'}")
+
                 self.aio_glm_channel = grpc_aio.insecure_channel(
-                    self.config.GLM_SERVICE_ADDRESS,
+                    target_address,
                     options=grpc_options
                 )
                 self.aio_glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.aio_glm_channel)
-                logger.info(f"GLM client (async) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}, options: {grpc_options}")
+                logger.info(f"GLM client (async) for SWM initialized, target: {target_address}, options: {grpc_options}")
             else:
                 logger.warning("GLM_SERVICE_ADDRESS not configured. GLM features will be unavailable in SWM.")
         except Exception as e:

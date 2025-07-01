@@ -22,6 +22,9 @@ shared:
   GRPC_SERVER_MAX_CONNECTION_AGE_MS: 0             # 0 for infinite (server-side)
   GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: 0       # 0 for infinite (server-side)
 
+  # gRPC Client Load Balancing (set GRPC_DNS_RESOLVER=ares in client service env for best results with dns)
+  GRPC_CLIENT_LB_POLICY: "round_robin" # e.g., "round_robin", "pick_first", or null to use gRPC default
+
   # Circuit Breaker Configuration (for client calls)
   CIRCUIT_BREAKER_ENABLED: true               # true or false
   CIRCUIT_BREAKER_FAIL_MAX: 5                 # Max failures before opening
@@ -34,11 +37,9 @@ shared:
   LOG_FILE_PATH: null # Example: "/var/log/dcsm/dcsm_service.log" (used if mode is 'file' or 'json_file')
 
 glm:
-  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_* from shared unless overridden
-  GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS: true      # true or false
-  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_* from shared unless overridden
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY from shared
   DB_FILENAME: "glm_prod_metadata.sqlite3"
-  QDRANT_HOST: "dcsm_qdrant"
+  QDRANT_HOST: "dcsm_qdrant" # For Qdrant client in GLM, LB is not typical for DB connection from a single service.
   QDRANT_PORT: 6333
   QDRANT_COLLECTION: "glm_kems_production_v1"
   DEFAULT_VECTOR_SIZE: 384
@@ -55,8 +56,8 @@ glm:
   HEALTH_CHECK_QDRANT_TIMEOUT_S: 2.0
 
 kps:
-  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_* from shared unless overridden
-  GLM_SERVICE_ADDRESS: "dcsm_glm:50051"
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_*, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY from shared
+  GLM_SERVICE_ADDRESS: "dns:///dcsm_glm:50051" # Example for enabling client-side LB if dcsm_glm is scaled
   EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
   DEFAULT_VECTOR_SIZE: 384
   DEFAULT_PROCESSING_BATCH_SIZE: 32
@@ -69,9 +70,9 @@ kps:
   HEALTH_CHECK_GLM_TIMEOUT_S: 2.0
 
 swm:
-  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_SHUTDOWN_GRACE_S, GRPC_KEEPALIVE_* from shared
+  # Inherits LOG_LEVEL, RETRY_*, GRPC_SERVER_SHUTDOWN_GRACE_S, GRPC_KEEPALIVE_*, LOG_*, GRPC_CLIENT_LB_POLICY from shared
   # GRPC_SERVER_MAX_WORKERS from shared is not applicable to SWM's async server
-  GLM_SERVICE_ADDRESS: "dcsm_glm:50051"
+  GLM_SERVICE_ADDRESS: "dns:///dcsm_glm:50051" # Example for enabling client-side LB if dcsm_glm is scaled
   MAX_CACHE_SIZE_KEMS: 1000 # Conceptual for Redis, actual eviction by Redis policies
   DEFAULT_KEM_TTL_SECONDS: 3600
   GRPC_LISTEN_ADDRESS: "[::]:50053"

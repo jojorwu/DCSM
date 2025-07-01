@@ -60,7 +60,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **Technologies (current implementation):**
     *   gRPC for API.
     *   `sentence-transformers`: for generating embeddings.
-    *   GLM gRPC client (with a built-in retry mechanism `@retry_grpc_call` for enhanced fault tolerance when interacting with GLM).
+    *   GLM gRPC client: This client is equipped with retry mechanisms (`@retry_grpc_call`) and circuit breaker patterns for resilience. It also supports client-side load balancing (e.g., `round_robin` via DNS service discovery when GLM is scaled) configurable via shared gRPC client settings. For effective DNS load balancing, the `GRPC_DNS_RESOLVER=ares` environment variable should be set for the KPS service.
 *   **API (gRPC - `kps_service.proto`):**
     *   `ProcessRawData`: Accepts raw data and metadata, processes them, and initiates storage in GLM. Returns the ID of the saved KEM and the operation status.
 
@@ -88,7 +88,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **Technologies (current implementation):**
     *   gRPC for API.
     *   Redis: For the primary KEM cache and secondary indexes. Uses the `aioredis` client.
-    *   GLM gRPC client (asynchronous, with retry logic).
+    *   GLM gRPC client (asynchronous): This client also incorporates retry mechanisms (`@async_retry_grpc_call`) and circuit breakers. It supports client-side load balancing (e.g., `round_robin` via DNS) similarly to the KPS GLM client, requiring appropriate configuration and the `GRPC_DNS_RESOLVER=ares` environment variable for the SWM service.
     *   Internal `asyncio.Queue` for SWM's Pub/Sub mechanism and for the GLM persistence queue.
 *   **API (gRPC - `swm_service.proto`):**
     *   `PublishKEMToSWM`: Publishes a KEM to SWM (Redis). Optionally queues it for asynchronous persistence to GLM.
@@ -303,18 +303,17 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **Comprehensive Integration and Load Testing.**
 *   **Error Handling and Fault Tolerance (Current State and Development):**
     *   **Current State**:
-        *   GLM clients (in KPS, SWM, AgentSDK) use a retry mechanism (`@retry_grpc_call`) for gRPC calls to GLM, helping to handle transient network issues or GLM restarts.
-        *   The GLM service has basic logic (`BatchStoreKEMs`) to maintain consistency between SQLite and Qdrant during batch insertions (if embeddings fail to save in Qdrant, the record is removed from SQLite).
-        *   The GLM service will not start if Qdrant is unavailable at startup. KPS and SWM log warnings if GLM is unavailable at their startup but may continue with limited functionality (e.g., SWM without persistence能力 or loading from GLM).
+        *   Inter-service gRPC calls (KPS->GLM, SWM->GLM, AgentSDK->Services) are protected by configurable retry mechanisms and circuit breakers to handle transient network issues or temporary service unavailability.
+        *   Client-side load balancing (e.g., `round_robin`) can be configured for these calls if the target service (e.g., GLM) is deployed with multiple instances and service discovery (e.g., DNS) is set up accordingly. This typically requires using the `dns:///` scheme in the target address and setting the `GRPC_DNS_RESOLVER=ares` environment variable in the client service's environment.
+        *   The GLM service has basic logic (`BatchStoreKEMs`, `StoreKEM`) to improve consistency between SQLite and Qdrant during writes, including some compensating actions on failure.
+        *   The GLM service will not start if Qdrant is unavailable at startup. KPS and SWM log warnings if GLM is unavailable at their startup but may continue with limited functionality. SWM also has a critical dependency on Redis.
+        *   SWM includes a Dead Letter Queue (DLQ) for KEMs that fail persistence to GLM after multiple retries.
+        *   KPS includes an optional idempotency check for `ProcessRawData` requests based on `data_id`.
     *   **Development Directions**:
-        *   More granular error handling and rollback strategies for complex operations involving multiple services.
-        *   Implementation of "circuit breaker" patterns to prevent cascading failures.
-        *   Improved service behavior logique during prolonged unavailability of critical dependencies (e.g., queuing strategies for deferred processing).
-        *   **Health Checks**: All gRPC services (GLM, KPS, SWM) expose standard gRPC health check endpoints (`grpc.health.v1.Health/Check`). These checks now verify critical dependencies:
-            *   **GLM**: Checks SQLite and Qdrant connectivity.
-            *   **KPS**: Checks embedding model loading and GLM service connectivity (via GLM's health check).
-            *   **SWM**: Checks Redis connectivity and GLM service connectivity (via GLM's health check).
-            This allows orchestrators and monitoring systems to get a more accurate assessment of service health.
+        *   More granular error handling and rollback strategies, particularly for GLM's multi-datastore operations.
+        *   Further refinement of circuit breaker interaction with specific gRPC error codes if needed.
+        *   Improved service behavior logique during prolonged unavailability of critical dependencies.
+        *   **Health Checks**: All gRPC services (GLM, KPS, SWM) expose standard gRPC health check endpoints (`grpc.health.v1.Health/Check`). These checks verify critical dependencies (e.g., GLM checks SQLite/Qdrant; KPS checks model/GLM; SWM checks Redis/GLM), allowing orchestrators to assess service health accurately.
 
 ### 3.6. The `IndexedLRUCache` Mechanism
 

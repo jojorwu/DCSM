@@ -142,6 +142,8 @@ The system loads configurations with the following priority (highest to lowest):
 
 This means environment variables can always override settings in `config.yml`.
 
+For client-side load balancing (e.g., when KPS or SWM connect to multiple instances of GLM), ensure the target service address in `config.yml` (e.g., `GLM_SERVICE_ADDRESS`) uses the `dns:///` scheme (e.g., `dns:///dcsm_glm:50051`). Additionally, for reliable DNS-based round-robin load balancing, it's recommended to set the `GRPC_DNS_RESOLVER=ares` environment variable for the client services (KPS, SWM) and ensure `grpcio[ares]` is installed (it is included in `requirements.txt`). The load balancing policy (e.g., `round_robin`) can be configured via `GRPC_CLIENT_LB_POLICY` in `config.yml`.
+
 After successful startup, the following services will be available:
 *   **Qdrant**: Vector DB (gRPC port 6333, HTTP 6334)
 *   **GLM Service**: gRPC on port 50051

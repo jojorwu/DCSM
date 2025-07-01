@@ -45,6 +45,12 @@ class BaseServiceConfig(BaseSettings):
     GRPC_SERVER_MAX_CONNECTION_AGE_MS: int = Field(default=0, description="gRPC server max connection age in ms (0 for infinite).")
     GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: int = Field(default=0, description="gRPC server max connection age grace period in ms (0 for infinite).")
 
+    # gRPC Client Load Balancing Policy
+    GRPC_CLIENT_LB_POLICY: Optional[str] = Field(
+        default="round_robin",
+        description="gRPC client-side load balancing policy (e.g., 'round_robin', 'pick_first'). Null/empty uses gRPC default. For 'round_robin' with DNS, ensure target address uses 'dns:///' scheme and GRPC_DNS_RESOLVER=ares is set in env for best results."
+    )
+
     # Circuit Breaker Configuration (shared defaults)
     CIRCUIT_BREAKER_ENABLED: bool = Field(default=True, description="Enable or disable circuit breakers globally for client calls.")
     CIRCUIT_BREAKER_FAIL_MAX: int = Field(default=5, description="Maximum number of failures before opening the circuit.")
@@ -206,7 +212,7 @@ class KPSConfig(BaseServiceConfig):
     _service_config_key: ClassVar[str] = "kps"
     model_config = SettingsConfigDict(env_prefix='KPS_', extra='ignore')
 
-    GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service KPS connects to.")
+    GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service KPS connects to. For client-side load balancing, use 'dns:///service_name:port' and set GRPC_DNS_RESOLVER=ares environment variable.")
     EMBEDDING_MODEL_NAME: str = Field(description="Name or path to the sentence-transformer model.")
     DEFAULT_VECTOR_SIZE: int = Field(description="Expected/generated embedding dimension.")
     DEFAULT_PROCESSING_BATCH_SIZE: int = Field(default=32, description="Default batch size for processing documents.")
@@ -230,7 +236,7 @@ class SWMConfig(BaseServiceConfig):
     _service_config_key: ClassVar[str] = "swm"
     model_config = SettingsConfigDict(env_prefix='SWM_', extra='ignore')
 
-    GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service for SWM.")
+    GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service for SWM. For client-side load balancing, use 'dns:///service_name:port' and set GRPC_DNS_RESOLVER=ares environment variable.")
     MAX_CACHE_SIZE_KEMS: int = Field(description="Maximum number of KEMs in SWM's LRU cache (conceptual for Redis, actual eviction by Redis policies).")
     DEFAULT_KEM_TTL_SECONDS: int = Field(default=3600, description="Default TTL for KEMs in cache in seconds (used by RedisKemCache).")
 
