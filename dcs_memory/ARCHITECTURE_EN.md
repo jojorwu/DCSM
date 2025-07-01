@@ -75,7 +75,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
     *   **Cache Querying:** Provides an interface (`QuerySWM`) for agents to request KEMs from the Redis cache with filtering by ID, indexed metadata, and dates. Default sorting is by update date.
     *   **KEM Publishing:** Agents can publish KEMs to SWM (`PublishKEMToSWM`). KEMs are stored in the Redis cache. If persistence is flagged, KEMs are queued for asynchronous batch writing to GLM.
     *   **Event Subscription:** The `SubscribeToSWMEvents` method allows agents to subscribe to KEM creation (`KEM_PUBLISHED`), update (`KEM_UPDATED`), and eviction (`KEM_EVICTED`) events within SWM. Filtering by ID, metadata, and event type is supported. `KEM_EVICTED` events are generated based on Redis Keyspace Notifications.
-    *   **Distributed Lock and Counter Management:** Provides mechanisms for agent coordination (logic encapsulated in respective managers).
+    *   **Distributed Lock and Counter Management:** Provides mechanisms for agent coordination using Redis as the backend. `DistributedLockManager` uses Redis `SET NX PX` for lock acquisition and Lua scripts for safe release. `DistributedCounterManager` uses Redis atomic increment/decrement operations.
 *   **Caching and Eviction Strategies in SWM**:
     *   **Storage**: Redis. KEMs are stored as Redis Hashes. Secondary indexes for metadata (on keys specified in `SWM_INDEXED_METADATA_KEYS`) and for `created_at`/`updated_at` dates are maintained using Redis Sets and Sorted Sets, respectively.
     *   **Eviction**: Managed by Redis based on the `allkeys-lru` policy and the `maxmemory` setting.
@@ -308,7 +308,7 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
         *   More granular error handling and rollback strategies for complex operations involving multiple services.
         *   Implementation of "circuit breaker" patterns to prevent cascading failures.
         *   Improved service behavior logique during prolonged unavailability of critical dependencies (e.g., queuing strategies for deferred processing).
-        *   Introduction of health check endpoints for all gRPC services for integration with orchestration systems.
+        *   **Health Checks**: All gRPC services (GLM, KPS, SWM) expose standard gRPC health check endpoints (`grpc.health.v1.Health/Check`). This allows orchestrators and monitoring systems to verify service health. Initial implementations report a basic SERVING status, with TODOs to add more detailed dependency checks.
 
 ### 3.6. The `IndexedLRUCache` Mechanism
 

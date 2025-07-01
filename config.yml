@@ -113,4 +113,10 @@ swm:
   RETRY_MAX_ATTEMPTS: 4
   RETRY_INITIAL_DELAY_S: 0.8
   RETRY_BACKOFF_FACTOR: 1.5
+
+  # SWM Distributed Primitives (Redis-backed)
+  REDIS_LOCK_KEY_PREFIX: "dcsm:lock:"
+  REDIS_LOCK_DEFAULT_LEASE_MS: 30000 # Default lease for locks if not specified by caller (30 seconds)
+  REDIS_LOCK_ACQUIRE_POLL_INTERVAL_S: 0.1 # Poll interval when waiting to acquire a lock (100ms)
+  REDIS_COUNTER_KEY_PREFIX: "dcsm:counter:"
 ```

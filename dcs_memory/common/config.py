@@ -258,6 +258,12 @@ class SWMConfig(BaseServiceConfig):
     REDIS_INDEX_DATE_UPDATED_KEY: str = Field(default="swm_idx:date:updated_at", description="Redis key for 'updated_at' sorted set index.")
     REDIS_QUERY_TEMP_KEY_PREFIX: str = Field(default="swm_query_tmp:", description="Prefix for temporary keys used during SWM queries in Redis.")
 
+    # Distributed Lock and Counter Redis Settings
+    REDIS_LOCK_KEY_PREFIX: str = Field(default="dcsm:lock:", description="Prefix for distributed lock keys in Redis.")
+    REDIS_LOCK_DEFAULT_LEASE_MS: int = Field(default=30000, description="Default lease time for distributed locks in milliseconds.")
+    REDIS_LOCK_ACQUIRE_POLL_INTERVAL_S: float = Field(default=0.1, description="Polling interval when trying to acquire a distributed lock, in seconds.")
+    REDIS_COUNTER_KEY_PREFIX: str = Field(default="dcsm:counter:", description="Prefix for distributed counter keys in Redis.")
+
     # SWM_INDEXED_METADATA_KEYS is already in SWMConfig
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited from BaseServiceConfig for SWM (async server)
 

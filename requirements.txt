@@ -4,3 +4,4 @@ protobuf
 pydantic-settings
 PyYAML>=5.4 # Added for centralized YAML configuration
 python-json-logger>=2.0 # For JSON logging
+grpcio-health-checking>=1.48.1 # For gRPC health checks (compatible with recent grpcio)

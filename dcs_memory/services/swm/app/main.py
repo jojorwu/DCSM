@@ -173,9 +173,10 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             logger.critical("SWM: aioredis library or RedisKemCache not available. SWM cannot start without a cache backend.")
             raise SystemExit("SWM: Missing Redis dependencies.")
 
-        self.subscription_manager = SubscriptionManager(self.config)
-        self.lock_manager = DistributedLockManager(self.config)
-        self.counter_manager = DistributedCounterManager(self.config)
+        # Pass redis_client to managers that need it
+        self.subscription_manager = SubscriptionManager(self.config) # Does not directly use redis_client currently
+        self.lock_manager = DistributedLockManager(self.config, self.redis_client)
+        self.counter_manager = DistributedCounterManager(self.config, self.redis_client)
 
         self._stop_event = asyncio.Event()
         self._glm_persistence_worker_task: Optional[asyncio.Task] = None
@@ -780,10 +781,19 @@ async def serve():
 
     swm_service_pb2_grpc.add_SharedWorkingMemoryServiceServicer_to_server(servicer_instance,server)
 
+    # Add Health Servicer for async server
+    from grpc_health.v1 import health_async, health_pb2_grpc # Use health_async for async server
+    # The HealthServicer from health_async is already an async servicer
+    health_servicer = health_async.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+    # TODO: Implement more detailed health checks for SWM (e.g., Redis connectivity, GLM connectivity).
+    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+
+
     listen_addr = servicer_instance.config.GRPC_LISTEN_ADDRESS # This is already from config
     server.add_insecure_port(listen_addr)
 
-    logger.info(f"Starting SWM async server on {listen_addr} with options: {final_server_options}...")
+    logger.info(f"Starting SWM async server on {listen_addr} with options: {final_server_options} and health checks enabled...")
     try:
         await server.start()
         if servicer_instance.redis_kem_cache:

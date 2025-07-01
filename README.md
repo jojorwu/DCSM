@@ -148,6 +148,8 @@ After successful startup, the following services will be available:
 *   **KPS Service**: gRPC on port 50052
 *   **SWM Service**: gRPC on port 50053
 
+All services also expose a standard gRPC health check endpoint (`grpc.health.v1.Health/Check`) on their respective ports.
+
 You can start interacting with the system using the [Python Agent SDK](dcsm_agent_sdk_python/README.md) or any other gRPC client. Examples of SDK usage can be found in `dcsm_agent_sdk_python/example.py`.
 
 ## Project Status and Future Directions

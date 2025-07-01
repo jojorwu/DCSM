@@ -258,8 +258,17 @@ def serve():
     kps_service_pb2_grpc.add_KnowledgeProcessorServiceServicer_to_server(
         servicer_instance, server
     )
+
+    # Add Health Servicer
+    from grpc_health.v1 import health, health_pb2_grpc
+    health_servicer = health.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+    # TODO: Implement more detailed health checks for KPS (e.g., model loaded, GLM connectivity).
+    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+
+
     server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting KPS (Knowledge Processor Service) on {config.GRPC_LISTEN_ADDRESS}...")
+    logger.info(f"Starting KPS (Knowledge Processor Service) on {config.GRPC_LISTEN_ADDRESS} with health checks enabled...")
     server.start()
     logger.info(f"KPS started and listening for connections on {config.GRPC_LISTEN_ADDRESS}.")
     try:
