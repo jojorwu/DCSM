@@ -32,6 +32,19 @@ class BaseServiceConfig(BaseSettings):
     GRPC_SERVER_MAX_WORKERS: int = Field(default=10, description="Default max_workers for synchronous gRPC servers.")
     GRPC_SERVER_SHUTDOWN_GRACE_S: int = Field(default=5, description="Default shutdown grace period for gRPC servers in seconds.")
 
+    # gRPC Keepalive and Channel/Server Options (defaults are examples, might need tuning)
+    GRPC_KEEPALIVE_TIME_MS: int = Field(default=60000, description="gRPC keepalive time in milliseconds.")
+    GRPC_KEEPALIVE_TIMEOUT_MS: int = Field(default=10000, description="gRPC keepalive timeout in milliseconds.")
+    GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS: bool = Field(default=True, description="Permit gRPC keepalive pings without active calls.")
+    GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS: int = Field(default=30000, description="gRPC HTTP2 minimum ping interval without data in milliseconds (client-side).")
+    GRPC_MAX_RECEIVE_MESSAGE_LENGTH: int = Field(default=4 * 1024 * 1024, description="gRPC max receive message length in bytes (default 4MB).")
+    GRPC_MAX_SEND_MESSAGE_LENGTH: int = Field(default=4 * 1024 * 1024, description="gRPC max send message length in bytes (default 4MB).")
+
+    # Server-specific gRPC connection management
+    GRPC_SERVER_MAX_CONNECTION_IDLE_MS: int = Field(default=0, description="gRPC server max connection idle time in ms (0 for infinite).")
+    GRPC_SERVER_MAX_CONNECTION_AGE_MS: int = Field(default=0, description="gRPC server max connection age in ms (0 for infinite).")
+    GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: int = Field(default=0, description="gRPC server max connection age grace period in ms (0 for infinite).")
+
 
     @classmethod
     def settings_customise_sources(
@@ -217,6 +230,14 @@ class SWMConfig(BaseServiceConfig):
     REDIS_TRANSACTION_MAX_RETRIES: int = Field(default=3, description="Max retries for Redis WATCH/MULTI/EXEC transactions.")
     REDIS_TRANSACTION_RETRY_INITIAL_DELAY_S: float = Field(default=0.01, description="Initial delay for Redis transaction retry.")
     REDIS_TRANSACTION_RETRY_BACKOFF_FACTOR: float = Field(default=2.0, description="Backoff factor for Redis transaction retry delay.")
+
+    # Redis Key Prefixes and Naming
+    SWM_EVICTION_SOURCE_AGENT_ID: str = Field(default="SWM_REDIS_EVICTION", description="Source agent ID for KEM eviction events from Redis.")
+    REDIS_KEM_KEY_PREFIX: str = Field(default="swm_kem:", description="Prefix for KEM data keys in Redis.")
+    REDIS_INDEX_META_KEY_PREFIX: str = Field(default="swm_idx:meta:", description="Prefix for metadata index keys in Redis.")
+    REDIS_INDEX_DATE_CREATED_KEY: str = Field(default="swm_idx:date:created_at", description="Redis key for 'created_at' sorted set index.")
+    REDIS_INDEX_DATE_UPDATED_KEY: str = Field(default="swm_idx:date:updated_at", description="Redis key for 'updated_at' sorted set index.")
+    REDIS_QUERY_TEMP_KEY_PREFIX: str = Field(default="swm_query_tmp:", description="Prefix for temporary keys used during SWM queries in Redis.")
 
     # SWM_INDEXED_METADATA_KEYS is already in SWMConfig
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited from BaseServiceConfig for SWM (async server)

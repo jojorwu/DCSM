@@ -56,9 +56,20 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         # If specific codes are needed for SWM's GLM calls, they can be configured and passed.
         try:
             if self.config.GLM_SERVICE_ADDRESS:
-                self.aio_glm_channel = grpc_aio.insecure_channel(self.config.GLM_SERVICE_ADDRESS)
+                grpc_options = [
+                    ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS),
+                    ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
+                    ('grpc.keepalive_permit_without_calls', 1 if self.config.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS else 0),
+                    ('grpc.http2.min_ping_interval_without_data_ms', self.config.GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS),
+                    ('grpc.max_receive_message_length', self.config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
+                    ('grpc.max_send_message_length', self.config.GRPC_MAX_SEND_MESSAGE_LENGTH),
+                ]
+                self.aio_glm_channel = grpc_aio.insecure_channel(
+                    self.config.GLM_SERVICE_ADDRESS,
+                    options=grpc_options
+                )
                 self.aio_glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.aio_glm_channel)
-                logger.info(f"GLM client (async) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}")
+                logger.info(f"GLM client (async) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}, options: {grpc_options}")
             else:
                 logger.warning("GLM_SERVICE_ADDRESS not configured. GLM features will be unavailable in SWM.")
         except Exception as e:
@@ -232,7 +243,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                             await self.subscription_manager.notify_kem_event(
                                 kem=evicted_kem_stub,
                                 event_type=swm_service_pb2.SWMMemoryEvent.EventType.KEM_EVICTED,
-                                source_agent_id="SWM_REDIS_EVICTION"
+                                source_agent_id=self.config.SWM_EVICTION_SOURCE_AGENT_ID # Use configured ID
                             )
             except asyncio.TimeoutError:
                 if self._stop_event.is_set(): logger.info("SWM Redis Eviction Listener: Stop event detected during get_message timeout."); break
@@ -267,6 +278,8 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
         logger.info("SWM Redis Eviction Listener: Stopped.")
 
     # --- GLM Client Methods (using async_retry_grpc_call decorator) ---
+    # Note: The config for RETRY_MAX_ATTEMPTS etc. for SWM's GLM client calls
+    # will be SWMConfig's own values for these fields (which can override shared values).
     @async_retry_grpc_call(
         max_attempts=config.RETRY_MAX_ATTEMPTS,
         initial_delay_s=config.RETRY_INITIAL_DELAY_S,
@@ -304,15 +317,11 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             logger.error("SWM: GLM async client not available for BatchStoreKEMs.");
             raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
         logger.debug(f"Calling GLM BatchStoreKEMs (async, with retry). KEMs: {len(request.kems)}, Timeout: {timeout}s")
-        # The decorator handles retries, so the direct try-except for RpcError here is less critical
-        # unless for very specific non-retryable error handling within the method itself.
-        # For now, let the decorator handle it.
         response = await self.aio_glm_stub.BatchStoreKEMs(request, timeout=timeout)
-        if response and response.failed_kem_references: # Check if response is not None
+        if response and response.failed_kem_references:
              logger.warning(f"SWM: GLM BatchStoreKEMs (after retry) reported {len(response.failed_kem_references)} failures. Refs: {response.failed_kem_references}")
         elif response:
              logger.info(f"SWM: GLM BatchStoreKEMs (after retry) processed. Success: {len(response.successfully_stored_kems)}, Failures: {len(response.failed_kem_references if response.failed_kem_references else [])}")
-        # If decorator exhausts retries, it will raise an exception, which will be caught by the caller of this method.
         return response
 
 
@@ -610,14 +619,14 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
         glm_req = glm_service_pb2.RetrieveKEMsRequest(query=request.query_for_glm)
         loaded_count = 0; queried_in_glm_count = 0; loaded_ids = []
-        status_message = "GLM query initiated."
+        # status_message = "GLM query initiated." # No longer needed here, set later
 
         try:
             logger.info(f"SWM: Requesting GLM.RetrieveKEMs with: {glm_req}")
-        glm_response = await self._glm_retrieve_kems_async_with_retry( # Use retry method
-            glm_req,
-            timeout=self.config.GLM_RETRIEVE_TIMEOUT_S # Use configured timeout
-        )
+            glm_response = await self._glm_retrieve_kems_async_with_retry(
+                glm_req,
+                timeout=self.config.GLM_RETRIEVE_TIMEOUT_S
+            )
 
             if glm_response and glm_response.kems:
                 queried_in_glm_count = len(glm_response.kems)
@@ -678,7 +687,49 @@ async def serve():
         force=True
     )
 
-    server=grpc_aio.server()
+    # Construct server options from config
+    server_options = [
+        ('grpc.keepalive_time_ms', module_cfg.GRPC_KEEPALIVE_TIME_MS),
+        ('grpc.keepalive_timeout_ms', module_cfg.GRPC_KEEPALIVE_TIMEOUT_MS),
+        ('grpc.keepalive_permit_without_calls', 1 if module_cfg.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS else 0),
+        ('grpc.max_receive_message_length', module_cfg.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
+        ('grpc.max_send_message_length', module_cfg.GRPC_MAX_SEND_MESSAGE_LENGTH),
+        ('grpc.max_connection_idle_ms', module_cfg.GRPC_SERVER_MAX_CONNECTION_IDLE_MS),
+        ('grpc.max_connection_age_ms', module_cfg.GRPC_SERVER_MAX_CONNECTION_AGE_MS),
+        ('grpc.max_connection_age_grace_ms', module_cfg.GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS),
+    ]
+    # Filter out options with non-positive values for time/age, as gRPC might not like 0 for some.
+    # Or ensure Pydantic models have minimums if 0 means "disabled" but gRPC expects positive.
+    # For keepalives, 0 usually means disabled or system default. Max connection age/idle 0 means infinite.
+    # For message length, -1 often means unlimited, 0 is invalid.
+    # Let's assume Pydantic defaults are sensible (e.g. >0 for times, 0 for infinite ages, >0 for lengths).
+    # The current Pydantic defaults are mostly fine.
+    # Filter options where value is 0 for time/age/grace and it means "infinite" or "disabled"
+    # For message lengths, they default to 4MB, so they are positive.
+    # For keepalive_time_ms, if 0, it might disable it. If that's intended, fine.
+    # The grpc library itself has defaults if options are not provided.
+    # Providing them explicitly from config gives control.
+
+    # Let's filter options that are 0 if they semantically mean "disabled" or "infinite"
+    # and gRPC might expect them to be absent or >0.
+    # For example, max_connection_idle_ms = 0 means infinite.
+    # Keepalive_time_ms = 0 might be problematic if not handled by underlying C-core as "use default".
+    # Python gRPC docs suggest default for keepalive_time_ms is INT_MAX.
+    # For safety, let's only pass time/age values if they are > 0.
+    # Message lengths are always > 0 from defaults.
+    final_server_options = []
+    for key, value in server_options:
+        if "_MS" in key.upper() and value <= 0: # For time, age, grace in ms
+            if key in ['grpc.max_connection_idle_ms', 'grpc.max_connection_age_ms', 'grpc.max_connection_age_grace_ms']:
+                 # For these, 0 means infinite/disabled, so we can skip passing them if 0 to use gRPC default behavior for "infinite"
+                 pass
+            else: # For other _MS values like keepalives, 0 might be invalid or disable. Pass if intended.
+                 final_server_options.append((key,value))
+        else:
+            final_server_options.append((key,value))
+
+
+    server=grpc_aio.server(options=final_server_options)
     try:
         servicer_instance=SharedWorkingMemoryServiceImpl()
     except SystemExit as e_init_fail:
@@ -687,10 +738,10 @@ async def serve():
 
     swm_service_pb2_grpc.add_SharedWorkingMemoryServiceServicer_to_server(servicer_instance,server)
 
-    listen_addr = servicer_instance.config.GRPC_LISTEN_ADDRESS
+    listen_addr = servicer_instance.config.GRPC_LISTEN_ADDRESS # This is already from config
     server.add_insecure_port(listen_addr)
 
-    logger.info(f"Starting SWM async server on {listen_addr}...")
+    logger.info(f"Starting SWM async server on {listen_addr} with options: {final_server_options}...")
     try:
         await server.start()
         if servicer_instance.redis_kem_cache:

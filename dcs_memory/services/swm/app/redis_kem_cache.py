@@ -50,13 +50,19 @@ class RedisKemCache:
         self.redis: aioredis.Redis = redis_client # type: ignore
         self.config = config
 
-        self.kem_key_prefix = "swm_kem:"
-        self.indexed_keys: Set[str] = set(config.INDEXED_METADATA_KEYS)
-        self.index_meta_key_prefix = "swm_idx:meta:"
-        self.index_date_created_key = "swm_idx:date:created_at"
-        self.index_date_updated_key = "swm_idx:date:updated_at"
+        self.kem_key_prefix = self.config.REDIS_KEM_KEY_PREFIX
+        self.indexed_keys: Set[str] = set(config.SWM_INDEXED_METADATA_KEYS) # Ensure using SWM_INDEXED_METADATA_KEYS from SWMConfig
+        self.index_meta_key_prefix = self.config.REDIS_INDEX_META_KEY_PREFIX
+        self.index_date_created_key = self.config.REDIS_INDEX_DATE_CREATED_KEY
+        self.index_date_updated_key = self.config.REDIS_INDEX_DATE_UPDATED_KEY
+        # REDIS_QUERY_TEMP_KEY_PREFIX will be used in query_by_filters method directly
 
-        logger.info(f"RedisKemCache initialized for field-based storage. Indexed metadata keys: {self.indexed_keys}")
+        logger.info(
+            f"RedisKemCache initialized. KEM Prefix: '{self.kem_key_prefix}', "
+            f"Meta Index Prefix: '{self.index_meta_key_prefix}', "
+            f"Date Created Index: '{self.index_date_created_key}', Date Updated Index: '{self.index_date_updated_key}'. "
+            f"Indexed metadata keys from config: {self.indexed_keys}"
+        )
 
 class RedisCacheError(Exception):
     """Base exception for RedisKemCache related errors."""
@@ -417,7 +423,7 @@ class RedisCacheTransactionError(RedisCacheError):
             logger.error("RedisKemCache.query_by_filters: Redis client not available.")
             return [], ""
 
-        temp_key_base = f"swm_query_tmp:{uuid.uuid4()}" # Base for temporary keys for this query
+        temp_key_base = f"{self.config.REDIS_QUERY_TEMP_KEY_PREFIX}{uuid.uuid4()}" # Use configured prefix
         intersect_keys_to_delete = []
         final_ids_set_key: Optional[str] = None # Key of the Redis SET holding candidate IDs
 
@@ -519,12 +525,26 @@ class RedisCacheTransactionError(RedisCacheError):
             # Request one more item than page_size to determine if there's a next page
             items_to_fetch_for_sort = page_size + 1
 
+            # Ensure final_ids_set_key_for_sort is assigned before use in sort_args
+            if not sinter_candidate_keys: # Should have returned earlier if this is empty due to no indexed filters
+                 return [],""
+            final_ids_set_key_for_sort: str
+            if len(sinter_candidate_keys) == 1:
+                final_ids_set_key_for_sort = sinter_candidate_keys[0]
+            else: # This means sinterstore was called or should have been.
+                  # If it wasn't (e.g., only one candidate key), final_ids_set_key_for_sort needs to be that single key.
+                  # The logic above handles this: final_ids_set_key_for_sort is assigned.
+                  # If sinterstore was intended but sinter_candidate_keys became empty before, we should have exited.
+                  # This re-assignment is defensive.
+                final_ids_set_key_for_sort = f"{temp_key_base}:final_intersect" if len(sinter_candidate_keys) > 1 else sinter_candidate_keys[0]
+
+
             sort_args = [
-                final_ids_set_key,
-                "BY", f"{self.kem_key_prefix}*->updated_at_ts",
+                final_ids_set_key_for_sort, # Use the correctly determined key
+                "BY", f"{self.kem_key_prefix}*->updated_at_ts", # kem_key_prefix is now from config
                 "DESC",
                 "LIMIT", str(current_offset), str(items_to_fetch_for_sort),
-                "GET", "#"
+                "GET", "#" # Get the KEM ID itself
             ]
             logger.debug(f"RedisKemCache: Executing SORT command: {sort_args}")
             sorted_and_paginated_ids_plus_one_bytes: List[bytes] = await self.redis.sort(*sort_args) # type: ignore

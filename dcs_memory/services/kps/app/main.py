@@ -72,11 +72,19 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             self.embedding_model = None # Ensure model is None if loading failed
 
         try:
-            self.glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS)
+            grpc_options = [
+                ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS),
+                ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
+                ('grpc.keepalive_permit_without_calls', 1 if self.config.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS else 0),
+                ('grpc.http2.min_ping_interval_without_data_ms', self.config.GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS),
+                ('grpc.max_receive_message_length', self.config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
+                ('grpc.max_send_message_length', self.config.GRPC_MAX_SEND_MESSAGE_LENGTH),
+            ]
+            self.glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=grpc_options)
             self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
-            logger.info(f"GLM client for KPS initialized, target address: {self.config.GLM_SERVICE_ADDRESS}")
+            logger.info(f"GLM client for KPS initialized, target: {self.config.GLM_SERVICE_ADDRESS}, options: {grpc_options}")
         except Exception as e:
-            logger.error(f"Error initializing GLM client in KPS: {e}")
+            logger.error(f"Error initializing GLM client in KPS: {e}", exc_info=True)
             self.glm_stub = None # Ensure stub is None if channel creation failed
 
     @retry_grpc_call( # Pass configured retry parameters
