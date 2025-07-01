@@ -510,11 +510,11 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                         status_message=f"KEM successfully processed and stored with ID: {kem_id_from_glm}"
                     )
                 else:
-                    # This case should ideally be an exception from _glm_store_kem_with_retry if something went wrong.
-                    msg = "Error: GLM.StoreKEM did not return an expected KEM object or KEM ID."
+                    # If _glm_store_kem_with_retry succeeded (no exception) but response is malformed.
+                    msg = "KPS Internal Error: GLM.StoreKEM did not return an expected KEM object or KEM ID after a successful RPC."
                     logger.error(msg)
-                    # Return a clear failure if the response is not as expected after successful RPC.
-                    return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg) # RPC is OK, but operation failed.
+                    context.abort(grpc.StatusCode.INTERNAL, msg)
+                    return kps_service_pb2.ProcessRawDataResponse() # Unreachable
 
             except pybreaker.CircuitBreakerError as e_cb_store:
                 msg = f"KPS: GLM service unavailable (circuit breaker open) for StoreKEM. Data_id='{request.data_id}'"
@@ -545,13 +545,24 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             context.abort(grpc.StatusCode.INTERNAL, "Internal KPS error during data processing.")
             return kps_service_pb2.ProcessRawDataResponse() # Unreachable
 
-    def __del__(self):
+    def close_resources(self):
+        """Closes gRPC channels and other resources held by the servicer instance."""
         if self.glm_channel:
-            self.glm_channel.close()
-            logger.info("KPS: Main GLM client channel closed.")
-        if self.glm_health_check_channel: # Also close the health check channel
-            self.glm_health_check_channel.close()
-            logger.info("KPS: GLM health check client channel closed.")
+            try:
+                self.glm_channel.close()
+                logger.info("KPS: Main GLM client channel closed.")
+            except Exception as e:
+                logger.error(f"KPS: Error closing main GLM client channel: {e}", exc_info=True)
+        if self.glm_health_check_channel:
+            try:
+                self.glm_health_check_channel.close()
+                logger.info("KPS: GLM health check client channel closed.")
+            except Exception as e:
+                logger.error(f"KPS: Error closing GLM health check client channel: {e}", exc_info=True)
+
+    # __del__ is not a reliable way to close channels, use explicit close_resources
+    # def __del__(self):
+    #     self.close_resources()
 
 
 def serve():
@@ -599,7 +610,12 @@ def serve():
     except KeyboardInterrupt:
         logger.info("Stopping KPS server...")
     finally:
-        server.stop(config.GRPC_SERVER_SHUTDOWN_GRACE_S) # Use configured grace period
+        if 'servicer_instance' in locals() and hasattr(servicer_instance, 'close_resources'):
+            logger.info("KPS: Closing servicer resources...")
+            servicer_instance.close_resources()
+
+        logger.info(f"KPS: Stopping gRPC server with {config.GRPC_SERVER_SHUTDOWN_GRACE_S}s grace...")
+        server.stop(config.GRPC_SERVER_SHUTDOWN_GRACE_S)
         logger.info("KPS server stopped.")
 
 if __name__ == '__main__':

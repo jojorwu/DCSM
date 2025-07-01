@@ -657,6 +657,8 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
             q_batch_ok = True
             qdrant_batch_error_details = ""
+            qdrant_was_unavailable = False # Flag for Qdrant specific unavailability
+
             if q_batch_pts:
                 try:
                     self.qdrant_repo.upsert_points_batch(q_batch_pts)
@@ -664,29 +666,65 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     logger.error(f"Batch: Qdrant batch upsert error: {e_q_b_up}", exc_info=True)
                     q_batch_ok = False
                     qdrant_batch_error_details = str(e_q_b_up)
-                    # If Qdrant is unavailable, we might want to fail the whole RPC here too.
-                    if "connect" in str(e_q_b_up).lower() or "unavailable" in str(e_q_b_up).lower():
-                         context.abort(grpc.StatusCode.UNAVAILABLE, f"Qdrant unavailable for batch upsert: {e_q_b_up}"); return glm_service_pb2.BatchStoreKEMsResponse()
-                         # Note: This aborts *before* SQLite rollback. For full atomicity, rollback should be attempted.
-                         # However, if Qdrant is down, rollback might also be problematic or slow.
-                         # The current logic proceeds to rollback, which is better.
-                         # Let's refine: if Qdrant connection error, we still try rollback but the overall message might indicate UNAVAILABLE.
+                    if "connect" in str(e_q_b_up).lower() or "unavailable" in str(e_q_b_up).lower() or "timeout" in str(e_q_b_up).lower():
+                        qdrant_was_unavailable = True # Set flag, but do not abort yet
 
             if not q_batch_ok:
-                logger.warning(f"Batch: Qdrant batch operation failed. Details: {qdrant_batch_error_details}. Rolling back SQLite for KEMs in Qdrant batch.")
-                for r_id_q in ids_for_q_rb_check:
+                logger.warning(f"Batch: Qdrant batch operation failed. Details: {qdrant_batch_error_details}. Rolling back SQLite for KEMs in Qdrant batch (IDs: {ids_for_q_rb_check}).")
+                for r_id_q in ids_for_q_rb_check: # These are KEM IDs that had embeddings and were attempted in Qdrant batch
                     orig_ref_q_rb = next((item['original_ref'] for item in valid_for_processing if item['proto'].id == r_id_q), r_id_q)
-                    if orig_ref_q_rb not in failed_refs: failed_refs.append(orig_ref_q_rb)
-                    if r_id_q in final_kem_protos_map: del final_kem_protos_map[r_id_q] # Remove from success
-                    try: self.sqlite_repo.delete_kem_by_id(r_id_q)
-                    except Exception as e_rb_sql_q_b: logger.critical(f"Batch: CRIT SQLite rollback error KEM '{r_id_q}': {e_rb_sql_q_b}", exc_info=True)
+                    if orig_ref_q_rb not in failed_refs:
+                        failed_refs.append(orig_ref_q_rb)
+                    if r_id_q in final_kem_protos_map:
+                        del final_kem_protos_map[r_id_q] # Remove from potential success list
+                    try:
+                        self.sqlite_repo.delete_kem_by_id(r_id_q)
+                        logger.info(f"Batch: SQLite rollback successful for KEM ID '{r_id_q}' due to Qdrant failure.")
+                    except Exception as e_rb_sql_q_b:
+                        logger.critical(f"Batch: CRITICAL SQLite rollback error for KEM ID '{r_id_q}': {e_rb_sql_q_b}", exc_info=True)
+                        # If rollback fails, this KEM is now inconsistent (in SQLite, failed in Qdrant)
 
-        for kem_p_final_s in final_kem_protos_map.values(): success_protos.append(kem_p_final_s)
+        # Populate success_protos from the remaining KEMs in final_kem_protos_map
+        # These are KEMs that were successfully stored in SQLite and did not require Qdrant rollback.
+        for kem_p_final_s in final_kem_protos_map.values():
+            success_protos.append(kem_p_final_s)
 
         final_failed_refs_list_unique = list(set(failed_refs))
+
+        # After all processing and rollbacks, if Qdrant was unavailable and all KEMs that needed Qdrant are in failed_refs,
+        # then it's a more systemic Qdrant issue for this batch.
+        if qdrant_was_unavailable:
+            # Check if all KEMs that had embeddings (and were in ids_for_q_rb_check) actually ended up in failed_refs
+            all_qdrant_dependent_failed = True
+            if not ids_for_q_rb_check: # No KEMs in this batch had embeddings
+                all_qdrant_dependent_failed = False
+            else:
+                for q_kem_id in ids_for_q_rb_check:
+                    # Find original ref for this q_kem_id
+                    orig_ref_for_q_id = next((item['original_ref'] for item in valid_for_processing if item['proto'].id == q_kem_id), q_kem_id)
+                    if orig_ref_for_q_id not in final_failed_refs_list_unique:
+                        all_qdrant_dependent_failed = False # Found a Qdrant-dependent KEM that didn't fail
+                        break
+
+            if all_qdrant_dependent_failed and ids_for_q_rb_check: # If all Qdrant-dependent KEMs failed due to Qdrant being unavailable
+                msg = f"Qdrant unavailable for batch upsert: {qdrant_batch_error_details}. All {len(ids_for_q_rb_check)} KEMs with embeddings failed."
+                logger.error(f"BatchStoreKEMs: Aborting due to Qdrant unavailability affecting all relevant KEMs. Details: {msg}")
+                context.abort(grpc.StatusCode.UNAVAILABLE, msg)
+                return glm_service_pb2.BatchStoreKEMsResponse() # Should be unreachable
+
         resp = glm_service_pb2.BatchStoreKEMsResponse(successfully_stored_kems=success_protos, failed_kem_references=final_failed_refs_list_unique)
-        if final_failed_refs_list_unique: resp.overall_error_message = f"Failed to store {len(final_failed_refs_list_unique)} KEMs."
-        elif not request.kems and not success_protos: resp.overall_error_message = "Empty KEM list received."
+
+        # Construct overall_error_message based on outcome
+        if final_failed_refs_list_unique:
+            base_fail_msg = f"Failed to store {len(final_failed_refs_list_unique)} KEMs."
+            if qdrant_was_unavailable and any(ref in (item['original_ref'] for item in valid_for_processing if item['proto'].id in ids_for_q_rb_check) for ref in final_failed_refs_list_unique):
+                # If Qdrant was unavailable AND at least one of the failed KEMs was Qdrant-dependent
+                resp.overall_error_message = f"{base_fail_msg} Qdrant issue: {qdrant_batch_error_details}"
+            else:
+                resp.overall_error_message = base_fail_msg
+        elif not request.kems and not success_protos: # Original request was empty
+            resp.overall_error_message = "Empty KEM list received."
+        # If all successful, no overall_error_message is needed.
 
         duration = time.monotonic() - start_time
         logger.info(f"BatchStoreKEMs: Finished. Duration: {duration:.4f}s. Success: {len(success_protos)}, Failures: {len(final_failed_refs_list_unique)}.")
