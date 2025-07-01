@@ -2,6 +2,7 @@
 
 import sqlite3
 import logging
+import threading # Added for thread-local storage
 from typing import List, Dict, Optional, Any
 from qdrant_client import QdrantClient, models
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -17,29 +18,54 @@ class SqliteKemRepository:
     def __init__(self, db_path: str, config: GLMConfig):
         self.db_path = db_path
         self.config = config
-        self._init_sqlite()
+        self._local = threading.local() # Initialize thread-local storage
+        self._init_sqlite_schema() # Renamed to avoid confusion, schema init is once
 
     def _get_sqlite_conn(self) -> sqlite3.Connection:
-        # Logic to be moved from GlobalLongTermMemoryServicerImpl
-        # For now, a placeholder implementation or direct copy
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        try:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute("PRAGMA synchronous=NORMAL;")
-            cursor.execute("PRAGMA foreign_keys=ON;")
-            cursor.execute("PRAGMA busy_timeout = 7500;") # Value from GLM main
-        except sqlite3.Error as e:
-            logger.error(f"Error setting SQLite PRAGMA options in Repository: {e}", exc_info=True)
-        return conn
+        # Get or create a connection for the current thread
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            logger.info(f"Thread {threading.get_ident()}: No existing SQLite connection. Creating new one to {self.db_path}.")
+            try:
+                # Each thread gets its own connection object.
+                # Default check_same_thread=True is appropriate and safe here.
+                conn = sqlite3.connect(self.db_path, timeout=10) # Increased timeout for busy DBs
 
-    def _init_sqlite(self):
-        # Logic to be moved from GlobalLongTermMemoryServicerImpl
-        logger.info(f"Repository: Initializing SQLite DB at path: {self.db_path}")
-        try:
-            with self._get_sqlite_conn() as conn:
+                # Apply PRAGMA settings once per connection
                 cursor = conn.cursor()
-                # ... (table and index creation logic will be moved here) ...
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                logger.info(f"Thread {threading.get_ident()}: PRAGMA journal_mode=WAL set.")
+                cursor.execute("PRAGMA synchronous=NORMAL;")
+                logger.info(f"Thread {threading.get_ident()}: PRAGMA synchronous=NORMAL set.")
+                cursor.execute("PRAGMA foreign_keys=ON;")
+                logger.info(f"Thread {threading.get_ident()}: PRAGMA foreign_keys=ON set.")
+                # busy_timeout from config or a sensible default
+                busy_timeout = getattr(self.config, 'SQLITE_BUSY_TIMEOUT', 7500)
+                cursor.execute(f"PRAGMA busy_timeout = {busy_timeout};")
+                logger.info(f"Thread {threading.get_ident()}: PRAGMA busy_timeout = {busy_timeout} set.")
+
+                self._local.conn = conn
+            except sqlite3.Error as e:
+                logger.critical(f"Thread {threading.get_ident()}: CRITICAL Error creating SQLite connection or setting PRAGMAs: {e}", exc_info=True)
+                # If essential PRAGMAs fail, it's safer to not proceed with a potentially misconfigured connection.
+                raise RuntimeError(f"Failed to initialize SQLite connection properly: {e}") from e
+        return self._local.conn
+
+    def _init_sqlite_schema(self):
+        # This method ensures the schema exists. It uses a temporary connection
+        # as it's called only once during repository initialization.
+        # The regular _get_sqlite_conn() will be used by operational methods.
+        logger.info(f"Repository: Initializing SQLite DB schema at path: {self.db_path}")
+        try:
+            # Use a temporary connection for schema initialization
+            # This is separate from the thread-local connections used for operations.
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                cursor = conn.cursor()
+                # Set PRAGMAs for this schema initialization connection as well,
+                # especially WAL mode, as it can affect how the DB file is structured initially.
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                cursor.execute("PRAGMA synchronous=NORMAL;")
+                cursor.execute("PRAGMA foreign_keys=ON;")
+
                 cursor.execute('''
                 CREATE TABLE IF NOT EXISTS kems (
                     id TEXT PRIMARY KEY,
@@ -119,13 +145,11 @@ class SqliteKemRepository:
             fields_to_update.append("metadata = ?")
             params.append(metadata_json)
 
-        if not fields_to_update: # Only updated_at needs to be set
-            fields_to_update.append("updated_at = ?") # This ensures updated_at is always part of the SET clause
-            params.append(updated_at_iso)
-        else: # Other fields are being updated, add updated_at to the list
-            fields_to_update.append("updated_at = ?")
-            params.append(updated_at_iso)
+        # updated_at is always updated
+        fields_to_update.append("updated_at = ?")
+        params.append(updated_at_iso)
 
+        # kem_id for the WHERE clause
         params.append(kem_id)
 
         set_clause = ", ".join(fields_to_update)

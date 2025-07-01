@@ -28,6 +28,7 @@ class GLMConfig(BaseServiceConfig):
 
     DEFAULT_VECTOR_SIZE: int = 384 # Изменен дефолт с 25 на более реалистичный
     DEFAULT_PAGE_SIZE: int = 10
+    SQLITE_BUSY_TIMEOUT: int = 7500 # milliseconds
 
     GRPC_LISTEN_ADDRESS: str = "[::]:50051"
 
