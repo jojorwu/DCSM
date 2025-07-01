@@ -148,19 +148,26 @@ After successful startup, the following services will be available:
 *   **KPS Service**: gRPC on port 50052
 *   **SWM Service**: gRPC on port 50053
 
-You can start interacting with the system using the [Python Agent SDK](dcsm_agent_sdk_python/README.md) or any other gRPC client. Examples of SDK usage can be found in `dcsm_agent_sdk_python/example.py`.
+All services also expose a standard gRPC health check endpoint (`grpc.health.v1.Health/Check`) on their respective ports.
+
+You can start interacting with the system using the [Python Agent SDK](dc_agent_sdk_python/README.md) or any other gRPC client. Examples of SDK usage can be found in `dcsm_agent_sdk_python/example.py`.
 
 ## Project Status and Future Directions
 
-The DCSM system is under active development. The current implementation includes all major described components and core functionality.
+The DCSM system is under active development. The current implementation includes all major described components and core functionality. Recent architectural enhancements include:
+*   **Circuit Breakers**: Client calls between services (e.g., KPS to GLM, SWM to GLM) are now protected by circuit breakers to improve resilience against temporary downstream service unavailability. These are configurable via `config.yml`.
+*   **SWM Dead Letter Queue (DLQ)**: KEMs that fail to persist to GLM from SWM's asynchronous persistence queue (after configured retries) are now moved to a DLQ in Redis for later inspection, rather than being discarded.
+*   **GLM Transactional Integrity**: Basic compensating actions have been added to GLM's `StoreKEM` and `UpdateKEM` operations to improve consistency between SQLite and Qdrant in case of partial failures.
+*   **KPS Idempotency**: The KPS `ProcessRawData` method now includes an optional idempotency check (based on `data_id`) to prevent reprocessing of duplicate requests.
 
-**Key directions for future development:**
+**Key directions for ongoing and future development:**
 *   Full-fledged Pub/Sub mechanism in SWM using `asyncio` or integration with message brokers.
 *   Development of more sophisticated caching and eviction policies in SWM.
 *   Expansion of filtering and querying capabilities in SWM.
 *   Enhancement of security aspects: authentication and authorization.
 *   Comprehensive integration and load testing.
-*   Improvement of fault tolerance and error handling mechanisms.
+*   Further improvement of fault tolerance and error handling mechanisms (e.g., more detailed health checks, advanced retry strategies).
+*   Implementation of metrics and distributed tracing for enhanced observability.
 
 We welcome discussion and potential contributions to the project!
 

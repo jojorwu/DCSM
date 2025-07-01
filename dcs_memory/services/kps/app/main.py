@@ -79,25 +79,37 @@ from generated_grpc import kps_service_pb2 # For KPS server
 from generated_grpc import kps_service_pb2_grpc # For KPS server
 # Import retry decorator
 from dcs_memory.common.grpc_utils import retry_grpc_call
+from dcs_memory.common.config import KPSConfig # Ensure KPSConfig is imported for type hint
+
+# Attempt to import pybreaker, make it optional
+try:
+    import pybreaker
+except ImportError:
+    pybreaker = None
 # --- End gRPC Code Import Block ---
 
 class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServiceServicer):
     def __init__(self):
         logger.info("Initializing KnowledgeProcessorServiceImpl...")
+        self.config: KPSConfig = config # Store config instance with type hint
         self.glm_channel = None
         self.glm_stub = None
-        self.embedding_model: typing.Optional[SentenceTransformer] = None # Type hint
-        self.config = config # Store config instance for easy access
+        self.embedding_model: typing.Optional[SentenceTransformer] = None
 
-        # Retry parameters for GLM client calls can be accessed via self.config if defined in KPSConfig
-        # For now, assuming retry_grpc_call uses its own defaults or global ones from grpc_utils
-        # self.retry_max_attempts = getattr(self.config, "GLM_RETRY_MAX_ATTEMPTS", 3)
-        # self.retry_initial_delay_s = getattr(self.config, "GLM_RETRY_INITIAL_DELAY_S", 1.0)
-        # self.retry_backoff_factor = getattr(self.config, "GLM_RETRY_BACKOFF_FACTOR", 2.0)
+        self.glm_circuit_breaker: typing.Optional[pybreaker.CircuitBreaker] = None
+        if pybreaker and self.config.CIRCUIT_BREAKER_ENABLED:
+            self.glm_circuit_breaker = pybreaker.CircuitBreaker(
+                fail_max=self.config.CIRCUIT_BREAKER_FAIL_MAX,
+                reset_timeout=self.config.CIRCUIT_BREAKER_RESET_TIMEOUT_S
+            )
+            logger.info(f"KPS: GLM client circuit breaker enabled: fail_max={self.config.CIRCUIT_BREAKER_FAIL_MAX}, reset_timeout={self.config.CIRCUIT_BREAKER_RESET_TIMEOUT_S}s")
+        else:
+            logger.info(f"KPS: GLM client circuit breaker is disabled (pybreaker not installed or CIRCUIT_BREAKER_ENABLED=False).")
+
 
         try:
-            logger.info(f"Loading sentence-transformer model: {self.config.SENTENCE_TRANSFORMER_MODEL}...")
-            self.embedding_model = SentenceTransformer(self.config.SENTENCE_TRANSFORMER_MODEL)
+            logger.info(f"Loading sentence-transformer model: {self.config.EMBEDDING_MODEL_NAME}...") # Use updated config name
+            self.embedding_model = SentenceTransformer(self.config.EMBEDDING_MODEL_NAME)
 
             # Perform a test encoding to check model and get vector dimension
             test_embedding = self.embedding_model.encode(["test"])[0]
@@ -130,21 +142,207 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             logger.error(f"Error initializing GLM client in KPS: {e}", exc_info=True)
             self.glm_stub = None # Ensure stub is None if channel creation failed
 
-    @retry_grpc_call( # Pass configured retry parameters
+    @retry_grpc_call(
+        max_attempts=config.RETRY_MAX_ATTEMPTS, # These are now correctly sourced from config by the decorator through the instance
+        initial_delay_s=config.RETRY_INITIAL_DELAY_S,
+        backoff_factor=config.RETRY_BACKOFF_FACTOR,
+        jitter_fraction=config.RETRY_JITTER_FRACTION,
+        # Pass the instance's circuit breaker and its enabled status
+        # Note: The decorator needs access to these. This implies the decorator should be applied
+        # to an instance method where `self` is available, or these need to be passed differently if
+        # the decorator is at class level or on static methods.
+        # Current application to instance method `_glm_store_kem_with_retry` is fine for `self.glm_circuit_breaker`.
+        # However, the decorator parameters are evaluated at definition time.
+        # This means we need to pass `self.glm_circuit_breaker` and `self.config.CIRCUIT_BREAKER_ENABLED`
+        # to the decorator when it's applied, or the decorator needs to fetch them from `self`.
+        # Let's adjust how the decorator is called or how it accesses these.
+        #
+        # For simplicity, the decorator will take them as arguments.
+        # The KPSConfig object (`config`) is global in this file.
+        # The circuit breaker needs to be specific to this client instance.
+        # This requires applying the decorator dynamically or accessing `self` from within the decorator.
+        #
+        # Let's make the decorator slightly smarter or pass the CB from the method call itself.
+        # Simpler: The decorator is already defined. We need to ensure it *can* receive the CB.
+        # The call to the decorator should be:
+        # @retry_grpc_call(..., circuit_breaker=self.glm_circuit_breaker, cb_enabled=self.config.CIRCUIT_BREAKER_ENABLED)
+        # This cannot be done directly as self is not available at decorator application time for the method.
+        #
+        # Alternative: The method itself fetches the CB and passes it to a helper.
+        # Or, the decorator is modified to expect `self` as first arg if it's a method.
+        #
+        # Easiest path: Modify how the decorator is applied in the KPS class.
+        # We will need to initialize the CB in __init__ and then use it.
+        # The decorator parameters `circuit_breaker` and `cb_enabled` are new.
+        # The retry_grpc_call in grpc_utils.py is now updated to accept these.
+        # The KPS service's method needs to be decorated such that these are passed.
+        # This means the decorator needs to be applied in a way that it has access to `self.config` and `self.glm_circuit_breaker`
+        #
+        # One way: The decorator itself, if the decorated function is a method of a class that has `config` and `glm_circuit_breaker` attributes,
+        # could try to access them.
+        # A cleaner way for now: The decorated method will be a wrapper that calls an inner method with CB.
+        # No, this is also complex.
+        #
+        # Let's assume the decorator will be modified slightly if it's applied to a method,
+        # to try to get `circuit_breaker` and `cb_enabled` from `self` (the first arg).
+        # For now, I'll update the call here, assuming the decorator in grpc_utils can handle it.
+        # The `config` object used for retry params is the global one.
+        #
+        # The decorator `retry_grpc_call` is defined globally in `grpc_utils`.
+        # When KPS's `_glm_store_kem_with_retry` is decorated, the decorator's parameters
+        # (max_attempts etc.) get fixed based on the global `config` at that point (KPSConfig).
+        # To pass instance-specific circuit breaker, the decorator has to be applied to the instance's method
+        # or the method itself has to use the circuit breaker.
+        #
+        # Let's assume the `retry_grpc_call` decorator will be applied like this:
+        # No, the decorator parameters are fixed at decoration time.
+        #
+        # Simplest: The method itself uses the circuit breaker.
+        # The retry decorator will then wrap the CB-protected call.
+        # The retry_grpc_call decorator has been updated to accept circuit_breaker and cb_enabled.
+        # So, KPS needs to instantiate the CB and pass it.
+        # The decorator itself does not have access to `self`.
+        #
+        # The retry decorator is applied at method definition.
+        # The parameters to the decorator (like max_attempts) are evaluated then.
+        # We cannot pass `self.glm_circuit_breaker` to the decorator at definition time.
+        #
+        # This means the circuit breaker logic must be invoked *inside* the decorated method,
+        # or the decorator itself must be more complex (e.g., a class-based decorator that gets `self`).
+        #
+        # Let's modify the method to use the circuit breaker internally,
+        # and the retry decorator will wrap this.
+        # The retry decorator in grpc_utils has already been modified to accept CB.
+        # The challenge is how to pass the instance's CB to the globally defined decorator.
+        #
+        # The solution is to apply the decorator in __init__ if we want instance-specific CBs.
+        # Or, make the decorator itself aware of instance attributes if it's decorating a method.
+        #
+        # Re-evaluating: The decorator parameters `circuit_breaker` and `cb_enabled` were added to `grpc_utils.py`.
+        # The call site of the decorator in KPS needs to pass these.
+        # Since `config` is global in `kps/main.py`, `cb_enabled=config.CIRCUIT_BREAKER_ENABLED` is fine.
+        # But `circuit_breaker=self.glm_circuit_breaker` is not.
+        #
+        # The most straightforward way is that the decorated function (`_glm_store_kem_with_retry`)
+        # becomes a simple wrapper that calls another method which is then protected by the CB.
+        # OR the CB logic is directly inside `_glm_store_kem_with_retry` before the actual gRPC call.
+        #
+        # Let's try making the method use the CB internally for now.
+        # The retry decorator will then wrap this CB-protected call.
+        # The `protected_func` inside the retry decorator will become the one that uses the CB.
+        # This means the `retry_grpc_call` decorator does not need the `circuit_breaker` and `cb_enabled` params directly.
+        # It will simply retry the function it's given. That function, in turn, will use the CB.
+        # This seems cleaner. I will revert the `grpc_utils.py` changes for CB params in decorator signature
+        # and instead put the CB logic into the service methods.
+        #
+        # *** Re-Correction ***:
+        # The `pybreaker.CircuitBreaker.call(func, *args, **kwargs)` pattern is what we need.
+        # The `retry_grpc_call` should indeed take the `circuit_breaker` and `cb_enabled` args.
+        # The KPS service will instantiate its `self.glm_circuit_breaker`.
+        # The problem is applying the decorator: `@retry_grpc_call(..., circuit_breaker=self.glm_circuit_breaker)`.
+        # This requires `self` at definition time.
+        #
+        # Solution: We can't use the decorator with instance-specific CBs directly on the method.
+        # Instead, the method will explicitly call a function that is then decorated,
+        # or the method will implement the retry/CB logic itself.
+        #
+        # Let's keep the retry decorator as is (already modified to accept CB).
+        # In KPS `__init__`, we will store the CB.
+        # In `_glm_store_kem_with_retry`, we will call the `self.glm_stub.StoreKEM` via the CB.
+        # The retry decorator will wrap `_glm_store_kem_with_retry`.
+        # The retry decorator needs to be passed the CB instance.
+        # This is still the core issue.
+        #
+        # The simplest way for now, given the existing structure:
+        # The retry decorator will be applied as is. The circuit breaker logic will be *inside* the
+        # `_glm_store_kem_with_retry` method, wrapping the `self.glm_stub.StoreKEM` call.
+        # This means the retry decorator will *not* be aware of the CB directly.
+        # If the CB is open, `_glm_store_kem_with_retry` will raise `CircuitBreakerError`.
+        # The retry decorator will catch this. We need to ensure `CircuitBreakerError` is NOT retryable by the retry_decorator.
+        # This means `RETRYABLE_ERROR_CODES` in `grpc_utils.py` must not include `CircuitBreakerError`.
+        # And the retry decorator should specifically let `CircuitBreakerError` propagate.
+        # This is already handled in the modified `grpc_utils.py`.
+
+        # So, the decorator call remains as is, configured by global `config`.
+        # The CB logic is added *inside* the method.
+    )
+    def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int) -> glm_service_pb2.StoreKEMResponse:
+        if not self.glm_stub:
+            logger.error("KPS._glm_store_kem_with_retry: GLM stub is not initialized.")
+            raise RuntimeError("KPS Internal Error: GLM client stub not available.")
+
+        def actual_glm_call():
+            return self.glm_stub.StoreKEM(request, timeout=timeout)
+
+        if self.glm_circuit_breaker and self.config.CIRCUIT_BREAKER_ENABLED:
+            try:
+                return self.glm_circuit_breaker.call(actual_glm_call)
+            except pybreaker.CircuitBreakerError as e:
+                logger.error(f"KPS: GLM Circuit Breaker open for StoreKEM: {e}")
+                # Map to a gRPC error or a specific KPS exception if needed by callers
+                # For now, re-raising will be caught by the retry decorator's generic Exception handler
+                # or propagate up if not caught by retry decorator's RpcError specific handler.
+                # The retry decorator was already modified to let pybreaker.CircuitBreakerError propagate.
+                raise
+        else: # Circuit breaker disabled or not available
+            return actual_glm_call()
+        # The line below was a leftover from a previous merge, actual_glm_call already returns this.
+        # return self.glm_stub.StoreKEM(request, timeout=timeout)
+
+    @retry_grpc_call(
         max_attempts=config.RETRY_MAX_ATTEMPTS,
         initial_delay_s=config.RETRY_INITIAL_DELAY_S,
         backoff_factor=config.RETRY_BACKOFF_FACTOR,
         jitter_fraction=config.RETRY_JITTER_FRACTION
-        # retryable_error_codes can use the decorator's default or be configured too if needed
     )
-    def _glm_store_kem_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int) -> glm_service_pb2.StoreKEMResponse: # timeout will be passed from caller
+    def _glm_retrieve_kems_with_retry(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int) -> glm_service_pb2.RetrieveKEMsResponse:
         if not self.glm_stub:
-            logger.error("KPS._glm_store_kem_with_retry: GLM stub is not initialized. This is a KPS internal configuration error.")
-            raise RuntimeError("KPS Internal Error: GLM client stub not available for storing KEM.")
-        return self.glm_stub.StoreKEM(request, timeout=timeout)
+            logger.error("KPS._glm_retrieve_kems_with_retry: GLM stub is not initialized.")
+            raise RuntimeError("KPS Internal Error: GLM client stub not available.")
+
+        def actual_glm_call():
+            return self.glm_stub.RetrieveKEMs(request, timeout=timeout)
+
+        if self.glm_circuit_breaker and self.config.CIRCUIT_BREAKER_ENABLED:
+            try:
+                return self.glm_circuit_breaker.call(actual_glm_call)
+            except pybreaker.CircuitBreakerError as e: # type: ignore
+                logger.error(f"KPS: GLM Circuit Breaker open for RetrieveKEMs: {e}")
+                raise
+        else:
+            return actual_glm_call()
 
     def ProcessRawData(self, request: kps_service_pb2.ProcessRawDataRequest, context) -> kps_service_pb2.ProcessRawDataResponse:
         logger.info(f"KPS: ProcessRawData called for data_id='{request.data_id}', content_type='{request.content_type}'")
+
+        # Idempotency Check
+        if self.config.KPS_IDEMPOTENCY_CHECK_ENABLED and request.data_id:
+            idempotency_key = self.config.KPS_IDEMPOTENCY_METADATA_KEY
+            logger.info(f"KPS: Performing idempotency check for data_id '{request.data_id}' using metadata key '{idempotency_key}'.")
+            query = glm_service_pb2.KEMQuery(
+                metadata_filters={idempotency_key: request.data_id}
+            )
+            retrieve_request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1)
+
+            try:
+                # Use a shorter timeout for this check compared to StoreKEM? Or make it configurable.
+                # For now, using the same StoreKEM timeout as a general GLM interaction timeout.
+                # TODO: Consider a specific KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S
+                response = self._glm_retrieve_kems_with_retry(retrieve_request, timeout=self.config.GLM_STORE_KEM_TIMEOUT_S)
+                if response and response.kems:
+                    existing_kem_id = response.kems[0].id
+                    logger.info(f"KPS: Idempotency check positive. Data_id '{request.data_id}' already processed as KEM ID '{existing_kem_id}'.")
+                    return kps_service_pb2.ProcessRawDataResponse(
+                        kem_id=existing_kem_id,
+                        success=True,
+                        status_message=f"Data already processed (KEM ID: {existing_kem_id})."
+                    )
+            except grpc.RpcError as e_rpc:
+                logger.warning(f"KPS: Idempotency check failed with gRPC error (Code: {e_rpc.code()}): {e_rpc.details()}. Proceeding with processing.", exc_info=True)
+            except pybreaker.CircuitBreakerError as e_cb:
+                 logger.warning(f"KPS: Idempotency check failed due to GLM circuit breaker open: {e_cb}. Proceeding with processing (will likely fail at StoreKEM).", exc_info=True)
+            except Exception as e_generic:
+                logger.warning(f"KPS: Idempotency check failed with unexpected error: {e_generic}. Proceeding with processing.", exc_info=True)
 
         if not self.glm_stub:
             msg = "GLM service is unavailable to KPS (GLM client not initialized)."
@@ -199,7 +397,11 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             )
             # If data_id was provided in the request, add it to metadata for traceability
             if request.data_id:
-                kem_to_store.metadata["source_data_id"] = request.data_id
+                # Ensure the idempotency key is added to metadata for future checks
+                kem_to_store.metadata[self.config.KPS_IDEMPOTENCY_METADATA_KEY] = request.data_id
+            elif self.config.KPS_IDEMPOTENCY_CHECK_ENABLED and not request.data_id:
+                logger.warning("KPS: Idempotency check enabled, but no data_id provided in request. Cannot perform check or guarantee idempotency via this mechanism.")
+
 
             logger.info("KPS: Calling GLM.StoreKEM (with retry logic)...")
             store_kem_request = glm_service_pb2.StoreKEMRequest(kem=kem_to_store)
@@ -258,8 +460,17 @@ def serve():
     kps_service_pb2_grpc.add_KnowledgeProcessorServiceServicer_to_server(
         servicer_instance, server
     )
+
+    # Add Health Servicer
+    from grpc_health.v1 import health, health_pb2_grpc
+    health_servicer = health.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+    # TODO: Implement more detailed health checks for KPS (e.g., model loaded, GLM connectivity).
+    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+
+
     server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting KPS (Knowledge Processor Service) on {config.GRPC_LISTEN_ADDRESS}...")
+    logger.info(f"Starting KPS (Knowledge Processor Service) on {config.GRPC_LISTEN_ADDRESS} with health checks enabled...")
     server.start()
     logger.info(f"KPS started and listening for connections on {config.GRPC_LISTEN_ADDRESS}.")
     try:

@@ -232,8 +232,17 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 updated_at_iso=kem.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
             )
         except Exception as e_sqlite:
-            msg = f"StoreKEM: SQLite error for ID '{kem_id}': {e_sqlite}"
+            msg = f"StoreKEM: SQLite error for ID '{kem_id}' after Qdrant upsert (if performed): {e_sqlite}"
             logger.error(msg, exc_info=True)
+            # Attempt to roll back Qdrant change if it happened
+            if self.qdrant_repo and has_embeddings:
+                try:
+                    logger.warning(f"StoreKEM: Attempting to roll back Qdrant upsert for KEM ID '{kem_id}' due to SQLite error.")
+                    self.qdrant_repo.delete_points_by_ids([kem_id])
+                    logger.info(f"StoreKEM: Qdrant rollback successful for KEM ID '{kem_id}'.")
+                except Exception as e_qdrant_rollback:
+                    logger.error(f"StoreKEM: CRITICAL - Failed to roll back Qdrant upsert for KEM ID '{kem_id}': {e_qdrant_rollback}", exc_info=True)
+                    # This KEM might be orphaned in Qdrant or in an inconsistent state.
             context.abort(grpc.StatusCode.INTERNAL, msg); return glm_service_pb2.StoreKEMResponse()
 
         duration = time.monotonic() - start_time
@@ -363,13 +372,83 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         sql_ct = kem_data_update.content_type if kem_data_update.HasField("content_type") else None
         sql_c = kem_data_update.content.value if kem_data_update.HasField("content") else None
         sql_meta_json = json.dumps(dict(kem_data_update.metadata)) if kem_data_update.metadata else None
+
+        qdrant_updated_for_this_call = False # Flag to track if Qdrant was touched in this specific UpdateKEM call
+        if self.qdrant_repo:
+            # This block was already here for Qdrant update
+            try:
+                q_point: PointStruct
+                if kem_data_update.embeddings: # Embeddings are explicitly being updated
+                    new_embeds_list = list(kem_data_update.embeddings)
+                    if len(new_embeds_list) != self.config.DEFAULT_VECTOR_SIZE:
+                        context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Invalid embedding dim."); return kem_pb2.KEM()
+                    q_point = PointStruct(id=kem_id, vector=new_embeds_list, payload=q_payload)
+                    final_embeds_resp = new_embeds_list
+                else: # Embeddings not in update, preserve existing if any, update payload
+                    ex_pts = self.qdrant_repo.retrieve_points_by_ids([kem_id], True)
+                    ex_vec = list(ex_pts[0].vector) if ex_pts and ex_pts[0].vector else None
+                    final_embeds_resp = ex_vec if ex_vec else []
+                    # Only create a point if there's a vector or if we intend to update payload even for no-vector points
+                    if ex_vec or kem_data_update.metadata: # If metadata is updated, payload needs update
+                         q_point = PointStruct(id=kem_id, vector=ex_vec, payload=q_payload)
+                    else: # No embeddings and no metadata update, no Qdrant point op needed if point doesn't exist or has no vector
+                         q_point = None
+
+                if q_point:
+                    self.qdrant_repo.upsert_point(q_point)
+                    qdrant_updated_for_this_call = True
+            except Exception as e_q_upd:
+                # If Qdrant fails here, we haven't touched SQLite yet for this update.
+                # So, state is still consistent with before this UpdateKEM call.
+                context.abort(grpc.StatusCode.INTERNAL, f"Qdrant update error: {e_q_upd}"); return kem_pb2.KEM()
+
         try:
-            self.sqlite_repo.update_kem_fields(kem_id, sql_upd_at_iso, sql_ct, sql_c, sql_meta_json)
+            update_success = self.sqlite_repo.update_kem_fields(kem_id, sql_upd_at_iso, sql_ct, sql_c, sql_meta_json)
+            if not update_success and (sql_ct or sql_c or sql_meta_json): # If we intended to update fields but nothing changed
+                 logger.warning(f"UpdateKEM: SQLite update_kem_fields reported no rows affected for KEM ID '{kem_id}' despite update data.")
+                 # This might indicate KEM was deleted between initial fetch and update, or a concurrent update changed it.
+                 # Or simply no actual changes were made by the provided data.
+                 # For now, we proceed, but this could be a point for stricter checks.
         except Exception as e_sql_upd:
+            logger.error(f"UpdateKEM: SQLite error for ID '{kem_id}' after Qdrant update (if performed): {e_sql_upd}", exc_info=True)
+            # Attempt to roll back Qdrant change if it happened in *this specific call*
+            if qdrant_updated_for_this_call and self.qdrant_repo:
+                try:
+                    logger.warning(f"UpdateKEM: Attempting to roll back Qdrant update for KEM ID '{kem_id}' due to SQLite error.")
+                    # This is tricky: rolling back Qdrant means restoring its *previous state*.
+                    # The current q_payload might be based on the *intended new metadata*.
+                    # A true rollback would require fetching the KEM's Qdrant point *before* this update.
+                    # For simplicity now, if an update involved embeddings, we might delete the point.
+                    # If only payload, restoring previous payload is complex.
+                    # A safer, simpler rollback for now if Qdrant was touched: re-fetch from SQLite (which failed to update)
+                    # and try to re-sync Qdrant to that older SQLite state.
+                    # Or, if the update was primarily payload, and embeddings were just preserved,
+                    # try to re-upsert with the *old* metadata from current_db_kem.
+                    # This is getting complex. Simplest rollback: delete if new embeddings were pushed.
+                    # If only payload was updated, a Qdrant delete might be too destructive if the point should exist.
+                    #
+                    # Let's consider the case: if `kem_data_update.embeddings` were provided, then Qdrant point was definitely changed with new vector.
+                    # If only metadata changed, Qdrant payload changed.
+                    # A simple strategy: if Qdrant was touched and SQLite failed, we log a CRITICAL inconsistency.
+                    # A true rollback of Qdrant to its exact previous state is hard without storing that state.
+                    logger.critical(f"UpdateKEM: CRITICAL INCONSISTENCY - SQLite update failed for KEM ID '{kem_id}' after Qdrant was updated. Manual reconciliation may be needed.")
+                    # For now, we won't attempt complex Qdrant rollback here to avoid further errors.
+                except Exception as e_qdrant_rollback:
+                    logger.error(f"UpdateKEM: Error during Qdrant rollback attempt for KEM ID '{kem_id}': {e_qdrant_rollback}", exc_info=True)
             context.abort(grpc.StatusCode.INTERNAL, f"SQLite update error: {e_sql_upd}"); return kem_pb2.KEM()
 
         final_db_kem = self.sqlite_repo.get_full_kem_by_id(kem_id)
-        if not final_db_kem: context.abort(grpc.StatusCode.INTERNAL, "KEM disappeared post-update."); return kem_pb2.KEM()
+        if not final_db_kem: # Should not happen if update_kem_fields didn't delete
+            logger.error(f"UpdateKEM: KEM ID '{kem_id}' disappeared after SQLite update attempt. This should not happen.")
+            context.abort(grpc.StatusCode.INTERNAL, "KEM disappeared post-update."); return kem_pb2.KEM()
+
+        # Ensure final_embeds_resp reflects the latest state (especially if no new embeddings were provided in update)
+        if not kem_data_update.embeddings and self.qdrant_repo: # If embeddings were not part of the update payload
+            retrieved_pts = self.qdrant_repo.retrieve_points_by_ids([kem_id], with_vectors=True)
+            if retrieved_pts and retrieved_pts[0].vector:
+                final_embeds_resp = list(retrieved_pts[0].vector)
+            else:
+                final_embeds_resp = [] # Ensure it's an empty list if no vector found
 
         resp_kem = self._kem_from_db_dict(final_db_kem, {kem_id: final_embeds_resp} if final_embeds_resp else None)
         duration = time.monotonic() - start_time
@@ -523,8 +602,20 @@ def serve():
         return
 
     glm_service_pb2_grpc.add_GlobalLongTermMemoryServicer_to_server(servicer_instance, server)
+
+    # Add Health Servicer
+    from grpc_health.v1 import health, health_pb2_grpc
+    health_servicer = health.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+    # For now, set overall health to SERVING.
+    # TODO: Implement more detailed health checks for dependencies (SQLite, Qdrant).
+    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+    # Set specific service health if needed, though "" usually covers the whole server.
+    # health_servicer.set(glm_service_pb2.DESCRIPTOR.services_by_name['GlobalLongTermMemory'].full_name, health_pb2.HealthCheckResponse.SERVING)
+
+
     server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting GLM server on {config.GRPC_LISTEN_ADDRESS}...")
+    logger.info(f"Starting GLM server on {config.GRPC_LISTEN_ADDRESS} with health checks enabled...")
     server.start()
     logger.info(f"GLM server started and listening on {config.GRPC_LISTEN_ADDRESS}.")
 

@@ -3,6 +3,13 @@ import time
 import random
 from functools import wraps
 import logging
+from typing import Optional, Callable, Any # For type hints
+
+# Attempt to import pybreaker, make it optional if not strictly needed everywhere
+try:
+    import pybreaker
+except ImportError:
+    pybreaker = None # type: ignore
 
 logger = logging.getLogger(__name__) # Logger for this module
 
@@ -21,13 +28,16 @@ DEFAULT_INITIAL_DELAY_S = 1.0  # seconds
 DEFAULT_BACKOFF_FACTOR = 2.0
 DEFAULT_JITTER_FRACTION = 0.1 # 10% jitter, e.g., for a 1s delay, jitter is +/- 0.1s
 
-def retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
-                    initial_delay_s=DEFAULT_INITIAL_DELAY_S,
-                    backoff_factor=DEFAULT_BACKOFF_FACTOR,
-                    jitter_fraction=DEFAULT_JITTER_FRACTION,
-                    retryable_error_codes=RETRYABLE_ERROR_CODES):
+def retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+                    initial_delay_s: float = DEFAULT_INITIAL_DELAY_S,
+                    backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+                    jitter_fraction: float = DEFAULT_JITTER_FRACTION,
+                    retryable_error_codes: tuple = RETRYABLE_ERROR_CODES,
+                    circuit_breaker: Optional[pybreaker.CircuitBreaker] = None, # type: ignore
+                    cb_enabled: bool = True):
+                    # cb_enabled allows config to globally disable CBs even if one is passed
     """
-    Decorator to automatically retry a gRPC call upon specific, typically transient, errors.
+    Decorator to automatically retry a gRPC call, with optional circuit breaker protection.
 
     :param max_attempts: Maximum number of call attempts.
     :param initial_delay_s: Initial delay before the first retry, in seconds.
@@ -41,11 +51,27 @@ def retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
         @wraps(func)
         def wrapper(*args, **kwargs):
             current_delay_s = initial_delay_s
+
+            # Prepare the function to be called, potentially wrapped by circuit breaker
+            protected_func: Callable[..., Any] = func
+            if pybreaker and circuit_breaker and cb_enabled:
+                # Define a wrapper that can be called by the circuit breaker
+                def cb_wrapper(*f_args, **f_kwargs):
+                    return func(*f_args, **f_kwargs)
+                protected_func = lambda *p_args, **p_kwargs: circuit_breaker.call(cb_wrapper, *p_args, **p_kwargs)
+                # Note: pybreaker's call method itself handles exceptions and CB state.
+                # If it throws CircuitBreakerError, we might want to not retry, or retry differently.
+                # For now, if CircuitBreakerError is raised, it will bypass the gRPC retry logic.
+
             for attempt in range(1, max_attempts + 1):
                 try:
-                    return func(*args, **kwargs)
+                    # Call the (potentially circuit-breaker-protected) function
+                    return protected_func(*args, **kwargs)
+                except pybreaker.CircuitBreakerError as cbe:
+                    # If circuit is open, log and re-raise immediately. No retries.
+                    logger.error(f"Circuit breaker open for {func.__name__}. Call aborted. Error: {cbe}")
+                    raise # Re-raise to signal failure upwards
                 except grpc.RpcError as e:
-                    # Ensure the RpcError instance has a 'code()' method
                     rpc_code = e.code() if hasattr(e, 'code') and callable(e.code) else None
 
                     if rpc_code in retryable_error_codes:
@@ -100,36 +126,41 @@ def retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
         return wrapper
     return decorator
 
-def async_retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
-                          initial_delay_s=DEFAULT_INITIAL_DELAY_S,
-                          backoff_factor=DEFAULT_BACKOFF_FACTOR,
-                          jitter_fraction=DEFAULT_JITTER_FRACTION,
-                          retryable_error_codes=RETRYABLE_ERROR_CODES): # Uses same default retryable codes
+def async_retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+                          initial_delay_s: float = DEFAULT_INITIAL_DELAY_S,
+                          backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+                          jitter_fraction: float = DEFAULT_JITTER_FRACTION,
+                          retryable_error_codes: tuple = RETRYABLE_ERROR_CODES,
+                          circuit_breaker: Optional[pybreaker.CircuitBreaker] = None, # type: ignore
+                          cb_enabled: bool = True):
     """
-    Decorator to automatically retry an ASYNCHRONOUS gRPC call upon specific, typically transient, errors.
-    Uses asyncio.sleep for non-blocking delays.
-    Make sure to import grpc.aio for AioRpcError.
+    Decorator to automatically retry an ASYNCHRONOUS gRPC call, with optional circuit breaker.
     """
-    def decorator(async_func):
+    def decorator(async_func: Callable[..., Any]):
         @wraps(async_func)
         async def wrapper(*args, **kwargs):
             current_delay_s = initial_delay_s
-            # Attempt to import grpc.aio.AioRpcError dynamically or ensure it's available
-            # This is to avoid import error if grpc.aio is not always installed/used,
-            # though for an async decorator, it's a strong prerequisite.
+
+            # Dynamically import AioRpcError as it's specific to grpc.aio
+            AioRpcError: Any = grpc.RpcError # Default fallback
             try:
-                from grpc.aio import AioRpcError
+                from grpc.aio import AioRpcError as ActualAioRpcError
+                AioRpcError = ActualAioRpcError
             except ImportError:
-                # Fallback or raise error if grpc.aio is not available
-                logger.error("grpc.aio.AioRpcError not found. async_retry_grpc_call requires grpc.aio.")
-                # Default to standard RpcError if AioRpcError is not available, though this is not ideal
-                # as async functions should raise AioRpcError.
-                AioRpcError = grpc.RpcError # This is a fallback, not a good one.
+                logger.warning("grpc.aio.AioRpcError not found. Async retry might not catch specific async gRPC errors precisely.")
+
+            protected_async_func: Callable[..., Any] = async_func
+            if pybreaker and circuit_breaker and cb_enabled:
+                # pybreaker's call_async expects an awaitable, so async_func is fine directly
+                protected_async_func = lambda *p_args, **p_kwargs: circuit_breaker.call_async(async_func, *p_args, **p_kwargs)
 
             for attempt in range(1, max_attempts + 1):
                 try:
-                    return await async_func(*args, **kwargs)
-                except AioRpcError as e: # Specifically catch AioRpcError
+                    return await protected_async_func(*args, **kwargs)
+                except pybreaker.CircuitBreakerError as cbe:
+                    logger.error(f"Circuit breaker open for async {async_func.__name__}. Call aborted. Error: {cbe}")
+                    raise
+                except AioRpcError as e: # Catch AioRpcError or fallback RpcError
                     rpc_code = e.code() if hasattr(e, 'code') and callable(e.code) else None
                     if rpc_code in retryable_error_codes:
                         if attempt == max_attempts:
@@ -145,7 +176,7 @@ def async_retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
                             f"with status {rpc_code}. Retrying in {actual_delay_s:.2f}s. "
                             f"Details: {e.details()}", exc_info=False
                         )
-                        await asyncio.sleep(actual_delay_s) # Use asyncio.sleep
+                        await asyncio.sleep(actual_delay_s)
                         current_delay_s *= backoff_factor
                     else:
                         logger.error(
@@ -154,7 +185,9 @@ def async_retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
                             exc_info=True
                         )
                         raise
-                except Exception as e_generic:
+                except Exception as e_generic: # Catch other errors
+                    # If this was a CircuitBreakerError from a non-pybreaker source, it would be caught here.
+                    # However, we explicitly catch pybreaker.CircuitBreakerError above.
                     logger.error(
                         f"A non-gRPC error occurred during async call to {async_func.__name__} (attempt {attempt}/{max_attempts}): {e_generic}",
                         exc_info=True
@@ -164,24 +197,27 @@ def async_retry_grpc_call(max_attempts=DEFAULT_MAX_ATTEMPTS,
                     jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
                     actual_delay_s = max(0, current_delay_s + jitter_value)
                     logger.info(f"Retrying async {async_func.__name__} after non-gRPC error in {actual_delay_s:.2f}s.")
-                    await asyncio.sleep(actual_delay_s) # Use asyncio.sleep
+                    await asyncio.sleep(actual_delay_s)
                     current_delay_s *= backoff_factor
 
-            logger.error(f"Async gRPC call to {async_func.__name__} exhausted attempts.") # Should be unreachable
-            return None # Should ideally not happen
+            # Should be unreachable if max_attempts >=1
+            logger.error(f"Async gRPC call to {async_func.__name__} exhausted attempts without returning or raising.")
+            raise RuntimeError(f"Async call {async_func.__name__} failed after all retries.") # Ensure something is raised
         return wrapper
     return decorator
 
 
 # Example of how to use the decorator (for testing or reference)
 if __name__ == '__main__':
-    # Ensure asyncio is imported for async examples
-    import asyncio
+    import asyncio # Ensure asyncio is imported for async examples
     # Assume grpc.aio is available for AioRpcError testing
     try:
         from grpc.aio import AioRpcError
     except ImportError:
         AioRpcError = grpc.RpcError # Fallback for environments without grpc.aio, for basic testing
+
+    if pybreaker is None:
+        print("pybreaker not installed, circuit breaker tests will be skipped/limited.")
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
