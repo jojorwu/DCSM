@@ -2,3 +2,4 @@ grpcio
 grpcio-tools
 protobuf
 pydantic-settings
+PyYAML>=5.4 # Added for centralized YAML configuration
