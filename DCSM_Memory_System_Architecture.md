@@ -1,0 +1,363 @@
+# DCSM Memory System Architecture
+
+## 1. Introduction
+
+The Distributed Cognitive State Management (DCSM) system provides sophisticated memory capabilities crucial for autonomous agents. This document details the architecture and interplay of its core Python-based memory components: Global Lifetime Memory (GLM), Short-Term Working Memory (SWM), and Knowledge Processing Service (KPS). Together, they enable agents to store, retrieve, process, and utilize information effectively throughout their operational lifecycle.
+
+The memory system is designed to support:
+-   **Persistence:** Long-term storage of critical information, experiences, and learned knowledge.
+-   **Contextual Recall:** Efficient retrieval of relevant information based on current task or query.
+-   **Working Memory:** Temporary storage for in-progress computations, session-specific data, and inter-agent communication.
+-   **Semantic Understanding:** Processing and structuring information to derive deeper meaning and relationships.
+-   **Scalability:** Handling growing volumes of data and concurrent access demands.
+
+## 2. Core Memory Components
+
+The DCSM memory system is composed of three primary services, each with a distinct role:
+
+```mermaid
+graph TD
+    A[Agent/Application Logic] -->|gRPC API| SWM
+    A -->|gRPC API| GLM
+    A -->|gRPC API| KPS
+
+    SWM -->|Data Sync/Cache Eviction| GLM
+    SWM -->|Data for Processing| KPS
+    KPS -->|Processed Data/Embeddings| SWM
+    GLM -->|Data for Processing| KPS
+    KPS -->|Processed Data/Embeddings/Graphs| GLM
+
+
+    subgraph "Memory Services Layer"
+        GLM[(Global Lifetime Memory <br> SQLite)]
+        SWM[(Short-Term Working Memory <br> In-Memory Dict, Redis for Pub/Sub)]
+        KPS[(Knowledge Processing Service <br> Embeddings, Vector Store, Conceptual Graph Logic)]
+    end
+
+    style GLM fill:#f9d,stroke:#333,stroke-width:2px
+    style SWM fill:#9cf,stroke:#333,stroke-width:2px
+    style KPS fill:#ccf,stroke:#333,stroke-width:2px
+    style A fill:#ff9,stroke:#333,stroke-width:2px
+```
+
+### 2.1. Global Lifetime Memory (GLM)
+
+**Purpose:**
+GLM serves as the long-term, persistent memory store for the DCSM system. It is designed to hold information that needs to be retained across agent sessions, system restarts, or even different agent instantiations if the data is shared. This includes factual knowledge, learned experiences, user preferences, historical interactions, and any data deemed valuable for future reference.
+
+**Key Characteristics:**
+-   **Persistence:** Data stored in GLM is durable and survives system shutdowns.
+-   **Structured Storage:** GLM utilizes SQLite, a relational database, providing structured storage with tables, schemas, and SQL querying capabilities.
+-   **Data Types:** Can store various data types including text, numbers, serialized objects (e.g., JSON, Pickle), and potentially references to larger binary data stored elsewhere.
+-   **Scalability:** While SQLite is file-based, its performance is suitable for many agent applications. For extremely large-scale systems, a more distributed database might be considered, but the current implementation focuses on robust single-node persistence.
+-   **Transactional Integrity:** SQLite provides ACID properties, ensuring data consistency.
+
+**Core Functionalities (via gRPC API - defined in `glm_service.proto`):**
+-   `StoreMemory(KEMUri, content, metadata_json)`: Stores a piece of memory (content, typically string or bytes) associated with a KEM URI and JSON string metadata. The KEM URI acts as a primary key.
+-   `RetrieveMemory(KEMUri)`: Retrieves memory content and metadata based on its KEM URI. Returns content and metadata_json.
+-   `QueryMemories(SQLQuery)`: Allows complex querying using SQL against the 'memories' table. This provides powerful and flexible data retrieval but requires careful construction of queries to prevent SQL injection if user inputs are involved (though typically queries would be system-generated).
+-   `DeleteMemory(KEMUri)`: Removes a specific memory item by its KEM URI.
+-   `UpdateMemory(KEMUri, content, metadata_json)`: Modifies an existing memory item.
+-   `ListMemories(limit, offset, optional_filter_kem_uri_prefix)`: Retrieves a list of memory items, with pagination and an optional prefix filter for KEM URIs.
+
+**Internal Implementation (Primarily `glm/glm_node.py` and `glm/database.py`):**
+-   **`GLMNode(Service)` class in `glm_node.py`**: Implements the gRPC service handlers defined in `glm_service.proto`. It instantiates and uses the `Database` class.
+-   **`Database` class in `glm/database.py`**:
+    -   Manages the SQLite connection (`self.conn`).
+    -   Initializes the database by calling `create_table()` on instantiation.
+    -   `create_table()`: Defines the `memories` table schema:
+        -   `id` (INTEGER PRIMARY KEY AUTOINCREMENT)
+        -   `kem_uri` (TEXT UNIQUE NOT NULL)
+        -   `content` (BLOB) - Can store text or binary data.
+        -   `metadata_json` (TEXT) - Stores metadata as a JSON string.
+        -   `created_at` (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+        -   `updated_at` (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+    -   Provides methods corresponding to each gRPC call (e.g., `add_memory`, `get_memory`, `update_memory`, `delete_memory`, `list_memories`, `query_memories_dynamic`).
+    -   Uses parameterized queries (`?`) to prevent SQL injection.
+    -   Metadata is stored as a JSON string, requiring serialization/deserialization in the application logic or service layer.
+-   **KEM URI Handling:** KEM URIs are the designated unique identifiers for memories in GLM. Their structure and generation are external to GLM but crucial for its addressing scheme.
+
+**Use Cases:**
+-   Storing factual knowledge extracted from documents.
+-   Remembering past user interactions and preferences.
+-   Archiving results of completed tasks.
+-   Building a persistent knowledge base over time.
+
+### 2.2. Short-Term Working Memory (SWM)
+
+**Purpose:**
+SWM provides a fast, transient memory space for agents. It's used for storing temporary data relevant to current tasks, session-specific information, intermediate results of computations, and facilitating rapid communication or data sharing between different components or sub-agents working on a collaborative task.
+
+**Key Characteristics:**
+-   **Volatility/Transience:** Data in SWM is typically not expected to persist across extended periods or system restarts (though some caching mechanisms might offer limited persistence). The primary store is in-memory.
+-   **High Speed:** Optimized for low-latency read/write operations.
+-   **Dynamic Data:** Suitable for frequently changing information.
+-   **Communication Hub:** Can act as a message bus or a shared blackboard for different parts of an agent or multiple agents.
+-   **Caching Layer:** Can cache frequently accessed data from GLM or results from KPS to reduce latency.
+
+**Core Functionalities (via gRPC API - defined in `swm_service.proto`):**
+-   `StoreMemory(key, value, ttl_seconds)`: Stores a key-value pair (both strings) in the in-memory store. `ttl_seconds` (int) makes the entry expire. A TTL of 0 means no expiration.
+-   `RetrieveMemory(key)`: Retrieves the value (string) for a given key from the in-memory store.
+-   `DeleteMemory(key)`: Deletes a key-value pair from the in-memory store.
+-   `Publish(topic, message)`: Publishes a message (string) to a given topic using Redis Pub/Sub.
+-   `Subscribe(topic)`: Subscribes to a topic on Redis Pub/Sub, returning a stream of messages (strings).
+-   `ListKeys(prefix)`: Lists keys in the in-memory store that match the given prefix.
+
+**Internal Implementation (Primarily `swm/swm_node.py`, `swm/memory_store.py`, `swm/pubsub_manager.py`, and `common/utils/redis_client.py`):**
+-   **`SWMNode(Service)` class in `swm_node.py`**: Implements the gRPC service handlers.
+    -   Uses `MemoryStore` for key-value operations.
+    -   Uses `PubSubManager` for publish/subscribe operations.
+-   **`MemoryStore` class in `swm/memory_store.py`**:
+    -   Manages an in-memory dictionary (`self.data`) for storing key-value pairs.
+    -   Uses a separate dictionary (`self.expirations`) and a `threading.Timer` for each key with a TTL to handle expirations.
+    -   Provides methods like `set_value`, `get_value`, `delete_value`, `list_keys_by_prefix`.
+    -   Thread-safety is managed using `threading.Lock` (`self.lock`) for concurrent access to data and expirations.
+-   **`PubSubManager` class in `swm/pubsub_manager.py`**:
+    -   Manages interactions with Redis for pub/sub.
+    -   Initializes a `RedisClient` from `common.utils.redis_client.py`.
+    -   `publish(topic, message)`: Uses the Redis client's `publish` method.
+    -   `subscribe(topic)`: Uses the Redis client's `subscribe` method, which returns a generator yielding messages from the Redis pubsub object.
+-   **`RedisClient` class in `common/utils/redis_client.py`**:
+    -   A wrapper around the `redis.Redis` client.
+    -   Manages connection to the Redis server (host and port configured via environment variables `REDIS_HOST`, `REDIS_PORT`).
+    -   Provides `publish_message` and `subscribe_to_topic` methods.
+
+**Interaction with GLM/KPS:**
+-   SWM primarily acts as a fast, temporary layer. It can cache data retrieved from GLM (application-level logic would handle this caching).
+-   It can hold intermediate data that is being actively processed, which might then be sent to KPS for further analysis or to GLM for long-term storage.
+-   The pub/sub feature is crucial for real-time notifications and coordination between different services or agent components that might react to events or new data in SWM.
+
+**Interaction with GLM/KPS:**
+-   SWM can cache data retrieved from GLM to speed up access.
+-   SWM can hold intermediate data that is then processed by KPS, with results potentially stored back in SWM or committed to GLM.
+-   Data intended for long-term storage that first lands in SWM (e.g., during a fast-moving task) might be periodically flushed or explicitly moved to GLM.
+
+**Use Cases:**
+-   Storing the current state of a multi-step task.
+-   Holding sensory input or observations that are being actively processed.
+-   Caching user profile information for the current session.
+-   Facilitating real-time message passing between agent modules.
+-   Scratchpad for complex calculations.
+
+### 2.3. Knowledge Processing Service (KPS)
+
+**Purpose:**
+KPS is responsible for more advanced processing and understanding of the data stored in GLM and SWM. It aims to transform raw information into structured knowledge, enabling semantic search, inference, and the discovery of relationships within the data.
+
+**Key Characteristics:**
+-   **Semantic Understanding:** Goes beyond keyword matching to understand the meaning and context of data.
+-   **Knowledge Structuring:** May involve creating knowledge graphs, generating embeddings, or classifying/tagging data.
+-   **Advanced Querying:** Supports queries based on semantic similarity, relationships, or patterns rather than just exact matches.
+-   **Computational Intensity:** KPS tasks (e.g., embedding generation, graph analysis) can be computationally expensive.
+
+**Core Functionalities (via gRPC API - defined in `kps_service.proto`):**
+-   `AddMemory(kem_uri, content)`: Adds content to the KPS. KPS generates an embedding for the content and stores the KEM URI, content, and embedding in its vector store.
+-   `RetrieveMemory(kem_uri)`: Retrieves the original content associated with a KEM URI directly from its internal storage (if KPS stores it) or potentially from GLM. (Based on `kps_node.py`, it appears KPS stores content alongside embeddings in its vector store).
+-   `QueryNearestNeighbors(kem_uri, k)`: Finds the `k` most semantically similar memories to the memory identified by `kem_uri`. It retrieves the embedding for the given `kem_uri` and queries the vector store.
+-   `QueryNearestNeighborsByVector(vector, k)`: Finds the `k` most semantically similar memories to a provided query vector.
+-   `RemoveMemory(kem_uri)`: Removes a memory (and its embedding) from the KPS vector store.
+-   `BatchAddMemories(memories)`: Adds multiple memories in a batch. Each memory includes a KEM URI and content.
+-   `BatchRemoveMemories(kem_uris)`: Removes multiple memories in a batch.
+-   `GetAllMemories(page_size, page_token)`: Retrieves all memories with pagination.
+
+**Internal Implementation (Primarily `kps/kps_node.py`, `kps/embedding_service.py`, and `common/utils/vector_store_utils.py`):**
+-   **`KPSNode(Service)` class in `kps_node.py`**: Implements the gRPC service handlers.
+    -   Initializes an `EmbeddingService` to generate embeddings.
+    -   Initializes a `VectorStore` (e.g., `ChromaVectorStore` from `common.utils.vector_store_utils`) to store and query embeddings along with their associated KEM URIs and content.
+        -   The ChromaDB collection name is configurable via the `KPS_COLLECTION_NAME` environment variable.
+        -   ChromaDB can be run in-memory or in a client/server mode, configured by `CHROMA_MODE` and related environment variables (`CHROMA_HOST`, `CHROMA_PORT`).
+-   **`EmbeddingService` class in `kps/embedding_service.py`**:
+    -   Responsible for generating vector embeddings from text content.
+    -   Uses a pre-trained model from the `sentence-transformers` library (e.g., 'all-MiniLM-L6-v2' or configurable via `EMBEDDING_MODEL_NAME` environment variable).
+    -   Provides an `embed_text(text)` method.
+-   **Vector Store (`ChromaVectorStore` in `common/utils/vector_store_utils.py`)**:
+    -   Abstracts interactions with ChromaDB.
+    -   Methods include `add_documents`, `get_document_by_id`, `query_neighbors`, `delete_documents`, `get_all_documents`.
+    -   Stores embeddings, KEM URIs (as document IDs), and the original content (as document metadata). This means KPS maintains its own copy of the content it processes.
+-   **Knowledge Graph Management:** The current codebase primarily focuses on vector embeddings and semantic search. While "Knowledge Processing" is in its name, explicit knowledge graph construction and querying (e.g., using SPARQL/Cypher or graph databases like Neo4j) are not directly implemented in the provided file structure. This remains a conceptual or future capability.
+
+**Interaction with GLM/SWM:**
+-   **Data Source:** KPS typically processes content that might originate from GLM (for persistent, historical data) or SWM (for new, transient data). The agent application logic would be responsible for feeding data from GLM/SWM to KPS's `AddMemory` or `BatchAddMemories` endpoints.
+-   **Output Storage:**
+    -   KPS stores embeddings, KEM URIs, and a copy of the content in its own vector store (ChromaDB).
+    -   There isn't an explicit mechanism shown where KPS writes its processed artifacts (like embeddings) *back* to GLM as separate columns or tables. Instead, KPS serves as a specialized store for semantically searchable data.
+-   **Querying:** Agents query KPS for semantic similarity. The results (KEM URIs and potentially content/scores) can then be used to:
+    -   Retrieve full, original data from GLM if KPS only returns URIs/summaries (though current KPS seems to store full content).
+    -   Inform subsequent operations or reasoning processes.
+    -   Results from KPS could be temporarily cached in SWM by the application.
+
+**Use Cases:**
+-   Finding relevant documents or past experiences based on the meaning of a query, not just keywords.
+-   Discovering hidden relationships between different pieces of information.
+-   Answering complex questions that require synthesizing information from multiple sources.
+-   Proactively suggesting relevant information to the agent based on context.
+
+## 3. Data Flow and Interactions
+
+The three memory components work in concert, with data flowing between them and the agent's application logic.
+
+**Typical Data Flow Scenarios:**
+
+1.  **New Information Ingestion (for long-term storage):**
+    ```mermaid
+    sequenceDiagram
+        participant A as Agent/App
+        participant SWM
+        participant GLM
+        participant KPS
+
+        A->>SWM: StoreMemory(temp_key, new_data_chunk)
+        Note right of SWM: Initial data capture, e.g., from user input or sensor
+        SWM-->>A: Ack
+
+        A->>GLM: StoreMemory(kem_uri, full_new_data, metadata_json)
+        Note right of GLM: Persisting the complete information
+        GLM-->>A: Ack
+
+        A->>KPS: AddMemory(kem_uri, full_new_data)
+        Note right of KPS: KPS generates embedding, stores in ChromaDB
+        KPS-->>A: Ack
+    ```
+    *Self-correction: The original diagram implied KPS writes back to GLM. Based on code, KPS maintains its own store. Agent orchestrates data flow.*
+
+2.  **Retrieving Information (Cached KEM URI Lookup):**
+    ```mermaid
+    sequenceDiagram
+        participant A as Agent/App
+        participant SWM
+        participant GLM
+
+        A->>SWM: RetrieveMemory(cached_kem_uri_content_key)
+        alt Cache Hit in SWM
+            SWM-->>A: Cached Content
+        else Cache Miss in SWM
+            SWM-->>A: Not Found
+            A->>GLM: RetrieveMemory(kem_uri)
+            GLM-->>A: Content from GLM
+            A->>SWM: StoreMemory(cached_kem_uri_content_key, Content, short_ttl) # Optional: Cache in SWM
+            SWM-->>A: Ack
+        end
+    ```
+
+3.  **Semantic Search via KPS:**
+    ```mermaid
+    sequenceDiagram
+        participant A as Agent/App
+        participant KPS
+        participant GLM
+
+        A->>KPS: QueryNearestNeighborsByVector(query_vector, k=5)
+        Note right of KPS: KPS queries ChromaDB
+        KPS-->>A: List of {kem_uri, content, score}
+
+        Note over A,KPS: Agent receives results directly from KPS (content included).
+        Note over A,GLM: Agent might use KEM URIs to fetch additional metadata from GLM if needed.
+        loop For each relevant result from KPS
+            A->>GLM: RetrieveMemory(kem_uri) # To get original metadata or verify
+            GLM-->>A: Full MemoryItem (content, metadata_json)
+        end
+    ```
+    *Self-correction: KPS `QueryNearestNeighbors` returns KEM URIs, content, and distances. The agent can use this directly or choose to fetch the original full record from GLM if KPS's stored content is only partial or if more metadata is needed from GLM.*
+
+4.  **Inter-Component Notification via SWM Pub/Sub:**
+    ```mermaid
+    sequenceDiagram
+        participant Module1 as Agent Module 1
+        participant SWM
+        participant Module2 as Agent Module 2
+
+        Module2->>SWM: Subscribe(topic_X)
+        SWM-->>Module2: Subscription Ack
+        Module1->>SWM: Publish(topic_X, message_data)
+        SWM-->>Module1: Publish Ack
+        SWM->>Module2: Stream message_data
+    ```
+
+## 4. Key Management and Addressing (KEM URIs)
+
+-   **KEM (Knowledge Encapsulation Module) URIs** are the designated unique identifiers for discrete pieces of knowledge or memory items within the DCSM ecosystem.
+-   **Purpose:** They provide a standardized and unique way to address specific memory objects across different services (GLM, KPS, and by agents/applications).
+-   **Structure & Generation:**
+    -   The exact structure and generation logic for KEM URIs are typically defined by utility functions within the broader agent framework (e.g., conceptually similar to `kemIdUtils.js` in a JavaScript ecosystem, or a Python equivalent within `common.utils` or agent SDKs).
+    -   A KEM URI might encode information such as:
+        -   `kem:<namespace>:<type>:<unique_id>`
+        -   `kem:user_profile:text_preferences:user123_abc`
+        -   `kem:project_alpha:research_document:doc789_section2`
+    -   They must be unique to avoid collisions. UUIDs are often incorporated into the `unique_id` part.
+-   **Usage in Services:**
+    -   **GLM:** Uses KEM URIs as the primary key (`kem_uri` column) for its `memories` table, ensuring each persistent memory item is uniquely addressable.
+    -   **KPS:** Uses KEM URIs as document IDs within its vector store (ChromaDB). This links the embeddings and content stored in KPS back to the conceptual memory item. When KPS returns search results, it provides the KEM URIs of matching items.
+    -   **SWM:** While SWM's in-memory store uses arbitrary string keys, these keys *can* be KEM URIs if the data being stored corresponds to a conceptual KEM. This is an application-level decision.
+-   **Benefits:**
+    -   **Unambiguous Referencing:** Allows different parts of the system to refer to the same piece of information consistently.
+    -   **Inter-Service Linking:** KPS results (KEM URIs) can be used to retrieve detailed metadata or original context from GLM.
+    -   **Organization:** Helps in categorizing and organizing memories based on the URI structure.
+
+## 5. Use Cases / Examples (System-Level)
+
+-   **Personalized Agent Behavior:**
+    -   GLM stores user preferences, past interactions, and feedback.
+    -   SWM holds current session context (e.g., recent user queries).
+    -   KPS helps understand user intent from new queries by comparing them semantically with past interactions stored in GLM.
+-   **Research and Analysis Task:**
+    -   Agent collects information from various sources.
+    -   Raw data is initially stored in SWM for quick processing.
+    -   Key findings and processed summaries are committed to GLM with appropriate KEM URIs.
+    -   KPS processes these findings to generate embeddings and identify relationships between different pieces of research.
+    -   The agent can later perform semantic searches via KPS to find relevant research when tackling new, related questions.
+-   **Collaborative Problem Solving (Multiple Agent Modules):**
+    -   Different modules (e.g., a planning module, an execution module, a monitoring module) communicate state and intermediate results via SWM's pub/sub or shared key-value store.
+    -   Critical decisions or final outcomes from the collaboration can be logged into GLM for audit or future learning.
+
+## 6. Scalability and Persistence
+
+-   **GLM (SQLite):**
+    -   **Persistence:** High (data stored on disk).
+    -   **Scalability:** Limited by the single-file nature of SQLite. Scales well for single-server deployments with moderate write loads and high read loads. For very large datasets or high concurrent writes, migrating to a client-server RDBMS (e.g., PostgreSQL, MySQL) or a NoSQL database designed for scale might be necessary. The current design prioritizes ease of deployment and robustness for typical agent scenarios.
+-   **SWM (In-Memory + Redis):**
+    -   **Persistence:** Low for in-memory parts (lost on restart unless backed by a persistent cache). If Redis is used for pub/sub or caching, Redis persistence options (RDB snapshots, AOF logs) can provide durability.
+    -   **Scalability:** In-memory store is limited by available RAM. Redis is highly scalable and can be clustered, making SWM (if reliant on Redis) very scalable for caching and messaging. Python's in-process pub/sub would be limited to a single process.
+-   **KPS (Depends on Backends):**
+    -   **Persistence:** Depends on where it stores its artifacts. If embeddings/graphs are stored in GLM, persistence is high. If stored in a dedicated vector/graph database, that database's persistence characteristics apply.
+    -   **Scalability:** Processing can be computationally intensive. KPS nodes could be scaled horizontally (more instances) if tasks are parallelizable. Scalability of semantic search depends heavily on the chosen vector store solution.
+
+## 7. API Reference (Conceptual Summary)
+
+This summarizes the primary gRPC service methods for each memory component. Refer to the respective `.proto` files (`glm_service.proto`, `swm_service.proto`, `kps_service.proto`) for detailed message definitions.
+
+**Global Lifetime Memory (GLM) - `glm.GLMService` (from `glm_service.proto`)**
+-   `StoreMemory(kem_uri: str, content: bytes, metadata_json: str) returns (StoreMemoryResponse)`
+-   `RetrieveMemory(kem_uri: str) returns (MemoryItem)`
+-   `QueryMemories(query: str) returns (stream MemoryItem)`
+-   `DeleteMemory(kem_uri: str) returns (DeleteMemoryResponse)`
+-   `UpdateMemory(kem_uri: str, content: bytes, metadata_json: str) returns (UpdateMemoryResponse)`
+-   `ListMemories(limit: int, offset: int, kem_uri_prefix: str) returns (stream MemoryItem)`
+
+**Short-Term Working Memory (SWM) - `swm.SWMService` (from `swm_service.proto`)**
+-   `StoreMemory(key: str, value: str, ttl_seconds: int) returns (StoreMemoryResponse)`
+-   `RetrieveMemory(key: str) returns (MemoryItem)`
+-   `DeleteMemory(key: str) returns (DeleteMemoryResponse)`
+-   `Publish(topic: str, message: str) returns (PublishResponse)`
+-   `Subscribe(topic: str) returns (stream Message)`
+-   `ListKeys(prefix: str) returns (ListKeysResponse)`
+
+**Knowledge Processing Service (KPS) - `kps.KPSService` (from `kps_service.proto`)**
+-   `AddMemory(kem_uri: str, content: str) returns (AddMemoryResponse)`
+-   `BatchAddMemories(memories: list<MemoryContent>) returns (BatchAddMemoriesResponse)`  (*MemoryContent contains kem_uri, content*)
+-   `RetrieveMemory(kem_uri: str) returns (MemoryContent)`
+-   `QueryNearestNeighbors(kem_uri: str, k: int) returns (QueryResults)` (*QueryResults contains list of ResultItem: kem_uri, content, distance*)
+-   `QueryNearestNeighborsByVector(vector: list<float>, k: int) returns (QueryResults)`
+-   `RemoveMemory(kem_uri: str) returns (RemoveMemoryResponse)`
+-   `BatchRemoveMemories(kem_uris: list<str>) returns (BatchRemoveMemoriesResponse)`
+-   `GetAllMemories(page_size: int, page_token: str) returns (GetAllMemoriesResponse)` (*GetAllMemoriesResponse contains list of MemoryContent and next_page_token*)
+
+## 8. Future Considerations / Potential Enhancements
+
+-   **Distributed GLM:** For very large-scale applications, replacing SQLite with a distributed SQL/NoSQL database.
+-   **Advanced KPS Capabilities:** Integration of more sophisticated NLP models, reasoning engines, or automated knowledge discovery algorithms.
+-   **Cross-Service Transactions:** Implementing distributed sagas or two-phase commit patterns if operations need to atomically span multiple memory services (e.g., ensuring KPS processing is transactionally linked with GLM storage). This adds significant complexity.
+-   **Security & Access Control:** Finer-grained access control policies for memory access, especially in multi-tenant or multi-agent scenarios.
+-   **Memory Versioning:** Implementing mechanisms to store and retrieve different versions of memory items.
+-   **Automated Memory Tiering:** Policies to automatically move data between SWM and GLM based on access patterns or age.
+
+This document provides a comprehensive overview of the DCSM Python-based memory system. By understanding the roles and interactions of GLM, SWM, and KPS, developers can effectively leverage these components to build intelligent and context-aware autonomous agents.
