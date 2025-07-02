@@ -39,6 +39,24 @@ class GLMConfig(BaseServiceConfig):
     # или оно будет наследоваться из BaseServiceConfig (INFO)
     # LOG_LEVEL: str = "INFO"
 
+    # Storage backend selection
+    GLM_STORAGE_BACKEND_TYPE: str = Field(
+        default="default_sqlite_qdrant",
+        description="Type of persistent storage backend to use. E.g., 'default_sqlite_qdrant'."
+    )
+    # Placeholder for backend-specific config block, if needed in future (e.g. using discriminated unions)
+    # GLM_STORAGE_BACKEND_CONFIG: Dict[str, Any] = Field(default_factory=dict)
+
+
+    # Re-adding fields that were present in more recent versions from other tasks
+    SQLITE_CONNECT_TIMEOUT_S: int = Field(default=10, description="SQLite connection timeout in seconds.")
+    QDRANT_CLIENT_TIMEOUT_S: int = Field(default=10, description="Timeout for Qdrant client operations in seconds.")
+    QDRANT_DEFAULT_DISTANCE_METRIC: str = Field(default="COSINE", description="Default distance metric for Qdrant collections (e.g. COSINE, DOT, EUCLID).") # Kept as str, QdrantKemRepository converts to enum
+    QDRANT_PREFLIGHT_CHECK_TIMEOUT_S: int = Field(default=2, description="Timeout for Qdrant pre-flight check in seconds.")
+
+    HEALTH_CHECK_SQLITE_QUERY: str = Field(default="SELECT 1", description="SQLite query for health check.")
+    HEALTH_CHECK_QDRANT_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for Qdrant health check operation.")
+
 
 if __name__ == '__main__':
     # Пример использования и тестирования этой конфигурации

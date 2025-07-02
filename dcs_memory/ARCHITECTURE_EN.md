@@ -29,20 +29,21 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 ### 3.2. Global/Long-Term Memory Service (GLM)
 
 *   **Location:** `dcs_memory/services/glm/`
-*   **Purpose:** Provides reliable and scalable persistent storage for all KEMs in the system.
-*   **Core Functions:**
+*   **Purpose:** Provides reliable and scalable persistent storage for all KEMs in the system. Internally, GLM uses a `BasePersistentStorageRepository` abstraction, allowing for different storage backends to be configured.
+*   **Core Functions:** (These are exposed via its gRPC API and fulfilled by the configured storage backend)
     *   Storing KEMs, including their content, metadata, and vector embeddings.
-    *   Retrieving KEMs by their unique identifiers.
-    *   Complex querying of KEMs using metadata filtering and date ranges.
-    *   Vector searchsimilarity search based on embeddings to find semantically similar KEMs.
+    *   Retrieving KEMs by their unique identifiers or complex criteria.
+    *   Vector similarity search.
     *   Updating and deleting existing KEMs.
-    *   **Write Conflict Handling**: When saving KEMs (`StoreKEM`, `BatchStoreKEMs`) with an existing ID, the data is overwritten (logic of `INSERT OR REPLACE` in SQLite and `upsert` in Qdrant).
-    *   **Batch Storing and Consistency (`BatchStoreKEMs`)**: The `BatchStoreKEMs` method attempts to save each KEM in the batch. If embeddings for any KEM (if present) cannot be saved to Qdrant, the corresponding record for that KEM is deleted from SQLite to maintain basic consistency between metadata and vector stores. Internally, Qdrant updates for batches are optimized by sending points to Qdrant in a single batch call where possible.
-    *   **Error Handling**: GLM aims to handle errors during its operations (especially multi-datastore writes involving SQLite and Qdrant) gracefully. It attempts compensating actions where appropriate (e.g., rolling back a SQLite change if a subsequent Qdrant write fails for a given KEM, or vice-versa during `StoreKEM` and `BatchStoreKEMs`). It returns standard gRPC status codes like `INVALID_ARGUMENT` for bad requests, `NOT_FOUND` if a KEM doesn't exist for an update/delete, `UNAVAILABLE` if a backend like Qdrant is temporarily down (especially if this prevents all relevant parts of a batch operation), or `INTERNAL` for other unexpected server-side issues.
-*   **Technologies (current implementation):**
-    *   gRPC for API definition and serving.
-    *   Qdrant: Used as a vector database for storing embeddings and performing similarity searches.
-    *   SQLite: Used for storing structured metadata and the main content of KEMs.
+    *   Batch operations for storage.
+*   **Error Handling**: The GLM service translates exceptions from the storage backend (e.g., `KemNotFoundError`, `BackendUnavailableError`) into appropriate gRPC status codes (`NOT_FOUND`, `UNAVAILABLE`, `INTERNAL`, etc.). Compensating actions for consistency (e.g., between metadata and vector stores if they are separate in a backend implementation) are the responsibility of the concrete storage repository implementation.
+*   **Storage Backend (Current Default Implementation - `DefaultGLMRepository`):**
+    *   **Type:** Configured via `GLM_STORAGE_BACKEND_TYPE: "default_sqlite_qdrant"` in `config.yml`.
+    *   **Technologies Used by Default Backend:**
+        *   SQLite: For storing structured metadata and the main content of KEMs.
+        *   Qdrant: As a vector database for storing embeddings and performing similarity searches.
+    *   **Consistency in Default Backend:** The `DefaultGLMRepository` attempts to maintain consistency between SQLite and Qdrant using compensating actions (e.g., rolling back a SQLite write if a Qdrant write fails for a KEM, or vice-versa).
+*   **API (gRPC - `glm_service.proto`):** (Remains externally consistent)
 *   **API (gRPC - `glm_service.proto`):**
     *   `StoreKEM`: Saves or updates a single KEM. Generates an ID if not provided.
     *   `RetrieveKEMs`: Retrieves KEMs based on complex criteria, including filters, vector queries, and pagination.
