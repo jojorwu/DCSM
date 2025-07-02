@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 import grpc
+import grpc.aio # For async context
 import time
 import asyncio # For async tests
 
@@ -34,13 +35,11 @@ def create_kem_proto_for_test(id_str: str, content_str: str = "content") -> kem_
     return kem
 
 def create_rpc_error(code, details="Test RpcError from SWM test"):
-    error = grpc.RpcError(details) # This is for sync gRPC
-    # For grpc.aio, it would be grpc.aio.AioRpcError
-    # The decorator handles both, but for manual creation, be specific if testing async paths.
-    # Let's assume this mock error is for the sync parts or will be adapted by mocks.
-    error.code = lambda: code
-    error.details = lambda: details
-    return error
+    # For grpc.aio, AioRpcError should be used for more precise mocking if needed
+    # However, the retry decorator is designed to catch generic grpc.RpcError as well for sync stubs
+    # For testing async methods that might raise AioRpcError specifically:
+    return grpc.aio.AioRpcError(code, initial_metadata=None, trailing_metadata=None, details=details)
+
 
 class TestSWMRetryLogic(unittest.IsolatedAsyncioTestCase): # Changed for async tests
 
@@ -56,11 +55,7 @@ class TestSWMRetryLogic(unittest.IsolatedAsyncioTestCase): # Changed for async t
         self.mock_glm_aio_channel_instance = MagicMock(spec=grpc.aio.Channel) # Mock for async channel
         self.mock_grpc_aio_channel.return_value = self.mock_glm_aio_channel_instance
 
-
-        self.mock_time_sleep_patcher_common = patch('dcs_memory.common.grpc_utils.asyncio.sleep') # Patch asyncio.sleep for async decorator
-        self.mock_asyncio_sleep_common = self.mock_time_sleep_patcher_common.start()
-
-        # Mock aioredis and RedisKemCache as SWMServiceImpl depends on them
+        # Patch aioredis and RedisKemCache as SWMServiceImpl depends on them
         self.mock_aioredis_patch = patch('dcs_memory.services.swm.app.main.aioredis')
         self.mock_aioredis = self.mock_aioredis_patch.start()
         self.mock_redis_client = MagicMock()
@@ -71,13 +66,17 @@ class TestSWMRetryLogic(unittest.IsolatedAsyncioTestCase): # Changed for async t
         self.mock_redis_kem_cache_instance = self.MockRedisKemCache.return_value
 
 
+        # Мокируем asyncio.sleep in common.grpc_utils
+        self.mock_asyncio_sleep_patcher_common = patch('dcs_memory.common.grpc_utils.asyncio.sleep')
+        self.mock_asyncio_sleep_common = self.mock_asyncio_sleep_patcher_common.start()
+
         test_swm_config = SWMConfig(
             RETRY_MAX_ATTEMPTS = 3,
             RETRY_INITIAL_DELAY_S = 0.01,
             RETRY_BACKOFF_FACTOR = 1.5,
-            CIRCUIT_BREAKER_ENABLED = False,
+            CIRCUIT_BREAKER_ENABLED = False, # Disable CB for focused retry test
             GLM_SERVICE_ADDRESS = "mock_glm_address",
-            SWM_REDIS_HOST = "mock_redis",
+            SWM_REDIS_HOST = "mock_redis", # Prevent real Redis connection
             # Add other minimal required fields for SWMConfig if any
             GLM_PERSISTENCE_QUEUE_MAX_SIZE=10, GLM_PERSISTENCE_BATCH_SIZE=1,
             GLM_PERSISTENCE_FLUSH_INTERVAL_S=0.1, GLM_PERSISTENCE_BATCH_MAX_RETRIES=1,
@@ -89,17 +88,17 @@ class TestSWMRetryLogic(unittest.IsolatedAsyncioTestCase): # Changed for async t
             REDIS_DLQ_KEY="test_dlq", DLQ_MAX_SIZE=10
         )
         self.swm_service = SharedWorkingMemoryServiceImpl(config=test_swm_config)
-        # Explicitly set retry params on the service's config object for clarity in tests
-        self.swm_service.config.RETRY_MAX_ATTEMPTS = 3
-        self.swm_service.config.RETRY_INITIAL_DELAY_S = 0.01
-        self.swm_service.config.RETRY_BACKOFF_FACTOR = 1.5
-        self.swm_service.config.CIRCUIT_BREAKER_ENABLED = False
+        # Ensure the service starts its background tasks if needed for the methods being tested
+        # For these specific retry tests, direct calls to GLM client methods are made,
+        # so starting all SWM background tasks might not be necessary if they interfere or have unmocked deps.
+        # await self.swm_service.start_background_tasks() # Consider if needed
 
 
     async def asyncTearDown(self): # Renamed and made async
+        # await self.swm_service.stop_background_tasks() # Match start_background_tasks if used
         self.mock_glm_stub_patcher.stop()
-        self.mock_grpc_aio_channel_patcher.stop() # Stop async channel mock
-        self.mock_time_sleep_patcher_common.stop()
+        self.mock_grpc_aio_channel_patcher.stop()
+        self.mock_asyncio_sleep_patcher_common.stop()
         self.mock_aioredis_patch.stop()
         self.mock_redis_kem_cache_patch.stop()
 
@@ -109,10 +108,9 @@ class TestSWMRetryLogic(unittest.IsolatedAsyncioTestCase): # Changed for async t
         mock_kem_proto = kem_pb2.KEM(id=kem_id)
         success_response_glm = glm_service_pb2.RetrieveKEMsResponse(kems=[mock_kem_proto])
 
-        # Simulate AioRpcError for async client calls
         self.mock_glm_stub_instance.RetrieveKEMs.side_effect = [
-            grpc.aio.AioRpcError(grpc.StatusCode.UNAVAILABLE, initial_metadata=None, trailing_metadata=None, details="Test Unavailable"),
-            grpc.aio.AioRpcError(grpc.StatusCode.UNAVAILABLE, initial_metadata=None, trailing_metadata=None, details="Test Unavailable"),
+            create_rpc_error(grpc.StatusCode.UNAVAILABLE),
+            create_rpc_error(grpc.StatusCode.UNAVAILABLE),
             success_response_glm
         ]
 
@@ -120,12 +118,9 @@ class TestSWMRetryLogic(unittest.IsolatedAsyncioTestCase): # Changed for async t
             query_for_glm=glm_service_pb2.KEMQuery(ids=[kem_id])
         )
 
-        # Mock the _put_kem_to_cache_and_notify_async method
-        with patch.object(self.swm_service, '_put_kem_to_cache_and_notify_async', new_callable=MagicMock) as mock_put_kem:
-            # Make the mock an async function
-            async def async_mock_put_kem(*args, **kwargs):
-                return None
-            mock_put_kem.side_effect = async_mock_put_kem
+        with patch.object(self.swm_service, '_put_kem_to_cache_and_notify_async') as mock_put_kem:
+            async def async_mock_put_kem_side_effect(*args, **kwargs): return None
+            mock_put_kem.side_effect = async_mock_put_kem_side_effect
 
             response = await self.swm_service.LoadKEMsFromGLM(request, MagicMock(spec=grpc.aio.ServicerContext))
 
@@ -138,13 +133,11 @@ class TestSWMRetryLogic(unittest.IsolatedAsyncioTestCase): # Changed for async t
 
     async def test_load_kems_from_glm_retry_fail_all_attempts(self): # Made async
         """Тест: LoadKEMsFromGLM неуспешно после всех попыток."""
-        self.mock_glm_stub_instance.RetrieveKEMs.side_effect = grpc.aio.AioRpcError(grpc.StatusCode.UNAVAILABLE, initial_metadata=None, trailing_metadata=None, details="Test Unavailable")
-
+        self.mock_glm_stub_instance.RetrieveKEMs.side_effect = create_rpc_error(grpc.StatusCode.UNAVAILABLE)
 
         request = swm_service_pb2.LoadKEMsFromGLMRequest(
             query_for_glm=glm_service_pb2.KEMQuery(ids=["kem1"])
         )
-
         mock_context = MagicMock(spec=grpc.aio.ServicerContext)
 
         with self.assertRaises(grpc.aio.AioRpcError) as cm:
@@ -153,40 +146,13 @@ class TestSWMRetryLogic(unittest.IsolatedAsyncioTestCase): # Changed for async t
         self.assertEqual(cm.exception.code(), grpc.StatusCode.UNAVAILABLE)
         self.assertEqual(self.mock_glm_stub_instance.RetrieveKEMs.call_count, 3)
         self.assertEqual(self.mock_asyncio_sleep_common.call_count, 2)
-        mock_context.abort.assert_not_called() # Decorator re-raises, SWM service might catch and abort or return error response.
-                                              # Current LoadKEMsFromGLM catches and aborts.
+        # The method now re-raises the RpcError if all retries fail.
+        # If it were to call context.abort(), this mock would check that.
+        # For now, checking the re-raised exception is correct.
+        mock_context.abort.assert_not_called()
 
-    # test_publish_kem_to_glm_retry_success needs significant rework
-    # as PublishKEMToSWM queues to a worker, and that worker calls _glm_batch_store_kems_async_with_retry.
-    # Testing the retry on _glm_batch_store_kems_async_with_retry would be more direct.
-    # For now, commenting out this specific test as it's not testing the decorator as intended.
-
-    # async def test_publish_kem_to_glm_retry_success(self):
-    #     """Тест: PublishKEMToSWM (с persist_to_glm) успешно после ошибок GLM.StoreKEM."""
-    #     kem_to_publish = create_kem_proto_for_test("kem_publish_retry")
-    #     mock_glm_store_response = glm_service_pb2.StoreKEMResponse(kem=kem_to_publish)
-
-    #     self.mock_glm_stub_instance.StoreKEM.side_effect = [ # This mock is for StoreKEM, but worker uses BatchStoreKEMs
-    #         create_rpc_error(grpc.StatusCode.UNAVAILABLE),
-    #         mock_glm_store_response
-    #     ]
-
-    #     with patch.object(self.swm_service.redis_kem_cache, 'contains', return_value=False) as mock_contains, \
-    #          patch.object(self.swm_service.redis_kem_cache, 'set') as mock_set, \
-    #          patch.object(self.swm_service.subscription_manager, 'notify_kem_event') as mock_notify:
-
-    #         request = swm_service_pb2.PublishKEMToSWMRequest(
-    #             kem_to_publish=kem_to_publish,
-    #             persist_to_glm_if_new_or_updated=True
-    #         )
-    #         response = await self.swm_service.PublishKEMToSWM(request, MagicMock(spec=grpc.aio.ServicerContext))
-
-    #         self.assertTrue(response.published_to_swm)
-    #         self.assertTrue(response.queued_for_glm_persistence)
-    #         # The worker would make the call, so StoreKEM mock on stub won't be hit directly here.
-    #         # Need to check queue or mock worker's call.
-    #         self.assertFalse(self.swm_service.glm_persistence_queue.empty())
-
+    # Commenting out test_publish_kem_to_glm_retry_success as it needs more involved mocking
+    # of the background persistence worker or direct testing of _glm_batch_store_kems_async_with_retry.
 
 if __name__ == '__main__':
     unittest.main()
