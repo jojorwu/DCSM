@@ -330,7 +330,7 @@ class SWMConfig(BaseServiceConfig):
 
 # Note: The __main__ block below is for quick testing of this config.py file directly.
 # For it to work correctly with the new YAML loading, you'd need a sample 'config.yml'
-# in the same directory or point DCSM_CONFIG_FILE env var to it.
+    # in the same directory or point DCSM_CONFIG_FILE env var to it.
 if __name__ == '__main__':
     # Create a dummy config.yml for testing
     dummy_config_content = """
@@ -412,5 +412,3 @@ swm:
     except OSError:
         pass
     print("\n--- Config test complete ---")
-
-```

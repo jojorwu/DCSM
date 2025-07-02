@@ -6,6 +6,7 @@ import sys
 import os
 import uuid
 import logging
+import json # Added import for json
 # import threading # No longer needed if IndexedLRUCache is fully replaced by Redis logic
 import random
 
@@ -17,6 +18,7 @@ import typing
 from typing import Optional, List, Set, Dict, Callable, AsyncGenerator, Tuple
 
 from dcs_memory.common.grpc_utils import async_retry_grpc_call # Import async retry decorator
+from google.protobuf.timestamp_pb2 import Timestamp # Added import for Timestamp
 
 # Attempt to import aioredis
 try:
@@ -1066,5 +1068,3 @@ if __name__=='__main__':
     except KeyboardInterrupt: logger.info("SWM main process interrupted by user.")
     except SystemExit as e_sysexit: logger.info(f"SWM main process exited: {e_sysexit}")
     except Exception as e_main: logger.critical(f"SWM main unhandled exception: {e_main}",exc_info=True)
-
-```

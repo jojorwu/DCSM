@@ -294,5 +294,3 @@ if __name__ == '__main__':
     except ConnectionError as e: logger.error(f"CONNECTION ERROR: {e}")
     except grpc.RpcError as e: logger.error(f"gRPC ERROR: code={e.code()}, details={e.details()}")
     except Exception as e: logger.error(f"UNEXPECTED ERROR: {e}", exc_info=True)
-
-```

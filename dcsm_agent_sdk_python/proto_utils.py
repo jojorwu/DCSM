@@ -75,4 +75,3 @@ def kem_proto_to_dict(kem_proto: kem_pb2.KEM) -> dict:
     return kem_dict
 
 # Similar utilities can be added for other proto messages if needed.
-```

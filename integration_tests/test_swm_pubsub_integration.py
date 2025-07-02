@@ -15,8 +15,10 @@ import grpc
 from integration_tests.kps_client_simple import process_data_via_kps # Для создания КЕП в GLM
 from dcs_memory.services.swm.generated_grpc import swm_service_pb2
 from dcs_memory.services.swm.generated_grpc import swm_service_pb2_grpc
-from dcs_memory.common.grpc_protos.kem_pb2 import KEM # Используем напрямую из общего proto
-from dcs_memory.common.grpc_protos.glm_service_pb2 import KEMQuery
+# from dcs_memory.common.grpc_protos.kem_pb2 import KEM # Используем напрямую из общего proto
+# from dcs_memory.common.grpc_protos.glm_service_pb2 import KEMQuery
+from temp_generated_grpc_code.kem_pb2 import KEM
+from temp_generated_grpc_code.glm_service_pb2 import KEMQuery
 from google.protobuf.timestamp_pb2 import Timestamp
 
 

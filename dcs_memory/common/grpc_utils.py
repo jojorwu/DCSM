@@ -121,7 +121,7 @@ def retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 
             # This part should not be reached if max_attempts >= 1,
             # as the loop will either return a successful result or raise an exception.
-    logger.error(f"Sync gRPC call to {func.__name__} exhausted attempts without success or specific error handling.")
+            logger.error(f"Sync gRPC call to {func.__name__} exhausted attempts without success or specific error handling.")
             return None # Should ideally not happen with proper error raising.
         return wrapper
     return decorator
@@ -339,5 +339,3 @@ if __name__ == '__main__':
         print(f"Test 4 Result: {result}") # Should succeed on 2nd attempt
     except Exception as e:
         print(f"Test 4 Error: {e}")
-
-```

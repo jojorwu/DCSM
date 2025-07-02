@@ -213,7 +213,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
     def StoreKEM(self, request: glm_service_pb2.StoreKEMRequest, context) -> glm_service_pb2.StoreKEMResponse:
         start_time = time.monotonic()
         kem = request.kem
-        logger.info(f"StoreKEM: Called with KEM ID '{kem.id if kem.id else \"<new>\"}'.")
+        logger.info(f"StoreKEM: Called with KEM ID '{kem.id if kem.id else '<new>'}'.")
         start_time = time.monotonic()
 
         # Input validation (example, more can be added)
@@ -497,9 +497,9 @@ def serve():
             # Update the status stored by the library HealthServicer.
             # This ensures that if a client uses the Watch API, it gets updates.
             # And also ensures that the Check response is based on the latest check.
-            self.set(request.service, current_status) # Use request.service to allow specific service checks if ever needed
-                                                 # For now, "" (overall) is what we update via check_overall_health.
-                                                 # If client sends empty string for service, it gets overall status.
+            self.set(request.service, current_status)
+            # For now, "" (overall) is what we update via check_overall_health.
+            # If client sends empty string for service, it gets overall status.
 
             # The super().Check will use the status that was just set (or previously set for a specific service name)
             # logger.debug(f"GLM Health Check RPC for service '{request.service}': Status {health_pb2.HealthCheckResponse.ServingStatus.Name(current_status)}")
@@ -554,5 +554,3 @@ def serve():
 
 if __name__ == '__main__':
     serve()
-
-```

@@ -3,7 +3,7 @@
 import sqlite3
 import logging
 import threading # Added for thread-local storage
-from typing import List, Dict, Optional, Any, Literal # Added Literal
+from typing import List, Dict, Optional, Any, Literal, Tuple # Added Literal and Tuple
 from qdrant_client import QdrantClient, models
 from google.protobuf.timestamp_pb2 import Timestamp
 

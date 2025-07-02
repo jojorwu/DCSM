@@ -395,5 +395,3 @@ if __name__ == '__main__':
             logger.error(f"Unexpected error in AgentSDK example: {e_main}", exc_info=True)
     else:
         logger.info("Environment variable RUN_AGENT_SDK_EXAMPLE not set to 'true', main SDK example will not run.")
-
-```

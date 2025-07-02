@@ -235,5 +235,3 @@ if __name__ == '__main__':
     tech_kems_after_evict = lam_indexed.query(metadata_filters={"topic": "tech"})
     assert len(tech_kems_after_evict) == 0
     print("Indexed LAM tests complete.")
-
-```

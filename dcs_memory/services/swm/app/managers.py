@@ -4,6 +4,7 @@ import logging
 import time
 import uuid
 from typing import Dict, Set, List, Optional, AsyncGenerator
+from dataclasses import dataclass # Added import for dataclass
 
 from .config import SWMConfig
 from generated_grpc import kem_pb2, swm_service_pb2
@@ -213,8 +214,8 @@ class SubscriptionManager:
             logger.debug(f"SubscriptionManager: No subscribers for KEM event on '{kem.id}' (type: {event_type}).")
             return
 
-        logger.debug(f"SubscriptionManager: Dispatching event for KEM '{kem.id}' (type: {event_type}) to {len(subscribers_to_notify_map)} subscribers.")
-        for sub_id, sub_info_item in subscribers_to_notify_map.items():
+        logger.debug(f"SubscriptionManager: Dispatching event for KEM '{kem.id}' (type: {event_type}) to {len(subscribers_to_dispatch_to)} subscribers.")
+        for sub_id, sub_info_item in subscribers_to_dispatch_to.items(): # Corrected variable name here
             try:
                 if sub_info_item.event_queue.full():
                     logger.warning(f"Subscriber queue full for subscriber_id='{sub_id}', event_id='{event_to_dispatch.event_id}' (KEM_ID='{kem.id}') lost. Queue size: {sub_info_item.event_queue.qsize()}/{sub_info_item.event_queue.maxsize}")
