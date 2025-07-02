@@ -42,11 +42,12 @@ class GLMConfig(BaseServiceConfig):
     # Storage backend selection
     GLM_STORAGE_BACKEND_TYPE: str = Field(
         default="default_sqlite_qdrant",
-        description="Type of persistent storage backend to use. E.g., 'default_sqlite_qdrant'."
+        description="Type of persistent storage backend to use (e.g., 'default_sqlite_qdrant', 'in_memory')."
     )
-    # Placeholder for backend-specific config block, if needed in future (e.g. using discriminated unions)
-    # GLM_STORAGE_BACKEND_CONFIG: Dict[str, Any] = Field(default_factory=dict)
-
+    GLM_STORAGE_BACKENDS_CONFIGS: Dict[str, Any] = Field( # Changed from Dict[str, Dict[str,Any]] to Dict[str,Any] for Pydantic v2 compatibility with complex types if needed later, or just plain dicts.
+        default_factory=dict,
+        description="Dictionary holding configurations for different storage backends, keyed by backend type. Specific settings are defined by each backend implementation."
+    )
 
     # Re-adding fields that were present in more recent versions from other tasks
     SQLITE_CONNECT_TIMEOUT_S: int = Field(default=10, description="SQLite connection timeout in seconds.")

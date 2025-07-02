@@ -29,24 +29,27 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 ### 3.2. Global/Long-Term Memory Service (GLM)
 
 *   **Location:** `dcs_memory/services/glm/`
-*   **Purpose:** Provides reliable and scalable persistent storage for all KEMs in the system. Internally, GLM uses a `BasePersistentStorageRepository` abstraction, allowing for different storage backends to be configured.
-*   **Core Functions:** (These are exposed via its gRPC API and fulfilled by the configured storage backend)
-    *   Storing KEMs, including their content, metadata, and vector embeddings.
-    *   Retrieving KEMs by their unique identifiers or complex criteria.
-    *   Vector similarity search.
-    *   Updating and deleting existing KEMs.
-    *   Batch operations for storage.
-*   **Error Handling**: The GLM service translates exceptions from the storage backend (e.g., `KemNotFoundError`, `BackendUnavailableError`) into appropriate gRPC status codes (`NOT_FOUND`, `UNAVAILABLE`, `INTERNAL`, etc.). Compensating actions for consistency (e.g., between metadata and vector stores if they are separate in a backend implementation) are the responsibility of the concrete storage repository implementation.
-*   **Storage Backend (Current Default Implementation - `DefaultGLMRepository`):**
-    *   **Type:** Configured via `GLM_STORAGE_BACKEND_TYPE: "default_sqlite_qdrant"` in `config.yml`.
-    *   **Technologies Used by Default Backend:**
-        *   SQLite: For storing structured metadata and the main content of KEMs.
-        *   Qdrant: As a vector database for storing embeddings and performing similarity searches.
-    *   **Consistency in Default Backend:** The `DefaultGLMRepository` attempts to maintain consistency between SQLite and Qdrant using compensating actions (e.g., rolling back a SQLite write if a Qdrant write fails for a KEM, or vice-versa).
-*   **API (gRPC - `glm_service.proto`):** (Remains externally consistent)
-*   **API (gRPC - `glm_service.proto`):**
-    *   `StoreKEM`: Saves or updates a single KEM. Generates an ID if not provided.
-    *   `RetrieveKEMs`: Retrieves KEMs based on complex criteria, including filters, vector queries, and pagination.
+*   **Purpose:** Provides reliable and scalable persistent storage for all KEMs in the system.
+*   **Storage Architecture:** GLM employs a `BasePersistentStorageRepository` abstraction layer. This allows the actual storage mechanism to be pluggable and configured.
+    *   **Configuration:** The active storage backend is determined by the `glm_storage_backend_type` setting in `config.yml` (or the `GLM_STORAGE_BACKEND_TYPE` environment variable). Backend-specific parameters can be provided under the `glm_storage_backends_configs` section in `config.yml`.
+    *   **Default Backend (`default_sqlite_qdrant`):**
+        *   This is the standard backend, utilizing SQLite for metadata and KEM content, and Qdrant for vector embeddings and similarity search.
+        *   It orchestrates writes and reads across these two datastores, including basic compensating actions to maintain consistency (e.g., rolling back a SQLite write if a corresponding Qdrant write fails).
+        *   Its configuration parameters (DB filename, Qdrant host/port, etc.) are primarily sourced from the top-level `glm:` section of `config.yml` or `GLM_*` environment variables.
+    *   **In-Memory Backend (`in_memory`):**
+        *   A non-persistent, in-memory storage option primarily for testing, development, or scenarios where data persistence is not required.
+        *   It implements basic filtering but currently does not support vector search.
+        *   Specific parameters (e.g., `max_kems`) can be set in `config.yml` under `glm_storage_backends_configs.in_memory`.
+    *   **Extensibility:** The `BasePersistentStorageRepository` ABC (in `dcs_memory/services/glm/app/repositories/base.py`) defines the contract for new storage backends. Developers can implement this interface to integrate other databases or storage systems with GLM.
+*   **Core Functions (exposed via gRPC API, fulfilled by the active storage backend):**
+    *   Storing KEMs (including content, metadata, vector embeddings).
+    *   Retrieving KEMs by ID or complex criteria (metadata filters, date ranges, vector search where supported by backend).
+    *   Updating and deleting KEMs.
+    *   Batch storage operations.
+*   **Error Handling**: The GLM service layer translates exceptions raised by the active storage repository (e.g., `KemNotFoundError`, `BackendUnavailableError`, `StorageError`) into appropriate gRPC status codes for the client (e.g., `NOT_FOUND`, `UNAVAILABLE`, `INTERNAL`).
+*   **API (gRPC - `glm_service.proto`):** (The external gRPC API remains consistent regardless of the chosen backend)
+    *   `StoreKEM`: Saves or updates a single KEM. ID generation and timestamp management are handled by the backend.
+    *   `RetrieveKEMs`: Retrieves KEMs based on complex criteria, including filters, vector queries (if backend supports), and pagination.
     *   `UpdateKEM`: Partially updates an existing KEM by its ID.
     *   `DeleteKEM`: Deletes a KEM by its ID.
 

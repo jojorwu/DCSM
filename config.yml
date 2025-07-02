@@ -56,10 +56,23 @@ glm:
   # If GLM were a client to another service and needed to verify that service's CA:
   # GRPC_CLIENT_ROOT_CA_CERT_PATH: "/certs/ca/ca.crt"
 
-  GLM_STORAGE_BACKEND_TYPE: "default_sqlite_qdrant" # Specifies the repository implementation to use
+  glm_storage_backend_type: "default_sqlite_qdrant" # Active backend: "default_sqlite_qdrant" or "in_memory"
+  glm_storage_backends_configs:
+    default_sqlite_qdrant:
+      # For this backend, primary settings like DB_FILENAME, QDRANT_HOST, etc.,
+      # are still sourced from the top-level GLMConfig fields for backward compatibility
+      # and ease of simple setup. This section can hold additional, specific overrides
+      # or settings unique to this composed backend if ever needed.
+      # Example: specific_option_for_default: "value"
+      description: "Default backend using SQLite for metadata and Qdrant for vectors."
+    in_memory:
+      # Example configuration for a hypothetical in-memory backend
+      max_kems: 10000
+      log_stats_interval_s: 60
+      description: "In-memory backend for testing/development. Data is not persisted."
 
-  DB_FILENAME: "glm_prod_metadata.sqlite3"
-  QDRANT_HOST: "dcsm_qdrant" # For Qdrant client in GLM, LB is not typical for DB connection from a single service.
+  DB_FILENAME: "glm_prod_metadata.sqlite3" # Used by 'default_sqlite_qdrant' backend
+  QDRANT_HOST: "dcsm_qdrant" # Used by 'default_sqlite_qdrant' backend
   QDRANT_PORT: 6333
   QDRANT_COLLECTION: "glm_kems_production_v1"
   DEFAULT_VECTOR_SIZE: 384
