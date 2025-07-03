@@ -418,7 +418,54 @@ Data retention policies (how long data is kept in each system) are generally enf
     -   **Persistence:** Depends on where it stores its artifacts. If embeddings/graphs are stored in GLM, persistence is high. If stored in a dedicated vector/graph database, that database's persistence characteristics apply.
     -   **Scalability:** Processing can be computationally intensive. KPS nodes could be scaled horizontally (more instances) if tasks are parallelizable. Scalability of semantic search depends heavily on the chosen vector store solution.
 
-## 8. API Reference (Conceptual Summary)
+## 8. Configuration
+
+Each service in the DCSM memory system can be configured through a combination of environment variables and potentially hardcoded defaults. This section outlines the key configuration parameters known or inferred from the service implementations.
+
+**8.1. Global Lifetime Memory (GLM)**
+
+GLM's primary configuration relates to its SQLite database file.
+
+*   **Database File Path:**
+    *   While not explicitly an environment variable in `database.py`, the path to the SQLite database file (`glm.db` by default) is a critical configuration. In a containerized or deployed environment, the volume mapping or path for this persistent file needs to be managed.
+    *   Typically, this path might be made configurable via an environment variable like `GLM_DB_PATH` in a production setup, though the current code uses a hardcoded default relative path.
+*   **Service Port:**
+    *   The gRPC service port for GLM (e.g., 50051) is defined when running the server (`python -m glm.glm_node`). This might be configurable via command-line arguments or an environment variable like `GLM_PORT` in a deployment script.
+
+**8.2. Short-Term Working Memory (SWM)**
+
+SWM relies on Redis for its pub/sub capabilities and can be configured accordingly.
+
+*   **Redis Connection:**
+    *   `REDIS_HOST`: Specifies the hostname or IP address of the Redis server. (Used in `common/utils/redis_client.py`). Defaults to `'localhost'` if not set.
+    *   `REDIS_PORT`: Specifies the port number for the Redis server. (Used in `common/utils/redis_client.py`). Defaults to `6379` if not set.
+    *   `REDIS_PASSWORD`: (Conceptual) While not explicitly in the current `redis_client.py`, a `REDIS_PASSWORD` variable would typically be used for password-protected Redis instances.
+*   **In-Memory Store:**
+    *   The in-memory key-value store (`memory_store.py`) does not have explicit external configuration parameters beyond its TTL logic.
+*   **Service Port:**
+    *   The gRPC service port for SWM (e.g., 50052) is defined when running the server (`python -m swm.swm_node`). Configurable similarly to GLM's port (e.g., `SWM_PORT`).
+
+**8.3. Knowledge Processing Service (KPS)**
+
+KPS has several configuration points related to its embedding model and vector store.
+
+*   **Embedding Model:**
+    *   `EMBEDDING_MODEL_NAME`: Specifies the name of the sentence-transformer model to be used for generating embeddings. (Used in `kps/embedding_service.py`). Defaults to `'all-MiniLM-L6-v2'` if not set.
+*   **Vector Store (ChromaDB):**
+    *   `CHROMA_MODE`: Determines the ChromaDB deployment mode. Can be `'in-memory'` (for transient, local testing) or `'client-server'`. (Used in `common/utils/vector_store_utils.py`).
+    *   `CHROMA_HOST`: If `CHROMA_MODE` is `'client-server'`, this specifies the hostname or IP address of the ChromaDB server. (Used in `common/utils/vector_store_utils.py`).
+    *   `CHROMA_PORT`: If `CHROMA_MODE` is `'client-server'`, this specifies the port of the ChromaDB server. (Used in `common/utils/vector_store_utils.py`).
+    *   `KPS_COLLECTION_NAME`: Defines the name of the collection within ChromaDB where KPS will store its embeddings and documents. (Used in `kps/kps_node.py`). Defaults to `'kps_collection'` or similar if not explicitly set by the node.
+    *   `CHROMA_PERSIST_PATH`: (Conceptual, for in-memory with persistence) If using ChromaDB in a mode that persists data locally from an in-memory start (e.g. `chromadb.PersistentClient(path=\"...\")`), this path would be a key configuration. The current `vector_store_utils.py` uses `chromadb.Client()` for basic in-memory or `HttpClient()` for client-server, so explicit path persistence for default in-memory isn't shown as directly configurable via an env var there, but is a common ChromaDB pattern.
+*   **Service Port:**
+    *   The gRPC service port for KPS (e.g., 50053) is defined when running the server (`python -m kps.kps_node`). Configurable similarly to GLM's port (e.g., `KPS_PORT`).
+
+**General Considerations:**
+
+*   **Logging Levels:** While not detailed as specific environment variables here, each service might have configurable logging levels (DEBUG, INFO, WARNING, ERROR) typically managed through Python's `logging` module and potentially adjustable via environment variables (e.g., `LOG_LEVEL`).
+*   **gRPC Server Options:** Parameters like the maximum number of workers for gRPC servers are usually set in the server instantiation code but could be externalized via environment variables for fine-tuning performance.
+
+## 9. API Reference (Conceptual Summary)
 
 This summarizes the primary gRPC service methods for each memory component. Refer to the respective `.proto` files (`glm_service.proto`, `swm_service.proto`, `kps_service.proto`) for detailed message definitions.
 
@@ -448,7 +495,7 @@ This summarizes the primary gRPC service methods for each memory component. Refe
 -   `BatchRemoveMemories(kem_uris: list<str>) returns (BatchRemoveMemoriesResponse)`
 -   `GetAllMemories(page_size: int, page_token: str) returns (GetAllMemoriesResponse)` (*GetAllMemoriesResponse contains list of MemoryContent and next_page_token*)
 
-## 9. Future Considerations / Potential Enhancements
+## 10. Future Considerations / Potential Enhancements
 
 -   **Distributed GLM:** For very large-scale applications, replacing SQLite with a distributed SQL/NoSQL database.
 -   **Advanced KPS Capabilities:** Integration of more sophisticated NLP models, reasoning engines, or automated knowledge discovery algorithms.
