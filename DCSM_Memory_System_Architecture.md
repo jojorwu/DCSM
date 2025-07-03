@@ -105,7 +105,8 @@ GLM serves as the long-term, persistent memory store for the DCSM system. It is 
         -   `updated_at` (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
     -   Provides methods corresponding to each gRPC call (e.g., `add_memory`, `get_memory`, `update_memory`, `delete_memory`, `list_memories`, `query_memories_dynamic`).
     -   Uses parameterized queries (`?`) to prevent SQL injection.
-    -   Metadata is stored as a JSON string, requiring serialization/deserialization in the application logic or service layer.
+    -   Metadata is stored as a JSON string, requiring serialization/deserialization in the application logic or service layer. Querying specific fields within this JSON is supported using SQLite's JSON functions (e.g., `json_extract`), with performance being optimal when appropriate JSON indexes are used and SQLite version is >= 3.38.0.
+    -   **SQLite PRAGMA Settings:** To enhance performance and concurrency, GLM configures SQLite with specific PRAGMA settings upon connection, including WAL (Write-Ahead Logging) mode, appropriate synchronous levels, busy timeout handling, and a configurable per-connection cache size (`SQLITE_CACHE_SIZE_KB`).
 -   **KEM URI Handling:** KEM URIs are the designated unique identifiers for memories in GLM. Their structure and generation are external to GLM but crucial for its addressing scheme.
 
 **Use Cases:**
@@ -410,7 +411,7 @@ Data retention policies (how long data is kept in each system) are generally enf
 
 -   **GLM (SQLite):**
     -   **Persistence:** High (data stored on disk).
-    -   **Scalability:** Limited by the single-file nature of SQLite. Scales well for single-server deployments with moderate write loads and high read loads. For very large datasets or high concurrent writes, migrating to a client-server RDBMS (e.g., PostgreSQL, MySQL) or a NoSQL database designed for scale might be necessary. The current design prioritizes ease of deployment and robustness for typical agent scenarios.
+    -   **Scalability:** Limited by the single-file nature of SQLite. Scales well for single-server deployments with moderate write loads and high read loads. Pagination for large query results is implemented using an efficient keyset-based approach to maintain performance with growing datasets. For very large datasets or high concurrent writes, migrating to a client-server RDBMS (e.g., PostgreSQL, MySQL) or a NoSQL database designed for scale might be necessary. The current design prioritizes ease of deployment and robustness for typical agent scenarios.
 -   **SWM (In-Memory + Redis):**
     -   **Persistence:** Low for in-memory parts (lost on restart unless backed by a persistent cache). If Redis is used for pub/sub or caching, Redis persistence options (RDB snapshots, AOF logs) can provide durability.
     -   **Scalability:** In-memory store is limited by available RAM. Redis is highly scalable and can be clustered, making SWM (if reliant on Redis) very scalable for caching and messaging. Python's in-process pub/sub would be limited to a single process.
@@ -426,11 +427,22 @@ Each service in the DCSM memory system can be configured through a combination o
 
 GLM's primary configuration relates to its SQLite database file.
 
-*   **Database File Path:**
-    *   While not explicitly an environment variable in `database.py`, the path to the SQLite database file (`glm.db` by default) is a critical configuration. In a containerized or deployed environment, the volume mapping or path for this persistent file needs to be managed.
-    *   Typically, this path might be made configurable via an environment variable like `GLM_DB_PATH` in a production setup, though the current code uses a hardcoded default relative path.
-*   **Service Port:**
-    *   The gRPC service port for GLM (e.g., 50051) is defined when running the server (`python -m glm.glm_node`). This might be configurable via command-line arguments or an environment variable like `GLM_PORT` in a deployment script.
+*   **`GLM_DB_FILENAME` (Environment Variable for `DB_FILENAME` in config):**
+    *   Specifies the filename for the SQLite database (e.g., `glm_metadata.sqlite3`).
+    *   The GLM service typically constructs the full path by joining an application directory (e.g., a data directory within the service deployment) with this filename.
+    *   Default: `glm_metadata.sqlite3`.
+*   **`GLM_SQLITE_CACHE_SIZE_KB` (Environment Variable for `SQLITE_CACHE_SIZE_KB` in config):**
+    *   Configures the per-connection cache size for SQLite in KiB (kibibytes).
+    *   A negative value `-N` sets the cache to `N` KiB. A positive value `N` sets the cache to `N` pages.
+    *   Helps improve performance by keeping more of the database in memory.
+    *   Default: `-2048` (for a 2MiB cache per connection).
+*   **`GLM_SQLITE_BUSY_TIMEOUT` (Environment Variable for `SQLITE_BUSY_TIMEOUT` in config):**
+    *   Sets the busy timeout in milliseconds for SQLite operations.
+    *   Helps manage contention in concurrent environments.
+    *   Default: `7500`.
+*   **Service Port (e.g., `GLM_GRPC_LISTEN_ADDRESS` or configured directly at runtime):**
+    *   Defines the address and port the GLM gRPC service listens on (e.g., `[::]:50051`).
+    *   The exact environment variable might depend on how the service is launched (e.g., `GLM_GRPC_LISTEN_ADDRESS` for the config field `GRPC_LISTEN_ADDRESS`).
 
 **8.2. Short-Term Working Memory (SWM)**
 
@@ -469,13 +481,12 @@ KPS has several configuration points related to its embedding model and vector s
 
 This summarizes the primary gRPC service methods for each memory component. Refer to the respective `.proto` files (`glm_service.proto`, `swm_service.proto`, `kps_service.proto`) for detailed message definitions.
 
-**Global Lifetime Memory (GLM) - `glm.GLMService` (from `glm_service.proto`)**
--   `StoreMemory(kem_uri: str, content: bytes, metadata_json: str) returns (StoreMemoryResponse)`
--   `RetrieveMemory(kem_uri: str) returns (MemoryItem)`
--   `QueryMemories(query: str) returns (stream MemoryItem)`
--   `DeleteMemory(kem_uri: str) returns (DeleteMemoryResponse)`
--   `UpdateMemory(kem_uri: str, content: bytes, metadata_json: str) returns (UpdateMemoryResponse)`
--   `ListMemories(limit: int, offset: int, kem_uri_prefix: str) returns (stream MemoryItem)`
+**Global Lifetime Memory (GLM) - `dcsm.GlobalLongTermMemory` (from `glm_service.proto`)**
+-   `StoreKEM(StoreKEMRequest) returns (StoreKEMResponse)`: Stores a single KEM. If the ID in the KEM is not specified, the server generates one.
+-   `RetrieveKEMs(RetrieveKEMsRequest) returns (RetrieveKEMsResponse)`: Retrieves KEMs based on various criteria. The `page_token` in the request is used for efficient keyset-based pagination.
+-   `UpdateKEM(UpdateKEMRequest) returns (KEM)`: Updates an existing KEM. The KEM ID must be specified.
+-   `DeleteKEM(DeleteKEMRequest) returns (google.protobuf.Empty)`: Deletes a KEM by its ID.
+-   `BatchStoreKEMs(BatchStoreKEMsRequest) returns (BatchStoreKEMsResponse)`: Stores multiple KEMs in a batch.
 
 **Short-Term Working Memory (SWM) - `swm.SWMService` (from `swm_service.proto`)**
 -   `StoreMemory(key: str, value: str, ttl_seconds: int) returns (StoreMemoryResponse)`
