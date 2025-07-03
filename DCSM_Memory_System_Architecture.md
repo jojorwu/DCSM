@@ -220,7 +220,44 @@ KPS is responsible for more advanced processing and understanding of the data st
 -   Answering complex questions that require synthesizing information from multiple sources.
 -   Proactively suggesting relevant information to the agent based on context.
 
-## 3. Data Flow and Interactions
+## 3. gRPC API and Communication
+
+The Distributed Cognitive State Management (DCSM) system relies on gRPC as the fundamental communication layer between the agent's application logic and the various memory services (GLM, SWM, KPS). This choice provides a robust, performant, and flexible way for these components to interact.
+
+### 3.1. Overview of gRPC Usage
+
+All interactions with the memory services are exposed as gRPC services. This means that an agent or application wanting to store, retrieve, or process information will make gRPC calls to the appropriate service endpoint (GLM, SWM, or KPS). This standardized approach simplifies client-side development and ensures consistent communication patterns.
+
+### 3.2. Service Definitions with Protocol Buffers
+
+The contracts for these services—including their RPC methods, request messages, and response messages—are formally defined using Protocol Buffers (protobuf). These definitions are stored in `.proto` files, such as:
+
+-   `glm_service.proto`: Defines the `GlobalLongTermMemory` service.
+-   `swm_service.proto`: Defines the `SWMService` (Short-Term Working Memory).
+-   `kps_service.proto`: Defines the `KPSService` (Knowledge Processing Service).
+-   `kem.proto`: Defines the core `KEM` (Knowledge Encapsulation Module) message structure used across services.
+
+These `.proto` files serve as the single source of truth for the API contracts.
+
+### 3.3. Benefits of gRPC in DCSM
+
+The adoption of gRPC offers several key advantages for the DCSM architecture:
+
+-   **Strongly-Typed Contracts:** Protocol Buffers enforce a clear, language-agnostic schema for messages and services. This minimizes integration errors and ensures that clients and servers agree on data structures.
+-   **High Performance:** gRPC leverages HTTP/2 for multiplexed, persistent connections and uses efficient binary serialization for protobuf messages, resulting in lower latency and reduced bandwidth consumption compared to text-based protocols like JSON over HTTP/1.1.
+-   **Streaming Capabilities:** gRPC supports various streaming modes (unary, server-streaming, client-streaming, bidirectional-streaming). This is utilized, for example, in SWM's `Subscribe` method for receiving a stream of messages, and could be used by other services for handling large datasets or long-lived interactions.
+-   **Language Agnostic:** While the current DCSM services are implemented in Python, gRPC's cross-language support allows future components or client applications to be developed in different programming languages while still seamlessly interacting with the existing memory services.
+-   **Code Generation:** gRPC tooling automatically generates client stubs and server-side boilerplate code in various languages from the `.proto` definitions. This significantly simplifies development by handling much of the low-level communication logic.
+
+### 3.4. Error Handling
+
+Service operations communicate success or failure using standard gRPC status codes. For example, `OK` indicates success, `NOT_FOUND` might indicate a requested KEM was not present, and `INVALID_ARGUMENT` could signal an issue with the request parameters. Error messages accompanying these status codes provide more specific details about any issues encountered.
+
+### 3.5. Security
+
+gRPC channels can be secured using Transport Layer Security (TLS) to encrypt communications between the client and server. The DCSM services can be configured with the necessary TLS certificates and keys to enable secure gRPC channels, as outlined in their respective configuration options (see Section 9: Configuration).
+
+## 4. Data Flow and Interactions
 
 The three memory components work in concert, with data flowing between them and the agent's application logic.
 
@@ -301,7 +338,7 @@ The three memory components work in concert, with data flowing between them and 
         SWM->>Module2: Stream message_data
     ```
 
-## 4. Key Management and Addressing (KEM URIs)
+## 5. Key Management and Addressing (KEM URIs)
 
 -   **KEM (Knowledge Encapsulation Module) URIs** are the designated unique identifiers for discrete pieces of knowledge or memory items within the DCSM ecosystem.
 -   **Purpose:** They provide a standardized and unique way to address specific memory objects across different services (GLM, KPS, and by agents/applications).
@@ -321,7 +358,7 @@ The three memory components work in concert, with data flowing between them and 
     -   **Inter-Service Linking:** KPS results (KEM URIs) can be used to retrieve detailed metadata or original context from GLM.
     -   **Organization:** Helps in categorizing and organizing memories based on the URI structure.
 
-## 5. Use Cases / Examples (System-Level)
+## 6. Use Cases / Examples (System-Level)
 
 -   **Personalized Agent Behavior:**
     -   GLM stores user preferences, past interactions, and feedback.
@@ -337,7 +374,7 @@ The three memory components work in concert, with data flowing between them and 
     -   Different modules (e.g., a planning module, an execution module, a monitoring module) communicate state and intermediate results via SWM's pub/sub or shared key-value store.
     -   Critical decisions or final outcomes from the collaboration can be logged into GLM for audit or future learning.
 
-## 6. Data Lifecycle Management
+## 7. Data Lifecycle Management
 
 Effective management of data throughout its lifecycle is crucial for the reliability, efficiency, and relevance of the DCSM memory system. The lifecycle stages involve creation, usage/updating, archival, and deletion, with different considerations for GLM, SWM, and KPS.
 
@@ -407,7 +444,7 @@ Data retention policies (how long data is kept in each system) are generally enf
 *   Applications may implement cron jobs or scheduled tasks to periodically review data in GLM and KPS, applying deletion or archival logic based on age, relevance, or other criteria.
 *   Metadata in GLM (e.g., `created_at`, custom metadata flags) can be crucial for implementing these retention policies.
 
-## 7. Scalability and Persistence
+## 8. Scalability and Persistence
 
 -   **GLM (SQLite):**
     -   **Persistence:** High (data stored on disk).
@@ -419,7 +456,7 @@ Data retention policies (how long data is kept in each system) are generally enf
     -   **Persistence:** Depends on where it stores its artifacts. If embeddings/graphs are stored in GLM, persistence is high. If stored in a dedicated vector/graph database, that database's persistence characteristics apply.
     -   **Scalability:** Processing can be computationally intensive. KPS nodes could be scaled horizontally (more instances) if tasks are parallelizable. Scalability of semantic search depends heavily on the chosen vector store solution.
 
-## 8. Configuration
+## 9. Configuration
 
 Each service in the DCSM memory system can be configured through a combination of environment variables and potentially hardcoded defaults. This section outlines the key configuration parameters known or inferred from the service implementations.
 
@@ -477,7 +514,7 @@ KPS has several configuration points related to its embedding model and vector s
 *   **Logging Levels:** While not detailed as specific environment variables here, each service might have configurable logging levels (DEBUG, INFO, WARNING, ERROR) typically managed through Python's `logging` module and potentially adjustable via environment variables (e.g., `LOG_LEVEL`).
 *   **gRPC Server Options:** Parameters like the maximum number of workers for gRPC servers are usually set in the server instantiation code but could be externalized via environment variables for fine-tuning performance.
 
-## 9. API Reference (Conceptual Summary)
+## 10. API Reference (Conceptual Summary)
 
 This summarizes the primary gRPC service methods for each memory component. Refer to the respective `.proto` files (`glm_service.proto`, `swm_service.proto`, `kps_service.proto`) for detailed message definitions.
 
@@ -506,7 +543,7 @@ This summarizes the primary gRPC service methods for each memory component. Refe
 -   `BatchRemoveMemories(kem_uris: list<str>) returns (BatchRemoveMemoriesResponse)`
 -   `GetAllMemories(page_size: int, page_token: str) returns (GetAllMemoriesResponse)` (*GetAllMemoriesResponse contains list of MemoryContent and next_page_token*)
 
-## 10. Future Considerations / Potential Enhancements
+## 11. Future Considerations / Potential Enhancements
 
 -   **Distributed GLM:** For very large-scale applications, replacing SQLite with a distributed SQL/NoSQL database.
 -   **Advanced KPS Capabilities:** Integration of more sophisticated NLP models, reasoning engines, or automated knowledge discovery algorithms.
