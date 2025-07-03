@@ -14,8 +14,8 @@ from google.protobuf.json_format import ParseDict
 from generated_grpc import kem_pb2, glm_service_pb2
 from ..config import GLMConfig # Relative import for config within the same app
 from .base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
-from .sqlite_repo import SqliteKemRepository # Previous sqlite_repo.py
-from .qdrant_repo import QdrantKemRepository # Previous qdrant_repo.py
+from . import SqliteKemRepository
+from . import QdrantKemRepository
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +253,178 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         page_size: int,
         page_token: Optional[str]
     ) -> Tuple[List[kem_pb2.KEM], Optional[str]]:
-        raise NotImplementedError()
+        # This method will primarily handle SQLite based filtering (IDs, metadata, timestamps).
+        # Vector search (embedding_query) or text_query would typically involve Qdrant
+        # and then potentially retrieving full KEMs from SQLite.
+        # For this implementation, we'll focus on filters applicable to SQLite.
+
+        sql_conditions: List[str] = []
+        sql_params: List[Any] = []
+
+        # 1. Handle ID filters
+        if query.ids:
+            placeholders = ','.join('?' for _ in query.ids)
+            sql_conditions.append(f"id IN ({placeholders})")
+            sql_params.extend(list(query.ids))
+
+        # 2. Handle metadata filters
+        # This uses json_extract, which benefits from JSON indexes if available (SQLite >= 3.38.0)
+        if query.metadata_filters:
+            for key, value in query.metadata_filters.items():
+                # Basic sanitization for key to prevent issues if keys could be non-alphanumeric,
+                # though json_extract path syntax is quite flexible.
+                # For now, assume keys are valid JSON path components (e.g. no dots if not intended for nesting).
+                # If keys could contain special characters like '.', they might need specific handling
+                # in the path string e.g. '$."key.with.dots"'. For simple keys, '$.key' is fine.
+                # Assuming simple keys for now.
+                sanitized_key = key # Add more robust sanitization if keys can be complex
+                sql_conditions.append(f"json_extract(metadata, '$.{sanitized_key}') = ?")
+                sql_params.append(value)
+
+        # 3. Handle timestamp filters
+        if query.HasField("created_at_start"):
+            sql_conditions.append("created_at >= ?")
+            sql_params.append(query.created_at_start.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+        if query.HasField("created_at_end"):
+            sql_conditions.append("created_at <= ?")
+            sql_params.append(query.created_at_end.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+        if query.HasField("updated_at_start"):
+            sql_conditions.append("updated_at >= ?")
+            sql_params.append(query.updated_at_start.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+        if query.HasField("updated_at_end"):
+            sql_conditions.append("updated_at <= ?")
+            sql_params.append(query.updated_at_end.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+
+        # TODO: Handle text_query and embedding_query (likely involving Qdrant)
+        # If embedding_query is present, this method might first query Qdrant,
+        # get KEM IDs, and then use those IDs to query SQLite.
+        # This example primarily focuses on SQLite filtering.
+        # For now, if embedding_query or text_query is present and not handled,
+        # we might return empty or raise NotImplementedError for those specific parts.
+        if query.embedding_query or query.text_query:
+            logger.warning("retrieve_kems: embedding_query and text_query are not fully implemented in this version for SQLite-first path. Qdrant integration needed here.")
+            # Placeholder: If Qdrant is supposed to be the primary source for vector search:
+            if self.qdrant_repo and query.embedding_query:
+                try:
+                    qdrant_filter = None # Build Qdrant filter from metadata/timestamps if needed
+                    # This is a simplified Qdrant search. Real implementation would need to map
+                    # KEMQuery metadata/timestamps to Qdrant's filter language.
+                    # For now, let's assume if embedding_query is there, other filters apply to Qdrant.
+                    # This part needs significant expansion for proper Qdrant integration.
+
+                    # Construct Qdrant filter from KEMQuery (simplified example)
+                    q_filters = []
+                    if query.metadata_filters:
+                        for k, v in query.metadata_filters.items():
+                            q_filters.append(qdrant_models.FieldCondition(key=f"md_{k}", match=qdrant_models.MatchValue(value=v)))
+                    # Timestamp filters for Qdrant (assuming timestamps are stored as seconds in payload)
+                    if query.HasField("created_at_start"): q_filters.append(qdrant_models.FieldCondition(key="created_at_ts", range=qdrant_models.Range(gte=query.created_at_start.seconds)))
+                    if query.HasField("created_at_end"): q_filters.append(qdrant_models.FieldCondition(key="created_at_ts", range=qdrant_models.Range(lte=query.created_at_end.seconds)))
+                    # (Add updated_at similarly if needed)
+
+                    if q_filters:
+                        qdrant_filter = qdrant_models.Filter(must=q_filters)
+
+                    # Pagination for Qdrant: Qdrant uses offset. page_token needs to be interpretable as offset.
+                    qdrant_offset = 0
+                    if page_token:
+                        try:
+                            qdrant_offset = int(page_token)
+                        except ValueError:
+                            logger.warning(f"Invalid page_token for Qdrant offset: {page_token}. Defaulting to 0.")
+                            qdrant_offset = 0
+
+                    scored_points = await asyncio.to_thread(
+                        self.qdrant_repo.search_points,
+                        query_vector=list(query.embedding_query),
+                        query_filter=qdrant_filter,
+                        limit=page_size,
+                        offset=qdrant_offset
+                    )
+                    kem_ids_from_qdrant = [sp.id for sp in scored_points]
+                    if not kem_ids_from_qdrant:
+                        return [], None # No results from Qdrant
+
+                    # Replace existing ID filters if Qdrant results are primary
+                    sql_conditions = []
+                    sql_params = []
+                    id_placeholders = ','.join('?' for _ in kem_ids_from_qdrant)
+                    sql_conditions.append(f"id IN ({id_placeholders})")
+                    sql_params.extend(kem_ids_from_qdrant)
+
+                    # Determine next page token for Qdrant results
+                    next_qdrant_page_token = None
+                    if len(scored_points) == page_size:
+                        # Qdrant itself doesn't directly give a "next page token" like this,
+                        # it just returns results for the current offset+limit.
+                        # We infer there might be more if we received a full page.
+                        # The next token would be the next offset.
+                        potential_next_offset = qdrant_offset + page_size
+                        # To confirm, one could do a count or a query for offset=potential_next_offset, limit=1
+                        # For simplicity here, if we got a full page, we assume there could be more.
+                        next_qdrant_page_token = str(potential_next_offset)
+
+
+                    # Now fetch these KEMs from SQLite
+                    # The order from Qdrant might be lost unless we re-order in Python after fetching.
+                    # Or, if SQLite query can preserve Qdrant's order (e.g. using CASE WHEN with IDs).
+                    # For now, default SQLite ordering will apply or keyset pagination's order.
+                    kems_from_db_dicts, sqlite_next_page_token = await asyncio.to_thread(
+                        self.sqlite_repo.retrieve_kems_from_db,
+                        sql_conditions,
+                        sql_params,
+                        page_size, # Fetch up to page_size, Qdrant might have returned fewer relevant IDs.
+                        0 # When fetching by specific IDs from Qdrant, usually no further SQLite pagination needed on these IDs.
+                          # Or, if Qdrant returns more IDs than page_size, this needs careful handling.
+                          # Let's assume for now Qdrant's limit is the primary driver here.
+                    )
+                    # If Qdrant was used, its next_page_token is authoritative for this path.
+                    final_next_page_token = next_qdrant_page_token
+
+                    # Convert dicts to protos
+                    # Note: embeddings are not directly retrieved from SQLite in this path.
+                    # Qdrant search results (scored_points) might contain embeddings if requested.
+                    # We might need to merge Qdrant embeddings with SQLite data.
+                    # For now, _kem_from_db_dict_to_proto doesn't combine with Qdrant embeddings.
+                    # This requires more sophisticated merging if KEM proto should have Qdrant's latest embeddings.
+                    kem_protos = [self._kem_from_db_dict_to_proto(db_dict) for db_dict in kems_from_db_dicts]
+                    return kem_protos, final_next_page_token
+
+                except Exception as e_qdrant_search:
+                    logger.error(f"Error during Qdrant search in retrieve_kems: {e_qdrant_search}", exc_info=True)
+                    raise StorageError(f"Qdrant search failed: {e_qdrant_search}")
+
+
+        # Pagination: page_token is now passed directly to the SQLite repository,
+        # which handles keyset pagination based on this token.
+
+        # Default order by, can be made configurable or based on query.
+        # This MUST match the expectations of the keyset pagination logic in SqliteKemRepository.
+        order_by_clause = "ORDER BY updated_at DESC, id DESC" # Ensure stable order for pagination
+
+        kems_db_dicts, next_page_token_str = await asyncio.to_thread(
+            self.sqlite_repo.retrieve_kems_from_db,
+            sql_conditions,
+            sql_params,
+            page_size,
+            page_token, # Pass the original page_token for keyset pagination
+            order_by_clause
+        )
+
+        # Convert dicts to KEM protos
+        # TODO: If Qdrant was involved, embeddings might need to be fetched/merged separately.
+        # For now, assuming embeddings are not part of this SQLite-focused retrieval path,
+        # or they are already in the SQLite content/metadata if stored there (unlikely for raw vectors).
+        # The KEM proto has an embeddings field, so if not populated here, it will be empty.
+        kem_protos = []
+        for db_dict in kems_db_dicts:
+            # If embeddings are needed and not in SQLite, this is where they'd be fetched from Qdrant
+            # using db_dict['id'] and merged into the KEM proto.
+            # For now, passing None for embeddings_list.
+            kem_protos.append(self._kem_from_db_dict_to_proto(db_dict, embeddings_list=None))
+
+        return kem_protos, next_page_token_str
+
 
     async def update_kem(
         self,

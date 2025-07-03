@@ -200,3 +200,155 @@ class TestGLMBatchStoreKEMs(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# --- New Test Class for RetrieveKEMs ---
+from dcs_memory.services.glm.app.repositories import DefaultGLMRepository, SqliteKemRepository
+from dcs_memory.services.glm.app.config import GLMConfig
+import asyncio # For running async repository methods if servicer calls them directly
+
+# Helper to run async methods in tests if needed
+def async_test(f):
+    def wrapper(*args, **kwargs):
+        asyncio.run(f(*args, **kwargs))
+    return wrapper
+
+class TestGLMRetrieveKEMs(unittest.TestCase):
+    def setUp(self):
+        # Config for an in-memory SQLite database
+        self.config = GLMConfig(
+            DB_FILENAME=":memory:",
+            GLM_STORAGE_BACKEND_TYPE="default_sqlite_qdrant",
+            QDRANT_HOST="", # Disable Qdrant for these SQLite focused tests
+            DEFAULT_PAGE_SIZE=2 # Small page size for easier pagination testing
+        )
+
+        # Patch QdrantClient globally for DefaultGLMRepository to avoid real connections
+        # We are testing SQLite behavior here.
+        self.mock_qdrant_client_patch = patch('dcs_memory.services.glm.app.repositories.default_impl.QdrantClient')
+        self.MockQdrantClientClass = self.mock_qdrant_client_patch.start()
+        self.mock_qdrant_instance = self.MockQdrantClientClass.return_value
+        self.mock_qdrant_instance.get_collections.return_value = MagicMock() # Allow DefaultGLMRepository to initialize
+        self.mock_qdrant_instance.search_points.return_value = [] # Default Qdrant search result
+
+
+        # The servicer will internally create DefaultGLMRepository,
+        # which will use SqliteKemRepository with the in-memory DB.
+        # We need to ensure 'app_dir' is correctly inferred or passed if DefaultGLMRepository needs it.
+        # DefaultGLMRepository(config, app_dir) - app_dir is used for db_path.
+        # For :memory:, app_dir doesn't matter as much for db_path construction.
+        # Patch GLMConfig instance used by the servicer
+        self.mock_main_config_patch = patch('dcs_memory.services.glm.app.main.config', self.config)
+        self.mock_main_config_patch.start()
+
+        # Patch app_dir used by DefaultGLMRepository if it's module level, or ensure servicer passes it.
+        # In main.py, app_dir is module level.
+        self.mock_app_dir_patch = patch('dcs_memory.services.glm.app.main.app_dir', '.') # Mock app_dir
+        self.mock_app_dir_patch.start()
+
+
+        self.servicer = GlobalLongTermMemoryServicerImpl() # This will init DefaultGLMRepository
+
+        # Helper to directly interact with the SQLite repo for setup if needed
+        self.sqlite_repo: SqliteKemRepository = self.servicer.storage_repository.sqlite_repo
+
+
+        # Pre-populate some data
+        self.kems_data = []
+        for i in range(5): # 5 KEMs for pagination testing (2 pages of 2, 1 page of 1)
+            ts = Timestamp()
+            ts.FromSeconds(1700000000 + i * 100) # Vary timestamps for ordering
+            kem_id = f"kem_id_{i}"
+            metadata = {"type": f"type{i%2}", "source_system": "test_system", "index": str(i)}
+            content = f"Content for KEM {i}"
+
+            kem_proto = create_proto_kem(id=kem_id, metadata=metadata, content=content)
+            kem_proto.created_at.CopyFrom(ts)
+            kem_proto.updated_at.CopyFrom(ts) # For simplicity, updated_at = created_at
+
+            self.kems_data.append(kem_proto)
+            # Store directly using the repository for setup
+            # The servicer's StoreKEM calls asyncio.run, which can be tricky in sync tests.
+            # Direct repo call, assuming it's synchronous for setup.
+            self.servicer.storage_repository.sqlite_repo.store_or_replace_kem(
+                kem_id=kem_proto.id,
+                content_type=kem_proto.content_type,
+                content=kem_proto.content,
+                metadata_json=json.dumps(dict(kem_proto.metadata)),
+                created_at_iso=ts.ToDatetime().isoformat().split('.')[0], # Match format
+                updated_at_iso=ts.ToDatetime().isoformat().split('.')[0]  # Match format
+            )
+        # KEMs sorted by updated_at DESC (which is ts DESC here): kem_id_4, kem_id_3, kem_id_2, kem_id_1, kem_id_0
+
+    def tearDown(self):
+        self.mock_qdrant_client_patch.stop()
+        self.mock_main_config_patch.stop()
+        self.mock_app_dir_patch.stop()
+        # In-memory DB is automatically discarded
+
+    def test_retrieve_with_metadata_filter(self):
+        query = glm_service_pb2.KEMQuery(
+            metadata_filters={"type": "type0"} # Should match kem_id_0, kem_id_2, kem_id_4
+        )
+        request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=5)
+
+        response = self.servicer.RetrieveKEMs(request, None)
+
+        self.assertEqual(len(response.kems), 3)
+        retrieved_ids = sorted([k.id for k in response.kems])
+        self.assertEqual(retrieved_ids, ["kem_id_0", "kem_id_2", "kem_id_4"])
+        self.assertEqual(response.next_page_token, "") # All results fit
+
+    def test_retrieve_keyset_pagination(self):
+        # Order by updated_at DESC, id DESC (default in DefaultGLMRepository.retrieve_kems)
+        # Expected order: kem_id_4, kem_id_3, kem_id_2, kem_id_1, kem_id_0 (since updated_at is increasing with i)
+
+        # Page 1
+        query1 = glm_service_pb2.KEMQuery()
+        request1 = glm_service_pb2.RetrieveKEMsRequest(query=query1, page_size=2) # page_size = 2
+        response1 = self.servicer.RetrieveKEMs(request1, None)
+
+        self.assertEqual(len(response1.kems), 2)
+        self.assertEqual(response1.kems[0].id, "kem_id_4")
+        self.assertEqual(response1.kems[1].id, "kem_id_3")
+        self.assertIsNotNone(response1.next_page_token)
+        self.assertNotEqual(response1.next_page_token, "")
+
+        # Page 2
+        query2 = glm_service_pb2.KEMQuery()
+        request2 = glm_service_pb2.RetrieveKEMsRequest(query=query2, page_size=2, page_token=response1.next_page_token)
+        response2 = self.servicer.RetrieveKEMs(request2, None)
+
+        self.assertEqual(len(response2.kems), 2)
+        self.assertEqual(response2.kems[0].id, "kem_id_2")
+        self.assertEqual(response2.kems[1].id, "kem_id_1")
+        self.assertIsNotNone(response2.next_page_token)
+        self.assertNotEqual(response2.next_page_token, "")
+
+        # Page 3
+        query3 = glm_service_pb2.KEMQuery()
+        request3 = glm_service_pb2.RetrieveKEMsRequest(query=query3, page_size=2, page_token=response2.next_page_token)
+        response3 = self.servicer.RetrieveKEMs(request3, None)
+
+        self.assertEqual(len(response3.kems), 1)
+        self.assertEqual(response3.kems[0].id, "kem_id_0")
+        self.assertEqual(response3.next_page_token, "") # Last page
+
+    def test_retrieve_metadata_filter_with_pagination(self):
+        # Filter for type1: kem_id_1, kem_id_3
+        # Expected order: kem_id_3, kem_id_1
+        query = glm_service_pb2.KEMQuery(metadata_filters={"type": "type1"})
+
+        # Page 1
+        request1 = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1)
+        response1 = self.servicer.RetrieveKEMs(request1, None)
+        self.assertEqual(len(response1.kems), 1)
+        self.assertEqual(response1.kems[0].id, "kem_id_3") # Highest updated_at for type1
+        self.assertNotEqual(response1.next_page_token, "")
+
+        # Page 2
+        request2 = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1, page_token=response1.next_page_token)
+        response2 = self.servicer.RetrieveKEMs(request2, None)
+        self.assertEqual(len(response2.kems), 1)
+        self.assertEqual(response2.kems[0].id, "kem_id_1")
+        self.assertEqual(response2.next_page_token, "") # Last page for this filter

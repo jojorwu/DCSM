@@ -43,6 +43,14 @@ class SqliteKemRepository:
                 cursor.execute(f"PRAGMA busy_timeout = {busy_timeout};")
                 logger.info(f"Thread {threading.get_ident()}: PRAGMA busy_timeout = {busy_timeout} set.")
 
+                if self.config.SQLITE_CACHE_SIZE_KB is not None:
+                    cursor.execute(f"PRAGMA cache_size = {self.config.SQLITE_CACHE_SIZE_KB};")
+                    logger.info(f"Thread {threading.get_ident()}: PRAGMA cache_size = {self.config.SQLITE_CACHE_SIZE_KB} (KiB if negative, pages if positive) set.")
+
+                # PRAGMA mmap_size could be considered for specific workloads, especially with large BLOBs,
+                # but its effectiveness can be OS-dependent and requires careful benchmarking.
+                # Example: cursor.execute(f"PRAGMA mmap_size = {some_configured_value_in_bytes};")
+
                 self._local.conn = conn
             except sqlite3.Error as e:
                 logger.critical(f"Thread {threading.get_ident()}: CRITICAL Error creating SQLite connection or setting PRAGMAs: {e}", exc_info=True)
@@ -71,20 +79,28 @@ class SqliteKemRepository:
                     id TEXT PRIMARY KEY,
                     content_type TEXT,
                     content BLOB,
-                    metadata TEXT,
+                    metadata TEXT, -- Stored as JSON string
                     created_at TEXT,
                     updated_at TEXT
                 )
                 ''')
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_created_at ON kems (created_at);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_updated_at ON kems (updated_at);")
-                logger.info("Repository: Attempting to create JSON indexes (requires SQLite >= 3.38.0)...")
+
+                # JSON indexes are effective for querying fields within the 'metadata' JSON column.
+                # These require SQLite version 3.38.0 or higher for optimal performance and syntax.
+                # If older SQLite versions are used, these indexes might not be created or might not be effective,
+                # and metadata queries will be slower (full scan of metadata column).
+                logger.info("Repository: Attempting to create JSON indexes on metadata (requires SQLite >= 3.38.0 for full support)...")
                 try:
+                    # Example indexes for common metadata keys. Add more as needed based on query patterns.
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_meta_type ON kems(json_extract(metadata, '$.type'));")
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_kems_meta_source_system ON kems(json_extract(metadata, '$.source_system'));")
+                    # Add other specific JSON path indexes if certain metadata fields are frequently queried.
+                    # For example: CREATE INDEX IF NOT EXISTS idx_kems_meta_custom_field ON kems(json_extract(metadata, '$.custom_field'));
                     logger.info("Repository: JSON indexes (meta_type, meta_source_system) creation attempted.")
                 except sqlite3.Error as e_json_idx:
-                    logger.warning(f"Repository: Could not create JSON indexes (SQLite < 3.38.0 or other error): {e_json_idx}.", exc_info=True)
+                    logger.warning(f"Repository: Could not create one or more JSON indexes. This might be due to an older SQLite version (< 3.38.0) or other SQL error: {e_json_idx}. Metadata queries might be slower.", exc_info=True)
                 conn.commit()
             logger.info("Repository: 'kems' table and indexes in SQLite successfully initialized via Repository.")
         except Exception as e:
@@ -176,47 +192,100 @@ class SqliteKemRepository:
                               sql_conditions: List[str],
                               sql_params: List[Any],
                               page_size: int,
-                              offset: int,
-                              order_by_clause: str = "ORDER BY updated_at DESC" # Default order
-                             ) -> Tuple[List[Dict[str, Any]], str]: # Returns (kems_list, next_page_token)
+                              # Keyset pagination uses a page_token string instead of offset
+                              page_token: Optional[str],
+                              order_by_clause: str = "ORDER BY updated_at DESC, id DESC"
+                             ) -> Tuple[List[Dict[str, Any]], Optional[str]]: # Returns (kems_list, next_page_token)
         """
-        Retrieves KEMs based on a constructed SQL query, supporting filters, ordering, and pagination.
+        Retrieves KEMs based on a constructed SQL query, using keyset pagination.
+
+        The pagination logic relies on the `order_by_clause` and the `page_token`.
+        The `order_by_clause` must specify a unique ordering, typically ending with a unique key like `id`.
+        The `page_token` is an opaque string for the client, but internally it encodes the sort key values
+        of the last item from the previous page. For an `ORDER BY key1 DESC, key2 DESC` clause,
+        the page_token would internally represent `(value_key1, value_key2)` of the last item.
+        This method currently expects a simple "value1|value2" format for the token if two sort keys are used.
+        Example for default 'ORDER BY updated_at DESC, id DESC': page_token = "last_updated_at_iso|last_id_str"
         """
-        sql_where_clause = " WHERE " + " AND ".join(sql_conditions) if sql_conditions else ""
+        paginated_sql_conditions = list(sql_conditions) # Copy to avoid modifying the original list
+        paginated_sql_params = list(sql_params)
 
-        base_query = f"SELECT id, content_type, content, metadata, created_at, updated_at FROM kems{sql_where_clause}"
+        # Default sort keys (must match the end of order_by_clause for keyset pagination)
+        # This parsing is simplistic and assumes "col1 DESC/ASC, col2 DESC/ASC"
+        # A more robust parser might be needed for complex ORDER BY clauses.
+        # For now, hardcoding based on the expected default.
+        # This part MUST align with how DefaultGLMRepository sets order_by_clause.
+        # Current default: "ORDER BY updated_at DESC, id DESC"
+        primary_sort_col = "updated_at"
+        secondary_sort_col = "id"
+        primary_sort_order_desc = "DESC" in order_by_clause.upper() and primary_sort_col.upper() in order_by_clause.upper() # Simplified check
 
-        # For pagination check: count how many items would exist for the *next* page
-        # This is more efficient than counting all matching items if only existence is needed.
-        query_for_next_page_check = f"SELECT EXISTS({base_query} {order_by_clause} LIMIT 1 OFFSET ?)"
+        if page_token:
+            try:
+                # Assuming page_token is "last_updated_at_iso|last_id_str"
+                last_updated_at_str, last_id_str = page_token.split('|', 1)
 
-        # For current page results
-        query_paginated = f"{base_query} {order_by_clause} LIMIT ? OFFSET ?"
+                # Build WHERE clause for keyset pagination
+                # For (updated_at DESC, id DESC):
+                # (updated_at < ? OR (updated_at = ? AND id < ?))
+                if primary_sort_order_desc: # Assuming DESC for both for simplicity of this example
+                    keyset_condition = f"(({primary_sort_col} < ?) OR ({primary_sort_col} = ? AND {secondary_sort_col} < ?))"
+                    paginated_sql_params.extend([last_updated_at_str, last_updated_at_str, last_id_str])
+                else: # Assuming ASC for both
+                    keyset_condition = f"(({primary_sort_col} > ?) OR ({primary_sort_col} = ? AND {secondary_sort_col} > ?))"
+                    paginated_sql_params.extend([last_updated_at_str, last_updated_at_str, last_id_str])
+                paginated_sql_conditions.append(keyset_condition)
+                logger.debug(f"Applying keyset pagination: token='{page_token}', condition='{keyset_condition}'")
+            except ValueError:
+                logger.warning(f"Invalid page_token format: '{page_token}'. Ignoring for pagination.", exc_info=True)
+                # Proceed without keyset pagination if token is invalid (effectively first page)
 
-        found_kems_list = []
-        next_page_token_str = ""
+        sql_where_clause = " WHERE " + " AND ".join(paginated_sql_conditions) if paginated_sql_conditions else ""
 
+        # Query to fetch current page results
+        # LIMIT is page_size + 1 to check if there's a next page.
+        query_paginated = (
+            f"SELECT id, content_type, content, metadata, created_at, updated_at FROM kems"
+            f"{sql_where_clause} {order_by_clause} LIMIT ?"
+        )
+        # We fetch one extra item (page_size + 1) to determine if there's a next page.
+        paginated_sql_params.append(page_size + 1)
+
+        logger.debug(f"Executing keyset paginated query: {query_paginated} with params {paginated_sql_params}")
+
+        rows = []
         with self._get_sqlite_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-
-            # Fetch current page
-            current_page_params = sql_params + [page_size, offset]
-            logger.debug(f"Executing paginated query: {query_paginated} with params {current_page_params}")
-            cursor.execute(query_paginated, current_page_params)
+            cursor.execute(query_paginated, tuple(paginated_sql_params))
             rows = cursor.fetchall()
-            found_kems_list = [dict(row) for row in rows]
 
-            # Check if there's a next page
-            if len(rows) == page_size:
-                next_page_offset_for_check = offset + page_size
-                logger.debug(f"Checking for next page with offset {next_page_offset_for_check}")
-                cursor_count = conn.cursor() # Use a new cursor for this separate query
-                cursor_count.execute(query_for_next_page_check, sql_params + [next_page_offset_for_check])
-                if cursor_count.fetchone()[0] == 1: # EXISTS returns 1 if subquery has rows
-                    next_page_token_str = str(next_page_offset_for_check)
+        found_kems_list = [dict(row) for row in rows]
 
-        return found_kems_list, next_page_token_str
+        next_page_token_val: Optional[str] = None
+        if len(found_kems_list) > page_size:
+            # More items exist than requested for the current page, so there is a next page.
+            # The actual list returned should only contain page_size items.
+            last_item_for_current_page = found_kems_list[page_size -1] # The last item of the *current* page
+
+            # The token for the *next* page is based on the last item of the current page.
+            # Ensure these fields exist in the dict, which they should if selected.
+            next_token_updated_at = last_item_for_current_page.get(primary_sort_col)
+            next_token_id = last_item_for_current_page.get(secondary_sort_col)
+
+            if next_token_updated_at is not None and next_token_id is not None:
+                next_page_token_val = f"{str(next_token_updated_at)}|{str(next_token_id)}"
+            else:
+                logger.error(f"Failed to generate next_page_token: missing '{primary_sort_col}' or '{secondary_sort_col}' in last item.")
+
+            # Truncate the list to the requested page_size
+            found_kems_list = found_kems_list[:page_size]
+            logger.debug(f"Keyset pagination: Next page token generated: '{next_page_token_val}'")
+        else:
+            # Fewer items than page_size + 1 were returned, so this is the last page.
+            logger.debug("Keyset pagination: No next page.")
+
+        return found_kems_list, next_page_token_val
 
     def batch_store_or_replace_kems(self, kems_data: List[Dict[str, Any]]):
         """

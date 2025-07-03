@@ -59,6 +59,11 @@ class GLMConfig(BaseServiceConfig):
     HEALTH_CHECK_SQLITE_QUERY: str = Field(default="SELECT 1", description="SQLite query for health check.")
     HEALTH_CHECK_QDRANT_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for Qdrant health check operation.")
 
+    SQLITE_CACHE_SIZE_KB: Optional[int] = Field(
+        default=-2048, # Default to 2MiB per connection
+        description="SQLite per-connection cache size. Negative value N means N KiB. Positive value N means N pages. Example: -2048 for 2MiB."
+    )
+
 
 if __name__ == '__main__':
     # Пример использования и тестирования этой конфигурации
