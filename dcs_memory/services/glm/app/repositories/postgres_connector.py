@@ -3,6 +3,7 @@ import asyncpg # For PostgreSQL connection
 import json
 import logging
 from typing import List, Tuple, Optional, Dict, Any
+from datetime import datetime, timezone # For robust timestamp handling
 
 from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
 from dcs_memory.services.glm.app.config import ExternalDataSourceConfig, GLMConfig
@@ -39,6 +40,11 @@ class PostgresExternalRepository(BaseExternalRepository):
         # Created_at and Updated_at column mapping (optional, if not using timestamp_sort_column for both)
         self.created_at_column = self.config.mapping_config.get("created_at_column", self.timestamp_sort_column)
         self.updated_at_column = self.config.mapping_config.get("updated_at_column", self.timestamp_sort_column)
+
+        # Default timezone assumption for naive timestamps from DB (if PG column is TIMESTAMP WITHOUT TIME ZONE)
+        # For TIMESTAMPTZ, asyncpg should return timezone-aware datetimes.
+        self.assume_naive_timestamp_is_utc = self.config.mapping_config.get("assume_naive_timestamp_is_utc", True)
+
 
         # Mapping for filterable metadata columns: KEM metadata key -> PG column name
         self.filterable_metadata_columns: Dict[str, str] = self.config.mapping_config.get("filterable_metadata_columns", {})
@@ -142,44 +148,75 @@ class PostgresExternalRepository(BaseExternalRepository):
         # Keyset pagination logic
         # For simplicity, assume timestamp_sort_column is a_timestamp and id_tiebreaker_column is a_uuid or string
         # Order: timestamp_sort_column DESC, id_tiebreaker_column DESC
-        # (This needs to be configurable or more robustly parsed from an order_by config)
 
         where_clauses: List[str] = []
         query_params: List[Any] = [] # Parameters for asyncpg, $1, $2, etc.
-
         param_idx = 1 # For asyncpg parameter numbering
+
+        def _to_utc_datetime(dt: Optional[datetime]) -> Optional[datetime]:
+            if dt is None:
+                return None
+            if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None: # Naive datetime
+                if self.assume_naive_timestamp_is_utc:
+                    return dt.replace(tzinfo=timezone.utc)
+                else: # Try to localize to system timezone then convert to UTC (can be problematic)
+                    logger.warning(f"Naive datetime '{dt}' found; localizing to system time then UTC. Explicit TIMESTAMPTZ in PG is safer.")
+                    return dt.astimezone(timezone.utc)
+            return dt.astimezone(timezone.utc) # Ensure it's UTC
+
+        def _datetime_to_iso_utc_string(dt: Optional[datetime]) -> Optional[str]:
+            if dt is None:
+                return None
+            utc_dt = _to_utc_datetime(dt)
+            if utc_dt:
+                return utc_dt.isoformat(timespec='microseconds') # Includes timezone offset like +00:00
+            return None
+
+        def _iso_utc_string_to_datetime(iso_str: str) -> Optional[datetime]:
+            try:
+                dt = datetime.fromisoformat(iso_str)
+                return _to_utc_datetime(dt) # Ensure it's UTC for comparison
+            except (ValueError, TypeError):
+                logger.warning(f"Could not parse ISO string '{iso_str}' to datetime.")
+                return None
 
         # 1. Add metadata filter conditions from KEMQuery
         if internal_query.metadata_filters and self.filterable_metadata_columns:
             for filter_key, filter_value in internal_query.metadata_filters.items():
                 if filter_key in self.filterable_metadata_columns:
                     pg_column_name = self.filterable_metadata_columns[filter_key]
+                    # For timestamp columns, we might need to parse filter_value if it's an ISO string
+                    # and the PG column is a timestamp type. For now, assume direct equality for non-ts.
+                    # This logic might need to be more type-aware based on pg_column_name's type.
                     where_clauses.append(f'"{pg_column_name}" = ${param_idx}')
-                    query_params.append(filter_value)
+                    query_params.append(filter_value) # asyncpg handles basic type conversion
                     param_idx += 1
-                    logger.debug(f"PostgreSQL connector '{self.config.name}': Applying metadata filter: {pg_column_name} = {filter_value}")
+                    logger.debug(f"PostgreSQL connector '{self.config.name}': Applying metadata filter: \"{pg_column_name}\" = '{filter_value}'")
                 else:
                     logger.warning(f"PostgreSQL connector '{self.config.name}': Metadata filter key '{filter_key}' is not configured as filterable. Ignoring.")
 
         # 2. Add keyset pagination conditions (if page_token is present)
         if page_token:
             try:
-                last_ts_val_str, last_id_val_str = page_token.split('|', 1)
+                last_ts_iso_str, last_id_val_str = page_token.split('|', 1)
+                last_ts_dt = _iso_utc_string_to_datetime(last_ts_iso_str)
 
-                # For (timestamp_sort_column DESC, id_tiebreaker_column DESC):
-                # ( (timestamp_sort_column < $idx) OR
-                #   (timestamp_sort_column = $idx+1 AND id_tiebreaker_column < $idx+2) )
-                keyset_condition = (
-                    f'(("{self.timestamp_sort_column}" < ${param_idx}) OR '
-                    f' ("{self.timestamp_sort_column}" = ${param_idx+1} AND "{self.id_tiebreaker_column}" < ${param_idx+2}))'
-                )
-                where_clauses.append(keyset_condition)
-                # These values might need casting or type conversion depending on the column types in PG
-                # and how asyncpg handles them. For now, assuming string comparison works or types are compatible.
-                query_params.extend([last_ts_val_str, last_ts_val_str, last_id_val_str])
-                param_idx += 3
-                logger.debug(f"PostgreSQL connector '{self.config.name}': Applying keyset pagination from token '{page_token}'")
-            except ValueError:
+                if last_ts_dt:
+                    # For (timestamp_sort_column DESC, id_tiebreaker_column DESC):
+                    # ( (timestamp_sort_column < $ts) OR
+                    #   (timestamp_sort_column = $ts AND id_tiebreaker_column < $id) )
+                    keyset_condition = (
+                        f'(("{self.timestamp_sort_column}" < ${param_idx}) OR '
+                        f' ("{self.timestamp_sort_column}" = ${param_idx+1} AND "{self.id_tiebreaker_column}" < ${param_idx+2}))'
+                    )
+                    where_clauses.append(keyset_condition)
+                    # asyncpg expects datetime objects for timestamp columns, not strings.
+                    query_params.extend([last_ts_dt, last_ts_dt, last_id_val_str]) # last_id_val_str might need casting depending on PG col type
+                    param_idx += 3
+                    logger.debug(f"PostgreSQL connector '{self.config.name}': Applying keyset pagination from token '{page_token}' (parsed ts: {last_ts_dt})")
+                else:
+                    logger.warning(f"PostgreSQL connector '{self.config.name}': Could not parse timestamp from page_token '{page_token}'. Ignoring for pagination.")
+            except ValueError: # Handles split error
                 logger.warning(f"PostgreSQL connector '{self.config.name}': Invalid page_token format '{page_token}'. Ignoring for pagination (fetching first page of filtered results).", exc_info=True)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
@@ -204,14 +241,25 @@ class PostgresExternalRepository(BaseExternalRepository):
 
             for row_idx, pg_row in enumerate(pg_rows):
                 if row_idx == page_size: # This is the extra item indicating a next page
-                    last_item_for_current_page = dict(pg_rows[page_size -1]) # The actual last item of current page
-                    next_ts_val = last_item_for_current_page.get(self.timestamp_sort_column)
+                    last_item_for_current_page = dict(pg_rows[page_size - 1]) # The actual last item of current page
+
+                    next_ts_dt_obj = last_item_for_current_page.get(self.timestamp_sort_column) # Should be a datetime object from asyncpg
                     next_id_val = last_item_for_current_page.get(self.id_tiebreaker_column)
-                    if next_ts_val is not None and next_id_val is not None:
-                        # Convert timestamp to string if it's a datetime object
-                        next_ts_val_str = str(next_ts_val.isoformat() if hasattr(next_ts_val, 'isoformat') else next_ts_val)
-                        next_page_token_val = f"{next_ts_val_str}|{str(next_id_val)}"
-                    break # Stop processing, we have our page_size items
+
+                    if next_ts_dt_obj is not None and next_id_val is not None:
+                        # Convert timestamp to standardized ISO UTC string for the token
+                        next_ts_iso_str = _datetime_to_iso_utc_string(next_ts_dt_obj)
+                        if next_ts_iso_str:
+                            next_page_token_val = f"{next_ts_iso_str}|{str(next_id_val)}"
+                        else:
+                            logger.error(f"PostgreSQL connector '{self.config.name}': Failed to format next_page_token timestamp for KEM ID {next_id_val}.")
+                    else:
+                        logger.error(f"PostgreSQL connector '{self.config.name}': Failed to generate next_page_token due to missing sort column values in last item: ts_col='{self.timestamp_sort_column}', id_col='{self.id_tiebreaker_column}'.")
+
+                    # Truncate the list to the requested page_size
+                    # This was missing, should be done after this block, before returning.
+                    # Corrected: This break is correct, found_kems_list will be built up to page_size.
+                    break
 
                 kem = kem_pb2.KEM()
                 kem.id = str(pg_row.get(self.id_column, "")) # Ensure ID is string
@@ -227,14 +275,24 @@ class PostgresExternalRepository(BaseExternalRepository):
 
                 kem.content_type = self.content_type_value # Could also be mapped from a column
 
-                # Timestamps
-                created_at_val = pg_row.get(self.created_at_column)
-                if created_at_val and hasattr(created_at_val, 'timestamp'): # if datetime object
-                    kem.created_at.FromSeconds(int(created_at_val.timestamp()))
+                # Timestamps - ensure they are UTC and then convert to protobuf Timestamp
+                created_at_db_val = pg_row.get(self.created_at_column) # Expected to be datetime from asyncpg
+                created_at_utc = _to_utc_datetime(created_at_db_val)
+                if created_at_utc:
+                    kem.created_at.FromSeconds(int(created_at_utc.timestamp()))
+                    kem.created_at.nanos = created_at_utc.microsecond * 1000
 
-                updated_at_val = pg_row.get(self.updated_at_column)
-                if updated_at_val and hasattr(updated_at_val, 'timestamp'): # if datetime object
-                    kem.updated_at.FromSeconds(int(updated_at_val.timestamp()))
+                updated_at_db_val = pg_row.get(self.updated_at_column) # Expected to be datetime from asyncpg
+                updated_at_utc = _to_utc_datetime(updated_at_db_val)
+                if updated_at_utc:
+                    kem.updated_at.FromSeconds(int(updated_at_utc.timestamp()))
+                    kem.updated_at.nanos = updated_at_utc.microsecond * 1000
+                elif self.updated_at_column == self.timestamp_sort_column and created_at_utc:
+                    # If updated_at is same as sort col, and sort col was primary for KEM updated_at
+                    # but was missing for some reason, use created_at if available, or log error.
+                    # This case should be rare if sort column is reliable.
+                    logger.warning(f"KEM ID {kem.id}: updated_at_column ('{self.updated_at_column}') value missing or unparseable, but it's also the sort column. This is problematic.")
+
 
                 # Metadata
                 if self.metadata_json_column:

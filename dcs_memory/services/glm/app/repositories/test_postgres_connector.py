@@ -161,10 +161,14 @@ class TestPostgresExternalRepository(unittest.TestCase):
         # Mock asyncpg.Record manually or use MagicMock with spec
         # For simplicity, let's use MagicMock and configure .get for expected columns
         mock_pg_row1 = MagicMock()
+        # Simulate asyncpg returning timezone-aware datetime for TIMESTAMPTZ
+        aware_datetime_updated = datetime(2023, 1, 1, 10, 0, 0, microsecond=123456, tzinfo=timezone.utc)
+        aware_datetime_created = datetime(2023, 1, 1, 9, 0, 0, microsecond=654321, tzinfo=timezone.utc)
+
         mock_pg_row1.get.side_effect = lambda key, default=None: {
             "doc_id": "pg_kem_1", "doc_content": "Content from PG 1",
-            "updated_ts": datetime.datetime(2023, 1, 1, 10, 0, 0, tzinfo=datetime.timezone.utc),
-            "created_ts_col": datetime.datetime(2023, 1, 1, 9, 0, 0, tzinfo=datetime.timezone.utc),
+            "updated_ts": aware_datetime_updated,
+            "created_ts_col": aware_datetime_created,
             "meta_json_col": {"tag": "alpha", "version": 1.0},
             "pg_col_for_meta1": "value1"
         }.get(key, default)
@@ -176,7 +180,8 @@ class TestPostgresExternalRepository(unittest.TestCase):
             "table_name": "docs", "id_column": "doc_id", "content_column": "doc_content",
             "timestamp_sort_column": "updated_ts", "created_at_column": "created_ts_col",
             "metadata_json_column": "meta_json_col",
-            "metadata_columns_map": {"custom_field": "pg_col_for_meta1"}
+            "metadata_columns_map": {"custom_field": "pg_col_for_meta1"},
+            "assume_naive_timestamp_is_utc": True # Explicit for clarity
         }
         config = ExternalDataSourceConfig(
             name="pg_test_retrieve", type="postgresql",
@@ -196,9 +201,11 @@ class TestPostgresExternalRepository(unittest.TestCase):
         self.assertEqual(kem1.content.decode('utf-8'), "Content from PG 1")
         self.assertEqual(kem1.content_type, "text/plain") # Default
 
-        # Timestamps (seconds since epoch)
-        self.assertEqual(kem1.created_at.seconds, int(datetime.datetime(2023, 1, 1, 9, 0, 0, tzinfo=datetime.timezone.utc).timestamp()))
-        self.assertEqual(kem1.updated_at.seconds, int(datetime.datetime(2023, 1, 1, 10, 0, 0, tzinfo=datetime.timezone.utc).timestamp()))
+        # Timestamps (seconds since epoch & nanos)
+        self.assertEqual(kem1.created_at.seconds, int(aware_datetime_created.timestamp()))
+        self.assertEqual(kem1.created_at.nanos, aware_datetime_created.microsecond * 1000)
+        self.assertEqual(kem1.updated_at.seconds, int(aware_datetime_updated.timestamp()))
+        self.assertEqual(kem1.updated_at.nanos, aware_datetime_updated.microsecond * 1000)
 
         self.assertEqual(kem1.metadata["tag"], "alpha")
         self.assertEqual(kem1.metadata["version"], "1.0") # Pydantic converts numbers to string for map<string,string>
@@ -333,14 +340,18 @@ class TestPostgresExternalRepository(unittest.TestCase):
         mock_conn = AsyncMock(spec=asyncpg.Connection)
         mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        # Mock data for two pages
-        ts1 = datetime.datetime(2023, 1, 1, 10, 0, 0, tzinfo=datetime.timezone.utc)
-        ts2 = datetime.datetime(2023, 1, 1, 9, 0, 0, tzinfo=datetime.timezone.utc)
-        mock_pg_row1 = MagicMock(); mock_pg_row1.get.side_effect = lambda k,d=None: {"doc_id":"id1","updated_ts":ts1, self.base_mapping_config["content_column"]:"c1"}.get(k,d)
-        mock_pg_row2 = MagicMock(); mock_pg_row2.get.side_effect = lambda k,d=None: {"doc_id":"id2","updated_ts":ts2, self.base_mapping_config["content_column"]:"c2"}.get(k,d)
+        # Mock data for two pages - ensure microseconds for robust ISO formatting
+        # These should be UTC aware as asyncpg would return for TIMESTAMPTZ
+        ts1_aware = datetime(2023, 1, 1, 10, 0, 0, microsecond=123000, tzinfo=timezone.utc)
+        ts2_aware = datetime(2023, 1, 1, 9, 0, 0, microsecond=456000, tzinfo=timezone.utc)
+        mock_pg_row1 = MagicMock()
+        mock_pg_row1.get.side_effect = lambda k,d=None: {"doc_id":"id1", "updated_ts":ts1_aware, self.base_mapping_config.get("content_column"):"c1"}.get(k,d)
+        mock_pg_row2 = MagicMock()
+        mock_pg_row2.get.side_effect = lambda k,d=None: {"doc_id":"id2", "updated_ts":ts2_aware, self.base_mapping_config.get("content_column"):"c2"}.get(k,d)
 
         # First call to fetch (page 1)
-        mock_conn.fetch.return_value = [mock_pg_row1, mock_pg_row2] # page_size=1, limit=2, returns 2 items
+        # page_size=1, so limit for query is 1+1=2. We return 2 rows, so there is a next page.
+        mock_conn.fetch.return_value = [mock_pg_row1, mock_pg_row2]
 
         mapping_config_filterable = {
             **self.base_mapping_config,
@@ -361,35 +372,38 @@ class TestPostgresExternalRepository(unittest.TestCase):
         self.assertEqual(len(kems_p1), 1)
         self.assertEqual(kems_p1[0].id, "id1")
         self.assertIsNotNone(next_token_p1)
-        expected_token_p1 = f"{ts1.isoformat()}|id1"
+        # Expected token format: YYYY-MM-DDTHH:MM:SS.ffffff+00:00|id
+        expected_token_p1 = f"{ts1_aware.isoformat(timespec='microseconds')}|id1"
         self.assertEqual(next_token_p1, expected_token_p1)
 
         call_args_p1 = mock_conn.fetch.call_args[0]
         query_string_p1 = call_args_p1[0]
         query_params_p1 = call_args_p1[1:]
-        self.assertIn('WHERE "pg_status_col" = $1', query_string_p1)
-        self.assertIn('LIMIT $2', query_string_p1)
-        self.assertEqual(query_params_p1[0], "active")
-        self.assertEqual(query_params_p1[1], 2) # page_size(1) + 1
+        self.assertIn('WHERE "pg_status_col" = $1', query_string_p1) # Filter
+        self.assertIn('LIMIT $2', query_string_p1)                   # Limit
+        self.assertEqual(query_params_p1[0], "active")              # Filter value
+        self.assertEqual(query_params_p1[1], 2)                     # page_size(1) + 1
 
         # Setup for Page 2 call
-        mock_conn.fetch.return_value = [mock_pg_row2] # Only one item left for page 2
+        mock_conn.fetch.return_value = [mock_pg_row2] # Only one item left for page 2 (limit 1+1=2, returns 1)
         kems_p2, next_token_p2 = await repo.retrieve_mapped_kems(internal_query=query, page_size=1, page_token=next_token_p1)
 
         self.assertEqual(len(kems_p2), 1)
         self.assertEqual(kems_p2[0].id, "id2")
-        self.assertIsNone(next_token_p2) # Last page
+        self.assertIsNone(next_token_p2) # Last page because fetch returned fewer than page_size+1
 
         call_args_p2 = mock_conn.fetch.call_args[0]
         query_string_p2 = call_args_p2[0]
         query_params_p2 = call_args_p2[1:]
+
+        # Check for filter AND keyset conditions
         self.assertIn('WHERE "pg_status_col" = $1 AND (("updated_ts" < $2) OR ("updated_ts" = $3 AND "doc_id" < $4))', query_string_p2)
         self.assertIn('LIMIT $5', query_string_p2)
         self.assertEqual(query_params_p2[0], "active") # status filter
-        self.assertEqual(query_params_p2[1], ts1.isoformat()) # keyset ts
-        self.assertEqual(query_params_p2[2], ts1.isoformat()) # keyset ts for =
-        self.assertEqual(query_params_p2[3], "id1")          # keyset id
-        self.assertEqual(query_params_p2[4], 2)              # limit
+        self.assertEqual(query_params_p2[1], ts1_aware) # keyset ts (datetime object)
+        self.assertEqual(query_params_p2[2], ts1_aware) # keyset ts for = (datetime object)
+        self.assertEqual(query_params_p2[3], "id1")     # keyset id
+        self.assertEqual(query_params_p2[4], 2)         # limit (page_size + 1)
 
         await repo.disconnect()
 
