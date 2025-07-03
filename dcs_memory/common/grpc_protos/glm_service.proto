@@ -23,6 +23,9 @@ service GlobalLongTermMemory {
 
   // Batch stores KEMs.
   rpc BatchStoreKEMs(BatchStoreKEMsRequest) returns (BatchStoreKEMsResponse);
+
+  // Triggers indexing of a configured external data source into KPS.
+  rpc IndexExternalDataSource(IndexExternalDataSourceRequest) returns (IndexExternalDataSourceResponse);
 }
 
 // ----- Messages for StoreKEM -----
@@ -47,6 +50,7 @@ message KEMQuery {
   google.protobuf.Timestamp updated_at_start = 7;
   google.protobuf.Timestamp updated_at_end = 8;
   // Other filter types could be added: e.g., for numerical ranges in metadata.
+  optional string data_source_name = 9; // Specifies an external data source by its configured name. If empty, queries native GLM storage.
 }
 
 message RetrieveKEMsRequest {
@@ -92,4 +96,19 @@ message BatchStoreKEMsResponse {
   // Alternatively, if KEMs in the request must have IDs (even client-side), can return failed_kem_ids.
   repeated string failed_kem_references = 2; // Can be an ID (if provided in request) or an index like "req_idx_0", "req_idx_1".
   string overall_error_message = 3; // General error message if the batch operation had issues.
+}
+
+// ----- Messages for IndexExternalDataSource -----
+message IndexExternalDataSourceRequest {
+  string data_source_name = 1; // The configured name of the external data source to index.
+  // bool full_reindex = 2; // Optional: Flag to indicate if a full re-index should be performed.
+                           // Default might be incremental if supported by the connector/KPS interaction.
+                           // For PoC, likely always a full fetch from external source.
+}
+
+message IndexExternalDataSourceResponse {
+  string status_message = 1;      // e.g., "Indexing started", "Completed", "Error: <details>"
+  uint32 items_processed = 2; // Number of items successfully sent to KPS (or attempted).
+  uint32 items_failed = 3;    // Number of items that failed during fetching or sending to KPS.
+  // string details_url = 4;  // Optional: URL to a log or more detailed status if it's a long process.
 }

@@ -74,7 +74,7 @@ graph TD
 ### 2.1. Global Lifetime Memory (GLM)
 
 **Purpose:**
-GLM serves as the long-term, persistent memory store for the DCSM system. It is designed to hold information that needs to be retained across agent sessions, system restarts, or even different agent instantiations if the data is shared. This includes factual knowledge, learned experiences, user preferences, historical interactions, and any data deemed valuable for future reference.
+GLM serves as the long-term, persistent memory store for the DCSM system. It is designed to hold information that needs to be retained across agent sessions, system restarts, or even different agent instantiations if the data is shared. This includes factual knowledge, learned experiences, user preferences, historical interactions, and any data deemed valuable for future reference. In addition to its native SQLite-based storage, GLM can be configured to connect to and retrieve data from existing external user databases, providing a unified query interface over diverse data sources.
 
 **Key Characteristics:**
 -   **Persistence:** Data stored in GLM is durable and survives system shutdowns.
@@ -380,6 +380,7 @@ The three memory components work in concert, with data flowing between them and 
     -   **GLM:** Uses KEM URIs as the primary key (`kem_uri` column) for its `memories` table, ensuring each persistent memory item is uniquely addressable.
     -   **KPS:** Uses KEM URIs as document IDs within its vector store (ChromaDB). This links the embeddings and content stored in KPS back to the conceptual memory item. When KPS returns search results, it provides the KEM URIs of matching items.
     -   **SWM:** While SWM's in-memory store uses arbitrary string keys, these keys *can* be KEM URIs if the data being stored corresponds to a conceptual KEM. This is an application-level decision.
+    -   **External Sources:** When data is indexed into KPS from an external data source via GLM, a convention like `kem:external:<data_source_name>:<original_id_from_source>` is used to ensure uniqueness and traceability.
 -   **Benefits:**
     -   **Unambiguous Referencing:** Allows different parts of the system to refer to the same piece of information consistently.
     -   **Inter-Service Linking:** KPS results (KEM URIs) can be used to retrieve detailed metadata or original context from GLM.
@@ -508,7 +509,58 @@ GLM's primary configuration relates to its SQLite database file.
     *   Defines the address and port the GLM gRPC service listens on (e.g., `[::]:50051`).
     *   The exact environment variable might depend on how the service is launched (e.g., `GLM_GRPC_LISTEN_ADDRESS` for the config field `GRPC_LISTEN_ADDRESS`).
 
-**8.2. Short-Term Working Memory (SWM)**
+*   **External Data Sources (`GLM_EXTERNAL_DATA_SOURCES` via complex env var or config file):**
+    *   Allows GLM to connect to and query user-defined external databases. This is typically configured via a YAML file or structured environment variables due to its complexity.
+    *   It's a list of configurations, where each item defines an external data source:
+        *   `name` (string, required): A unique name for this data source, referenced in `KEMQuery.data_source_name`.
+        *   `type` (string, required): The type of the external database (e.g., "postgresql", "mongodb"). GLM needs a corresponding connector implementation for this type.
+        *   `connection_uri` (string, optional): A full connection URI for the database.
+        *   `connection_details` (object, optional): Key-value pairs for connection (e.g., `host`, `port`, `user`, `password`, `dbname`). Use if `connection_uri` is not provided.
+        *   `mapping_config` (object, required): Defines how data from the external source maps to KEM structures. The specifics depend on the connector `type`. This includes table names, column mappings for KEM fields (ID, content, metadata, timestamps), and potentially query templates or transformation rules. Crucially, for data intended for KPS indexing via GLM's `IndexExternalDataSource` RPC, this config must clearly identify which column(s) provide the primary textual content for KPS to embed (e.g., `content_column` in the PostgreSQL connector example).
+    *   Example (conceptual YAML snippet for `external_data_sources`):
+        ```yaml
+        external_data_sources:
+          - name: "my_legacy_pg_notes"
+            type: "postgresql"
+            connection_uri: "postgresql://user:pass@host:port/dbname"
+            mapping_config: # Specific structure depends on the 'type'
+              # Example for type: "postgresql"
+              table_name: "public.my_documents" # Name of the table to query
+              id_column: "document_id"          # Column to use as KEM ID (must be unique)
+              content_column: "content_text"    # Column containing the main KEM content
+              timestamp_sort_column: "modified_date" # Column for ordering and keyset pagination (e.g., updated_at)
+
+              # Optional:
+              id_tiebreaker_column: "document_id" # Tie-breaker for pagination if timestamps are not unique (defaults to id_column)
+              content_type_value: "text/plain"  # Default KEM content_type if not mapped from a column
+              created_at_column: "creation_date"   # Column for KEM created_at timestamp (defaults to timestamp_sort_column)
+              updated_at_column: "modified_date"   # Column for KEM updated_at timestamp (defaults to timestamp_sort_column)
+
+              # Metadata mapping (choose one or combine if connector supports it):
+              metadata_json_column: "metadata_jsonb" # If one PG column contains a JSON/JSONB object for all metadata
+              metadata_columns_map: # Or, map specific PG columns to KEM metadata keys (values become string in KEM metadata)
+                kem_meta_key_1: "pg_column_for_meta1"
+                kem_meta_key_2: "pg_column_for_meta2"
+                project_tag: "project_name_column"
+
+              filterable_metadata_columns: # Map KEM metadata keys to PG columns that can be used in WHERE clauses for exact matches
+                                           # KEMQuery.metadata_filters will use these mappings.
+                category: "document_category_column" # Allows filtering by KEMQuery.metadata_filters["category"]
+                status_flag: "current_processing_status_column"
+
+          # Example for another source (details would depend on its connector)
+          # - name: "my_csv_archive"
+          #   type: "csv_dir" # Hypothetical CSV connector
+          #   connection_details:
+          #     path: "/mnt/archive/csv_reports/"
+          #   mapping_config:
+          #     id_column_name: "ReportID"
+          #     content_column_indices: [2, 3] # e.g., join multiple columns for content
+          #     timestamp_column_name: "DateGenerated"
+          #     delimiter: ";"
+        ```
+
+**9.2. Short-Term Working Memory (SWM)**
 
 SWM relies on Redis for its pub/sub capabilities and can be configured accordingly.
 
@@ -521,7 +573,7 @@ SWM relies on Redis for its pub/sub capabilities and can be configured according
 *   **Service Port:**
     *   The gRPC service port for SWM (e.g., 50052) is defined when running the server (`python -m swm.swm_node`). Configurable similarly to GLM's port (e.g., `SWM_PORT`).
 
-**8.3. Knowledge Processing Service (KPS)**
+**9.3. Knowledge Processing Service (KPS)**
 
 KPS has several configuration points related to its embedding model and vector store.
 
@@ -547,10 +599,18 @@ This summarizes the primary gRPC service methods for each memory component. Refe
 
 **Global Lifetime Memory (GLM) - `dcsm.GlobalLongTermMemory` (from `glm_service.proto`)**
 -   `StoreKEM(StoreKEMRequest) returns (StoreKEMResponse)`: Stores a single KEM. If the ID in the KEM is not specified, the server generates one.
--   `RetrieveKEMs(RetrieveKEMsRequest) returns (RetrieveKEMsResponse)`: Retrieves KEMs based on various criteria. The `page_token` in the request is used for efficient keyset-based pagination.
+-   `RetrieveKEMs(RetrieveKEMsRequest) returns (RetrieveKEMsResponse)`: Retrieves KEMs based on criteria defined in the `KEMQuery` message within the request.
+    -   The `KEMQuery` supports filtering by:
+        -   `ids` (list of KEM IDs)
+        -   `metadata_filters` (exact key-value matches on metadata fields)
+        -   `created_at_start`, `created_at_end`, `updated_at_start`, `updated_at_end` (timestamp ranges)
+        -   `text_query` and `embedding_query` (for semantic search, typically handled by KPS or a vector-enabled backend)
+        -   `data_source_name` (optional): Specifies a configured external data source by its unique name. If empty, queries GLM's native storage.
+    -   The `page_token` in `RetrieveKEMsRequest` is used for efficient keyset-based pagination over the results.
 -   `UpdateKEM(UpdateKEMRequest) returns (KEM)`: Updates an existing KEM. The KEM ID must be specified.
 -   `DeleteKEM(DeleteKEMRequest) returns (google.protobuf.Empty)`: Deletes a KEM by its ID.
 -   `BatchStoreKEMs(BatchStoreKEMsRequest) returns (BatchStoreKEMsResponse)`: Stores multiple KEMs in a batch.
+-   `IndexExternalDataSource(IndexExternalDataSourceRequest) returns (IndexExternalDataSourceResponse)`: Triggers GLM to fetch data from a configured external data source (specified by `data_source_name` in the request) and submit it to KPS for indexing. Returns a status message, count of items processed, and items failed.
 
 **Short-Term Working Memory (SWM) - `swm.SWMService` (from `swm_service.proto`)**
 -   `StoreMemory(key: str, value: str, ttl_seconds: int) returns (StoreMemoryResponse)`

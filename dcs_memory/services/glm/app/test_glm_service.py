@@ -352,3 +352,104 @@ class TestGLMRetrieveKEMs(unittest.TestCase):
         self.assertEqual(len(response2.kems), 1)
         self.assertEqual(response2.kems[0].id, "kem_id_1")
         self.assertEqual(response2.next_page_token, "") # Last page for this filter
+
+
+    # --- Tests for External Data Source Dispatch ---
+
+    async def mock_external_retrieve_kems(self, page_size: int, page_token: Optional[str]):
+        # Simple mock implementation for BaseExternalRepository
+        # In a real test for a connector, this would interact with a mock DB or return specific data
+        mock_kem = create_proto_kem(id="ext_kem_1", content="External KEM content", metadata={"source": "external_db_A"})
+        if page_token is None: # First page
+            return [mock_kem], "next_ext_token"
+        elif page_token == "next_ext_token": # Second page
+            mock_kem_2 = create_proto_kem(id="ext_kem_2", content="External KEM content 2", metadata={"source": "external_db_A"})
+            return [mock_kem_2], None # No more pages
+        return [], None
+
+    def test_retrieve_kems_dispatch_to_external_source(self):
+        # 1. Configure an external data source in the config used by the servicer
+        mock_external_source_name = "my_external_db"
+        self.servicer.storage_repository.external_repos[mock_external_source_name] = MagicMock(spec=BaseExternalRepository)
+
+        # Make the mocked method an async mock
+        mock_external_repo_instance = self.servicer.storage_repository.external_repos[mock_external_source_name]
+
+        # Wrap the synchronous mock_external_retrieve_kems in an async function for side_effect
+        async def async_mock_retriever(*args, **kwargs):
+            return await self.mock_external_retrieve_kems(*args, **kwargs)
+
+        mock_external_repo_instance.retrieve_mapped_kems = MagicMock(side_effect=async_mock_retriever)
+
+        # 2. Call RetrieveKEMs with data_source_name
+        query = glm_service_pb2.KEMQuery(data_source_name=mock_external_source_name)
+        request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1)
+
+        response = self.servicer.RetrieveKEMs(request, None) # Servicer calls asyncio.run internally
+
+        # 3. Assert that the external repository's method was called
+        mock_external_repo_instance.retrieve_mapped_kems.assert_called_once_with(
+            page_size=1,
+            page_token=None # Initial call has no page_token
+        )
+        self.assertEqual(len(response.kems), 1)
+        self.assertEqual(response.kems[0].id, "ext_kem_1")
+        self.assertEqual(response.next_page_token, "next_ext_token")
+
+        # Test fetching the next page from external source
+        request_page2 = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1, page_token="next_ext_token")
+        response_page2 = self.servicer.RetrieveKEMs(request_page2, None)
+
+        mock_external_repo_instance.retrieve_mapped_kems.assert_called_with(
+            page_size=1,
+            page_token="next_ext_token"
+        )
+        self.assertEqual(len(response_page2.kems), 1)
+        self.assertEqual(response_page2.kems[0].id, "ext_kem_2")
+        self.assertIsNone(response_page2.next_page_token or None) # Ensure it's empty or None
+
+
+    def test_retrieve_kems_fall_back_to_native_if_no_data_source_name(self):
+        # Ensure Qdrant mock is in place for native vector search path if triggered
+        self.mock_qdrant_instance.search_points.return_value = [] # No Qdrant results
+
+        # Spy on the native SQLite retrieval method
+        with patch.object(self.servicer.storage_repository.sqlite_repo, 'retrieve_kems_from_db',
+                          wraps=self.servicer.storage_repository.sqlite_repo.retrieve_kems_from_db) as mock_sqlite_retrieve:
+
+            query = glm_service_pb2.KEMQuery() # No data_source_name
+            request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=2)
+
+            response = self.servicer.RetrieveKEMs(request, None)
+
+            mock_sqlite_retrieve.assert_called_once()
+            self.assertEqual(len(response.kems), 2) # Should get from pre-populated native SQLite data
+            self.assertEqual(response.kems[0].id, "kem_id_4") # Default order from setup
+
+    def test_retrieve_kems_error_if_unknown_data_source_name(self):
+        query = glm_service_pb2.KEMQuery(data_source_name="non_existent_source")
+        request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=2)
+
+        # The servicer should catch InvalidQueryError from DefaultGLMRepository and abort
+        # For unittest, we can check the context manager for grpc.RpcError (which abort raises)
+        # This requires running the servicer method in a way that gRPC context is available or mocked.
+        # Simpler: check if DefaultGLMRepository.retrieve_kems raises InvalidQueryError
+
+        # Patch asyncio.run to avoid issues if called within a running loop (e.g. by async_test)
+        # and to directly test the async method of the repository.
+        with patch('asyncio.run') as mock_asyncio_run:
+            # Define a side effect for asyncio.run that simply executes the coroutine
+            async def immediate_coro_runner(coro):
+                return await coro
+            mock_asyncio_run.side_effect = immediate_coro_runner
+
+            with self.assertRaises(grpc.RpcError) as context: # type: ignore
+                 self.servicer.RetrieveKEMs(request, MagicMock()) # MagicMock for gRPC context
+
+            self.assertEqual(context.exception.code(), grpc.StatusCode.INVALID_ARGUMENT) # type: ignore
+            self.assertIn("External data source 'non_existent_source' not available", context.exception.details()) # type: ignore
+
+# Need to import BaseExternalRepository for type hinting and MagicMock spec
+from dcs_memory.services.glm.app.repositories.external_base import BaseExternalRepository
+from typing import Optional # For Optional type hint
+import grpc # For grpc.RpcError and grpc.StatusCode

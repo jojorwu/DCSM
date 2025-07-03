@@ -2,3 +2,4 @@ grpcio
 grpcio-tools
 protobuf
 qdrant-client
+asyncpg # For PostgreSQL external connector

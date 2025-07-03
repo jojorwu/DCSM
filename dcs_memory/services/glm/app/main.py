@@ -10,10 +10,11 @@ from qdrant_client import QdrantClient, models
 from qdrant_client.http.models import PointStruct
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.protobuf.json_format import ParseDict
-import typing
+from typing import List, Optional # Added for type hints
 import logging
 
 from .config import GLMConfig
+from .repositories.base import StorageError # For specific exception handling
 # from .repositories import SqliteKemRepository, QdrantKemRepository # Will be used by DefaultGLMRepository
 from .repositories.base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
 # Placeholder for the default implementation, will be created in a later step
@@ -91,15 +92,17 @@ setup_logging(config)
 logger = logging.getLogger(__name__) # Get a logger specific to this module
 
 from generated_grpc import kem_pb2
-from generated_grpc import glm_service_pb2
-from generated_grpc import glm_service_pb2_grpc
+from generated_grpc import glm_service_pb2, glm_service_pb2_grpc
+from generated_grpc import kps_service_pb2, kps_service_pb2_grpc # For KPS Client
 from google.protobuf import empty_pb2
 from grpc_health.v1 import health_pb2 # For HealthCheckResponse.ServingStatus enum
+import grpc # For KPS client channel
 
 class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemoryServicer):
     def __init__(self):
         logger.info("Initializing GlobalLongTermMemoryServicerImpl...")
         self.config: GLMConfig = config
+        self.kps_client_stub: Optional[kps_service_pb2_grpc.KnowledgeProcessingServiceStub] = None
 
         # Initialize the unified storage repository
         # The actual instantiation will depend on configuration (Step 5 of plan)
@@ -135,6 +138,33 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             raise ValueError(f"Unsupported GLM_STORAGE_BACKEND_TYPE: {backend_type}")
 
         logger.info("GLM servicer initialized with unified storage repository.")
+        self._init_kps_client()
+
+
+    def _init_kps_client(self):
+        kps_host = self.config.KPS_SERVICE_HOST
+        kps_port = self.config.KPS_SERVICE_PORT
+        if kps_host and kps_port:
+            kps_address = f"{kps_host}:{kps_port}"
+            logger.info(f"Attempting to connect to KPS service at {kps_address}...")
+            try:
+                # TODO: Add TLS credentials for KPS client if KPS server is secured
+                # For now, assuming insecure channel for PoC
+                channel = grpc.insecure_channel(kps_address)
+
+                # Quick connectivity test (optional, but good for early feedback)
+                # grpc.channel_ready_future(channel).result(timeout=5) # Blocking, maybe not ideal in constructor
+
+                self.kps_client_stub = kps_service_pb2_grpc.KnowledgeProcessingServiceStub(channel)
+                logger.info(f"KPS client stub initialized for address {kps_address}.")
+                # To verify connection, one might make a dummy call here or rely on first actual use.
+                # For example, KPS might have a HealthCheck or a simple GetStatus RPC.
+            except Exception as e:
+                logger.error(f"Failed to initialize KPS client for address {kps_address}: {e}", exc_info=True)
+                self.kps_client_stub = None # Ensure it's None if init fails
+        else:
+            logger.warning("KPS_SERVICE_HOST or KPS_SERVICE_PORT not configured. KPS client will not be available.")
+            self.kps_client_stub = None
 
     # The _check_sqlite_health and _check_qdrant_health methods are no longer needed here,
     # as health checking will be delegated to self.storage_repository.check_health().
@@ -448,6 +478,145 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         return glm_service_pb2.BatchStoreKEMsResponse(
             failed_kem_references=list(set(initial_failed_refs + all_original_refs)),
             overall_error_message="Batch store failed due to an unexpected error after initial processing."
+        )
+
+    # --- Method for KPS Indexing of External Data Sources ---
+    def IndexExternalDataSource(self, request: glm_service_pb2.IndexExternalDataSourceRequest, context) -> glm_service_pb2.IndexExternalDataSourceResponse:
+        start_time = time.monotonic()
+        data_source_name = request.data_source_name
+        logger.info(f"IndexExternalDataSource: Called for data_source_name='{data_source_name}'.")
+
+        items_processed_total = 0
+        items_failed_total = 0
+        page_size_for_fetch = self.config.DEFAULT_PAGE_SIZE # Or make this configurable for indexing
+
+        if not data_source_name:
+            msg = "data_source_name is required."
+            logger.warning(f"IndexExternalDataSource: {msg}")
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
+            return glm_service_pb2.IndexExternalDataSourceResponse()
+
+        if not self.kps_client_stub:
+            msg = "KPS client is not available in GLM. Cannot index external data."
+            logger.error(f"IndexExternalDataSource: {msg} For source '{data_source_name}'.")
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, msg)
+            return glm_service_pb2.IndexExternalDataSourceResponse()
+
+        external_repo = self.storage_repository.external_repos.get(data_source_name)
+        if not external_repo:
+            msg = f"External data source '{data_source_name}' not found or not configured."
+            logger.warning(f"IndexExternalDataSource: {msg}")
+            context.abort(grpc.StatusCode.NOT_FOUND, msg)
+            return glm_service_pb2.IndexExternalDataSourceResponse()
+
+        logger.info(f"IndexExternalDataSource: Starting data fetch and KPS indexing for source '{data_source_name}'. Page size: {page_size_for_fetch}")
+
+        current_page_token: Optional[str] = None
+        has_more_pages = True
+        kps_batch_size = 50 # How many items to send to KPS in one BatchAddMemories call
+
+        try:
+            while has_more_pages:
+                kems_from_external_source: List[kem_pb2.KEM] = []
+                next_page_token_from_connector: Optional[str] = None
+
+                # Construct a dummy KEMQuery for the external repo, as it might expect one.
+                # The external repo for now mostly uses mapping_config for query details.
+                # Filters in this dummy query won't be used by the basic connectors yet.
+                dummy_query_for_connector = glm_service_pb2.KEMQuery()
+
+
+                try:
+                    # retrieve_mapped_kems is async, call it appropriately
+                    kems_from_external_source, next_page_token_from_connector = asyncio.run(
+                        external_repo.retrieve_mapped_kems(
+                            internal_query=dummy_query_for_connector,
+                            page_size=page_size_for_fetch,
+                            page_token=current_page_token
+                        )
+                    )
+                    logger.info(f"IndexExternalDataSource: Fetched {len(kems_from_external_source)} items from '{data_source_name}' (page_token: {current_page_token}). Next token: {next_page_token_from_connector}")
+
+                except Exception as e_fetch:
+                    logger.error(f"IndexExternalDataSource: Error fetching data from '{data_source_name}': {e_fetch}", exc_info=True)
+                    items_failed_total += page_size_for_fetch # Approximate failure for the page
+                    # Depending on error, might stop or try next page if pagination allows skipping
+                    # For PoC, let's stop on fetch error for a page.
+                    raise StorageError(f"Failed to fetch data from external source '{data_source_name}': {e_fetch}") from e_fetch
+
+                if not kems_from_external_source:
+                    logger.info(f"IndexExternalDataSource: No more items from '{data_source_name}'.")
+                    has_more_pages = False
+                else:
+                    kps_payloads: List[kps_service_pb2.MemoryContent] = []
+                    for kem_ext in kems_from_external_source:
+                        # Construct unique KEM URI for KPS
+                        # Format: kem:external:<data_source_name>:<original_kem_id>
+                        kps_kem_uri = f"kem:external:{data_source_name}:{kem_ext.id}"
+
+                        # Content for KPS is the KEM's content field (bytes, needs to be string for KPS AddMemory)
+                        # Assuming KPS AddMemory expects string content.
+                        try:
+                            content_str = kem_ext.content.decode('utf-8')
+                        except UnicodeDecodeError:
+                            logger.warning(f"IndexExternalDataSource: Could not decode content for KEM ID '{kem_ext.id}' from source '{data_source_name}' as UTF-8. Skipping for KPS.")
+                            items_failed_total +=1
+                            continue
+
+                        kps_payloads.append(kps_service_pb2.MemoryContent(kem_uri=kps_kem_uri, content=content_str))
+
+                    if kps_payloads:
+                        for i in range(0, len(kps_payloads), kps_batch_size):
+                            batch_to_send = kps_payloads[i:i + kps_batch_size]
+                            logger.debug(f"IndexExternalDataSource: Sending batch of {len(batch_to_send)} items to KPS for source '{data_source_name}'.")
+                            try:
+                                kps_request = kps_service_pb2.BatchAddMemoriesRequest(memories=batch_to_send)
+                                kps_response: kps_service_pb2.BatchAddMemoriesResponse = self.kps_client_stub.BatchAddMemories(kps_request, timeout=30) # Add timeout
+
+                                items_processed_this_batch = len(batch_to_send) - len(kps_response.failed_kem_references)
+                                items_failed_this_batch = len(kps_response.failed_kem_references)
+                                items_processed_total += items_processed_this_batch
+                                items_failed_total += items_failed_this_batch
+
+                                if kps_response.failed_kem_references:
+                                    logger.warning(f"IndexExternalDataSource: KPS failed to process {items_failed_this_batch} items from batch for source '{data_source_name}'. References: {kps_response.failed_kem_references}")
+                                if kps_response.overall_error_message:
+                                     logger.warning(f"IndexExternalDataSource: KPS BatchAddMemories overall error: {kps_response.overall_error_message}")
+                            except grpc.RpcError as e_kps:
+                                logger.error(f"IndexExternalDataSource: gRPC error calling KPS BatchAddMemories for source '{data_source_name}': {e_kps}", exc_info=True)
+                                items_failed_total += len(batch_to_send) # All in batch failed
+                                # Depending on error, might stop or continue. For PoC, continue with next external page.
+                            except Exception as e_kps_other:
+                                logger.error(f"IndexExternalDataSource: Unexpected error calling KPS BatchAddMemories for source '{data_source_name}': {e_kps_other}", exc_info=True)
+                                items_failed_total += len(batch_to_send)
+
+
+                current_page_token = next_page_token_from_connector
+                if not current_page_token:
+                    has_more_pages = False
+
+            # Loop finished
+            duration = time.monotonic() - start_time
+            status_msg = f"Completed indexing for '{data_source_name}'. Processed: {items_processed_total}, Failed: {items_failed_total}. Duration: {duration:.2f}s."
+            logger.info(f"IndexExternalDataSource: {status_msg}")
+            return glm_service_pb2.IndexExternalDataSourceResponse(
+                status_message=status_msg,
+                items_processed=items_processed_total,
+                items_failed=items_failed_total
+            )
+
+        except StorageError as e_storage: # From external_repo.retrieve_mapped_kems
+            logger.error(f"IndexExternalDataSource: StorageError during indexing of '{data_source_name}': {e_storage}", exc_info=True)
+            context.abort(grpc.StatusCode.INTERNAL, f"Storage error accessing external source '{data_source_name}': {e_storage}")
+        except Exception as e_main:
+            logger.error(f"IndexExternalDataSource: Unexpected error during indexing of '{data_source_name}': {e_main}", exc_info=True)
+            context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error indexing '{data_source_name}': {e_main}")
+
+        # Should be unreachable if aborts are called
+        return glm_service_pb2.IndexExternalDataSourceResponse(
+            status_message=f"Failed indexing for '{data_source_name}' due to unexpected error after loop.",
+            items_processed=items_processed_total,
+            items_failed=items_failed_total # Or update based on where it failed
         )
 
 

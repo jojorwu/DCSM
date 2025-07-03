@@ -12,12 +12,32 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from google.protobuf.json_format import ParseDict
 
 from generated_grpc import kem_pb2, glm_service_pb2
-from ..config import GLMConfig # Relative import for config within the same app
+from ..config import GLMConfig, ExternalDataSourceConfig # Relative import for config within the same app
 from .base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
 from . import SqliteKemRepository
 from . import QdrantKemRepository
+from .external_base import BaseExternalRepository # Import the new ABC
 
 logger = logging.getLogger(__name__)
+
+# Placeholder for dynamic connector loading/factory
+# In a real system, this might use entry points or a more robust plugin mechanism.
+def get_external_repository_connector(config: ExternalDataSourceConfig, glm_config: GLMConfig) -> Optional[BaseExternalRepository]:
+    if config.type == "postgresql":
+        from .postgres_connector import PostgresExternalRepository # Now this file exists
+        try:
+            return PostgresExternalRepository(config, glm_config)
+        except Exception as e_pg_init:
+            logger.error(f"Failed to initialize PostgresExternalRepository for '{config.name}': {e_pg_init}", exc_info=True)
+            return None
+    # Add other types here:
+    # elif config.type == "mongodb":
+    #     from .mongodb_connector import MongoDBExternalRepository
+    #     return MongoDBExternalRepository(config, glm_config)
+    else:
+        logger.warning(f"Unsupported external data source type '{config.type}' for source '{config.name}'.")
+        return None
+
 
 class DefaultGLMRepository(BasePersistentStorageRepository):
     """
@@ -68,6 +88,24 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         else:
             logger.warning("DefaultGLMRepository: QDRANT_HOST not configured. Qdrant features will be unavailable.")
             self.qdrant_repo = None
+
+        # Initialize external repositories
+        self.external_repos: Dict[str, BaseExternalRepository] = {}
+        if hasattr(self.config, 'external_data_sources') and self.config.external_data_sources:
+            logger.info(f"Found {len(self.config.external_data_sources)} external data source configurations.")
+            for ext_ds_config in self.config.external_data_sources:
+                try:
+                    logger.info(f"Initializing external data source: Name='{ext_ds_config.name}', Type='{ext_ds_config.type}'")
+                    connector = get_external_repository_connector(ext_ds_config, self.config)
+                    if connector:
+                        self.external_repos[ext_ds_config.name] = connector
+                        logger.info(f"Successfully initialized and registered external connector for '{ext_ds_config.name}'.")
+                    else:
+                        logger.warning(f"Failed to initialize or no connector available for external data source '{ext_ds_config.name}' of type '{ext_ds_config.type}'.")
+                except Exception as e_ext_init:
+                    logger.error(f"Error initializing external data source '{ext_ds_config.name}': {e_ext_init}", exc_info=True)
+        else:
+            logger.info("No external data sources configured for GLM.")
 
         logger.info("DefaultGLMRepository initialized.")
 
@@ -253,6 +291,30 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         page_size: int,
         page_token: Optional[str]
     ) -> Tuple[List[kem_pb2.KEM], Optional[str]]:
+        # Dispatch to external repository if data_source_name is specified and valid
+        if query.data_source_name and query.data_source_name in self.external_repos:
+            external_repo = self.external_repos[query.data_source_name]
+            logger.info(f"Dispatching retrieve_kems query to external data source: '{query.data_source_name}'")
+            try:
+                # External repo's retrieve_mapped_kems needs to be an async method.
+                # It is responsible for its own internal query translation, data fetching, mapping to KEMs, and pagination.
+                return await external_repo.retrieve_mapped_kems(
+                    internal_query=query, # Pass the full query
+                    page_size=page_size,
+                    page_token=page_token
+                )
+            except Exception as e_ext_retrieve:
+                logger.error(f"Error retrieving KEMs from external source '{query.data_source_name}': {e_ext_retrieve}", exc_info=True)
+                # Decide on error propagation: re-raise a specific error or return empty with logging?
+                # For now, re-raise as a StorageError or let specific exception propagate if it's informative.
+                if isinstance(e_ext_retrieve, (StorageError, BackendUnavailableError, InvalidQueryError)):
+                    raise
+                raise StorageError(f"Failed to retrieve from external source '{query.data_source_name}': {e_ext_retrieve}") from e_ext_retrieve
+        elif query.data_source_name: # Specified but not found/configured
+            logger.warning(f"Requested external data source '{query.data_source_name}' not found or not configured.")
+            raise InvalidQueryError(f"External data source '{query.data_source_name}' not available.")
+
+        # If not dispatched to external, proceed with native SQLite/Qdrant logic
         # This method will primarily handle SQLite based filtering (IDs, metadata, timestamps).
         # Vector search (embedding_query) or text_query would typically involve Qdrant
         # and then potentially retrieving full KEMs from SQLite.
@@ -465,39 +527,58 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         # qdrant_healthy = await loop.run_in_executor(None, self.qdrant_repo._check_qdrant_health_internal_logic)
 
         # For now, direct call for placeholder:
-        sqlite_ok, qdrant_ok = True, True
+        all_ok = True
         msg_parts = []
 
+        # 1. Check native SQLite health
         try:
             conn = self.sqlite_repo._get_sqlite_conn()
             cursor = conn.cursor()
             sqlite_query = getattr(self.config, "HEALTH_CHECK_SQLITE_QUERY", "SELECT 1")
             cursor.execute(sqlite_query)
             cursor.fetchone()
-            msg_parts.append("SQLite OK")
+            msg_parts.append("NativeSQLite:OK")
         except Exception as e_sqlite_check:
-            logger.warning(f"DefaultGLMRepository Health Check: SQLite check failed: {e_sqlite_check}")
-            sqlite_ok = False
-            msg_parts.append(f"SQLite FAILED: {e_sqlite_check}")
+            logger.warning(f"DefaultGLMRepository Health Check: Native SQLite check failed: {e_sqlite_check}")
+            all_ok = False
+            msg_parts.append(f"NativeSQLite:FAIL ({e_sqlite_check})")
 
+        # 2. Check native Qdrant health (if configured)
         if self.qdrant_repo and self.qdrant_repo.client:
             try:
                 self.qdrant_repo.client.get_collections() # Simple connectivity test
-                msg_parts.append("Qdrant OK")
+                msg_parts.append("NativeQdrant:OK")
             except Exception as e_qdrant_check:
-                logger.warning(f"DefaultGLMRepository Health Check: Qdrant check failed: {e_qdrant_check}")
-                qdrant_ok = False
-                msg_parts.append(f"Qdrant FAILED: {e_qdrant_check}")
+                logger.warning(f"DefaultGLMRepository Health Check: Native Qdrant check failed: {e_qdrant_check}")
+                all_ok = False
+                msg_parts.append(f"NativeQdrant:FAIL ({e_qdrant_check})")
         elif not self.config.QDRANT_HOST:
-            msg_parts.append("Qdrant N/A (not configured)")
-            qdrant_ok = True # Not a failure if not configured
-        else: # Configured but client not initialized
-            logger.warning("DefaultGLMRepository Health Check: Qdrant configured but client not available.")
-            qdrant_ok = False
-            msg_parts.append("Qdrant FAILED (client not initialized)")
+            msg_parts.append("NativeQdrant:N/A (not configured)")
+        else: # Configured but Qdrant client not initialized (e.g. init failed)
+            logger.warning("DefaultGLMRepository Health Check: Native Qdrant configured but client not available.")
+            all_ok = False
+            msg_parts.append("NativeQdrant:FAIL (client not initialized)")
 
-        is_healthy = sqlite_ok and qdrant_ok
-        return is_healthy, "; ".join(msg_parts)
+        # 3. Check health of external repositories
+        if self.external_repos:
+            for name, repo in self.external_repos.items():
+                try:
+                    # Need to run async health check method
+                    # If check_health itself is defined as async in BaseExternalRepository
+                    ext_healthy, ext_msg = await repo.check_health()
+                    if ext_healthy:
+                        msg_parts.append(f"ExternalRepo({name}):OK ({ext_msg})")
+                    else:
+                        all_ok = False
+                        msg_parts.append(f"ExternalRepo({name}):FAIL ({ext_msg})")
+                except Exception as e_ext_health:
+                    logger.error(f"Error during health check for external repo '{name}': {e_ext_health}", exc_info=True)
+                    all_ok = False
+                    msg_parts.append(f"ExternalRepo({name}):FAIL (Exception: {e_ext_health})")
+        else:
+            msg_parts.append("ExternalRepos:N/A (none configured)")
+
+        return all_ok, "; ".join(msg_parts)
 
 # Need to import os for db_path
 import os
