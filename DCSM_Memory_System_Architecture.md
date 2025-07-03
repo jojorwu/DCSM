@@ -237,7 +237,30 @@ The contracts for these services—including their RPC methods, request messages
 -   `kps_service.proto`: Defines the `KPSService` (Knowledge Processing Service).
 -   `kem.proto`: Defines the core `KEM` (Knowledge Encapsulation Module) message structure used across services.
 
-These `.proto` files serve as the single source of truth for the API contracts.
+These `.proto` files serve as the single source of truth for the API contracts. For example, a simplified service definition might look like:
+
+```protobuf
+syntax = "proto3";
+
+package example_package;
+
+// The service definition.
+service ExampleService {
+  // A simple RPC call.
+  rpc GetFeature(FeatureRequest) returns (FeatureResponse);
+}
+
+// Request message
+message FeatureRequest {
+  string feature_id = 1;
+}
+
+// Response message
+message FeatureResponse {
+  string name = 1;
+  string value = 2;
+}
+```
 
 ### 3.3. Benefits of gRPC in DCSM
 
@@ -245,7 +268,11 @@ The adoption of gRPC offers several key advantages for the DCSM architecture:
 
 -   **Strongly-Typed Contracts:** Protocol Buffers enforce a clear, language-agnostic schema for messages and services. This minimizes integration errors and ensures that clients and servers agree on data structures.
 -   **High Performance:** gRPC leverages HTTP/2 for multiplexed, persistent connections and uses efficient binary serialization for protobuf messages, resulting in lower latency and reduced bandwidth consumption compared to text-based protocols like JSON over HTTP/1.1.
--   **Streaming Capabilities:** gRPC supports various streaming modes (unary, server-streaming, client-streaming, bidirectional-streaming). This is utilized, for example, in SWM's `Subscribe` method for receiving a stream of messages, and could be used by other services for handling large datasets or long-lived interactions.
+-   **Streaming Capabilities:** gRPC supports various communication patterns beyond simple request-response (unary RPCs). These include:
+    -   *Server-streaming RPCs:* The client sends a single request, and the server responds with a stream of messages. This is useful for sending back large collections of data, like SWM's `Subscribe` method which streams messages for a topic.
+    -   *Client-streaming RPCs:* The client sends a stream of messages, and the server responds with a single message once it has processed them all.
+    -   *Bidirectional-streaming RPCs:* Both client and server send a stream of messages to each other independently.
+    These capabilities allow for more flexible and efficient communication patterns, especially for large datasets or event-driven interactions.
 -   **Language Agnostic:** While the current DCSM services are implemented in Python, gRPC's cross-language support allows future components or client applications to be developed in different programming languages while still seamlessly interacting with the existing memory services.
 -   **Code Generation:** gRPC tooling automatically generates client stubs and server-side boilerplate code in various languages from the `.proto` definitions. This significantly simplifies development by handling much of the low-level communication logic.
 
@@ -255,7 +282,7 @@ Service operations communicate success or failure using standard gRPC status cod
 
 ### 3.5. Security
 
-gRPC channels can be secured using Transport Layer Security (TLS) to encrypt communications between the client and server. The DCSM services can be configured with the necessary TLS certificates and keys to enable secure gRPC channels, as outlined in their respective configuration options (see Section 9: Configuration).
+gRPC channels can be secured using Transport Layer Security (TLS) to encrypt communications between the client and server. The DCSM services can be configured with the necessary TLS certificates and keys (server certificate/key, and optionally client root CAs for mutual TLS) to enable secure gRPC channels, as outlined in their respective configuration options (see Section 9: Configuration). For enhanced security, mutual TLS (mTLS) can also be implemented, where both the client and server authenticate each other's certificates.
 
 ## 4. Data Flow and Interactions
 
