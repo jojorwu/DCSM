@@ -4,6 +4,37 @@
 
 The Distributed Cognitive State Management (DCSM) system provides sophisticated memory capabilities crucial for autonomous agents. This document details the architecture and interplay of its core Python-based memory components: Global Lifetime Memory (GLM), Short-Term Working Memory (SWM), and Knowledge Processing Service (KPS). Together, they enable agents to store, retrieve, process, and utilize information effectively throughout their operational lifecycle.
 
+### 1.1 ASCII Art Overview
+
+Below is a simplified ASCII representation of the memory architecture, illustrating the main components and their primary interactions with an agent:
+
+```text
++-----------------+         +---------------------------+
+|      AGENT      |<------->|   Short-Term Working Mem. |
+| (App Logic)     |         | (SWM)                     |
++-----------------+         | - In-Memory Key/Value     |
+        |                   | - Redis Pub/Sub           |
+        |                   +-------------+-------------+
+        |                                 |  ^ (Cache, Temp Data)
+        | (gRPC API Calls)                |  |
+        |                                 V  |
+        |                   +-------------+-------------+
+        +------------------>|   Global Lifetime Memory  |
+        |                   | (GLM)                     |
+        |                   | - SQLite (Persistent)     |
+        |                   | - KEM URI indexed         |
+        |                   +-------------+-------------+
+        |                                 |  ^ (Store/Retrieve)
+        |                                 |  |
+        |                                 V  |
+        |                   +-------------+-------------+
+        +------------------>| Knowledge Processing Svc. |
+                            | (KPS)                     |
+                            | - Embeddings (SentenceTrans)
+                            | - Vector Store (ChromaDB) |
+                            +---------------------------+
+```
+
 The memory system is designed to support:
 -   **Persistence:** Long-term storage of critical information, experiences, and learned knowledge.
 -   **Contextual Recall:** Efficient retrieval of relevant information based on current task or query.
@@ -122,15 +153,11 @@ SWM provides a fast, transient memory space for agents. It's used for storing te
     -   Manages connection to the Redis server (host and port configured via environment variables `REDIS_HOST`, `REDIS_PORT`).
     -   Provides `publish_message` and `subscribe_to_topic` methods.
 
-**Interaction with GLM/KPS:**
--   SWM primarily acts as a fast, temporary layer. It can cache data retrieved from GLM (application-level logic would handle this caching).
--   It can hold intermediate data that is being actively processed, which might then be sent to KPS for further analysis or to GLM for long-term storage.
--   The pub/sub feature is crucial for real-time notifications and coordination between different services or agent components that might react to events or new data in SWM.
-
-**Interaction with GLM/KPS:**
--   SWM can cache data retrieved from GLM to speed up access.
--   SWM can hold intermediate data that is then processed by KPS, with results potentially stored back in SWM or committed to GLM.
--   Data intended for long-term storage that first lands in SWM (e.g., during a fast-moving task) might be periodically flushed or explicitly moved to GLM.
+**Interaction with GLM/KPS (Consolidated):**
+-   **Caching Layer:** SWM can be used by the application layer to cache frequently accessed data originally from GLM or results from KPS to reduce latency. This is managed by the agent/application, not an automatic SWM feature.
+-   **Temporary Data Hub:** SWM holds transient data for ongoing tasks. This data might be sourced from user inputs, sensors, or intermediate processing steps.
+-   **Input for GLM/KPS:** Data temporarily stored or processed in SWM can be subsequently committed to GLM for long-term persistence or sent to KPS for semantic processing and indexing.
+-   **Communication Bus:** The Redis-backed pub/sub functionality in SWM allows different components (including agents, or even different services if they subscribe) to communicate events, signal data availability, or trigger actions in a decoupled manner. For instance, a component might publish a message when new data is available in GLM or KPS.
 
 **Use Cases:**
 -   Storing the current state of a multi-step task.
