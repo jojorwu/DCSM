@@ -24,7 +24,12 @@ class PostgresExternalRepository(BaseExternalRepository):
         # Validate and parse mapping_config for PostgreSQL
         self.table_name = self.config.mapping_config.get("table_name")
         self.id_column = self.config.mapping_config.get("id_column")
-        self.content_column = self.config.mapping_config.get("content_column") # Can be text, bytea, or even json/jsonb
+
+        # Changed from content_column to content_column_names (list of strings)
+        self.content_column_names: List[str] = self.config.mapping_config.get("content_column_names", [])
+        if not self.content_column_names or not isinstance(self.content_column_names, list):
+            raise ValueError(f"PostgreSQL connector '{self.config.name}': 'content_column_names' in mapping_config must be a non-empty list of column names.")
+
         self.content_type_value = self.config.mapping_config.get("content_type_value", "text/plain") # Default content type if not mapped from a column
 
         # Timestamp columns for ordering and keyset pagination
@@ -53,16 +58,16 @@ class PostgresExternalRepository(BaseExternalRepository):
             self.filterable_metadata_columns = {}
 
 
-        if not all([self.table_name, self.id_column, self.content_column, self.timestamp_sort_column]):
+        if not all([self.table_name, self.id_column, self.timestamp_sort_column]): # content_column_names already checked
             raise ValueError(
                 f"PostgreSQL connector '{self.config.name}': Missing required mapping_config fields: "
-                f"'table_name', 'id_column', 'content_column', 'timestamp_sort_column'."
+                f"'table_name', 'id_column', 'timestamp_sort_column'. 'content_column_names' must also be a non-empty list."
             )
 
         if not self.metadata_json_column and not self.metadata_columns_map:
             logger.warning(f"PostgreSQL connector '{self.config.name}': No metadata mapping configured ('metadata_json_column' or 'metadata_columns_map'). KEM metadata will be empty.")
 
-        logger.info(f"PostgresExternalRepository '{self.config.name}' initialized. Table: {self.table_name}, ID: {self.id_column}, Content: {self.content_column}, TimestampSort: {self.timestamp_sort_column}")
+        logger.info(f"PostgresExternalRepository '{self.config.name}' initialized. Table: {self.table_name}, ID: {self.id_column}, Content Columns: {self.content_column_names}, TimestampSort: {self.timestamp_sort_column}")
 
 
     async def connect(self) -> None:
@@ -135,7 +140,8 @@ class PostgresExternalRepository(BaseExternalRepository):
         next_page_token_val: Optional[str] = None
 
         # Build list of columns to select
-        select_columns = {self.id_column, self.content_column, self.timestamp_sort_column}
+        select_columns = {self.id_column, self.timestamp_sort_column}
+        select_columns.update(self.content_column_names) # Add all content columns
         if self.id_tiebreaker_column: select_columns.add(self.id_tiebreaker_column)
         if self.created_at_column: select_columns.add(self.created_at_column)
         if self.updated_at_column: select_columns.add(self.updated_at_column)
@@ -264,16 +270,25 @@ class PostgresExternalRepository(BaseExternalRepository):
                 kem = kem_pb2.KEM()
                 kem.id = str(pg_row.get(self.id_column, "")) # Ensure ID is string
 
-                # Content
-                content_val = pg_row.get(self.content_column)
-                if isinstance(content_val, bytes):
-                    kem.content = content_val
-                elif isinstance(content_val, str):
-                    kem.content = content_val.encode('utf-8')
-                elif content_val is not None: # Other types like JSON
-                    kem.content = json.dumps(content_val).encode('utf-8')
+                # Content - concatenate from multiple columns
+                content_parts = []
+                for col_name in self.content_column_names:
+                    val = pg_row.get(col_name)
+                    if val is not None:
+                        if isinstance(val, bytes): # Should ideally be text, but handle if bytea
+                            try:
+                                content_parts.append(val.decode('utf-8'))
+                            except UnicodeDecodeError:
+                                logger.warning(f"KEM ID {kem.id}: Could not decode content column '{col_name}' as UTF-8. Skipping this part.")
+                        else: # Handles str, int, float, bool, json/jsonb from PG (via asyncpg)
+                            content_parts.append(str(val))
 
-                kem.content_type = self.content_type_value # Could also be mapped from a column
+                full_content_str = " ".join(content_parts).strip() # Join with space, remove leading/trailing whitespace
+                if not full_content_str and len(self.content_column_names) > 0:
+                     logger.warning(f"KEM ID {kem.id}: All specified content columns were null or empty. KEM content will be empty.")
+
+                kem.content = full_content_str.encode('utf-8')
+                kem.content_type = self.content_type_value
 
                 # Timestamps - ensure they are UTC and then convert to protobuf Timestamp
                 created_at_db_val = pg_row.get(self.created_at_column) # Expected to be datetime from asyncpg

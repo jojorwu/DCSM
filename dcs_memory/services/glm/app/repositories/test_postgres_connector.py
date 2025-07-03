@@ -23,10 +23,10 @@ class TestPostgresExternalRepository(unittest.TestCase):
 
     def setUp(self):
         self.glm_config = GLMConfig() # Default GLMConfig
-        self.base_mapping_config = {
+        self.base_mapping_config = { # Now expects content_column_names
             "table_name": "test_table",
             "id_column": "doc_id",
-            "content_column": "doc_content",
+            "content_column_names": ["doc_content_main"], # Default to a list with one item
             "timestamp_sort_column": "updated_ts"
         }
         self.default_config = ExternalDataSourceConfig(
@@ -166,7 +166,9 @@ class TestPostgresExternalRepository(unittest.TestCase):
         aware_datetime_created = datetime(2023, 1, 1, 9, 0, 0, microsecond=654321, tzinfo=timezone.utc)
 
         mock_pg_row1.get.side_effect = lambda key, default=None: {
-            "doc_id": "pg_kem_1", "doc_content": "Content from PG 1",
+            "doc_id": "pg_kem_1",
+            "main_text": "Content from PG 1.", # Part 1 of content
+            "notes_text": "Some notes.",      # Part 2 of content
             "updated_ts": aware_datetime_updated,
             "created_ts_col": aware_datetime_created,
             "meta_json_col": {"tag": "alpha", "version": 1.0},
@@ -177,7 +179,8 @@ class TestPostgresExternalRepository(unittest.TestCase):
         mock_create_pool.return_value = mock_pool
 
         mapping_config = {
-            "table_name": "docs", "id_column": "doc_id", "content_column": "doc_content",
+            "table_name": "docs", "id_column": "doc_id",
+            "content_column_names": ["main_text", "notes_text", "non_existent_col"], # Test with multiple, one non-existent
             "timestamp_sort_column": "updated_ts", "created_at_column": "created_ts_col",
             "metadata_json_column": "meta_json_col",
             "metadata_columns_map": {"custom_field": "pg_col_for_meta1"},
@@ -198,7 +201,7 @@ class TestPostgresExternalRepository(unittest.TestCase):
 
         kem1 = kems[0]
         self.assertEqual(kem1.id, "pg_kem_1")
-        self.assertEqual(kem1.content.decode('utf-8'), "Content from PG 1")
+        self.assertEqual(kem1.content.decode('utf-8'), "Content from PG 1. Some notes.") # Concatenated content
         self.assertEqual(kem1.content_type, "text/plain") # Default
 
         # Timestamps (seconds since epoch & nanos)
@@ -220,9 +223,16 @@ class TestPostgresExternalRepository(unittest.TestCase):
         query_string = call_args[0]
         query_params = call_args[1:] # The actual parameters passed after the query string
 
-        self.assertIn('SELECT "created_ts_col", "doc_content", "doc_id", "meta_json_col", "pg_col_for_meta1", "updated_ts" FROM "docs"', query_string)
+        # Check that all relevant columns (ID, timestamps, metadata, and *all content columns*) are selected
+        self.assertIn('"doc_id"', query_string)
+        self.assertIn('"main_text"', query_string)
+        self.assertIn('"notes_text"', query_string) # non_existent_col should not make query fail if not selected
+        self.assertIn('"updated_ts"', query_string)
+        self.assertIn('"created_ts_col"', query_string)
+        self.assertIn('"meta_json_col"', query_string)
+        self.assertIn('"pg_col_for_meta1"', query_string)
+        self.assertIn('FROM "docs"', query_string)
         self.assertIn('ORDER BY "updated_ts" DESC, "doc_id" DESC LIMIT $1', query_string)
-        # Parameters for query_params start from $1. Here, only LIMIT is a parameter.
         self.assertEqual(query_params[0], 6) # page_size + 1
 
 
@@ -345,9 +355,10 @@ class TestPostgresExternalRepository(unittest.TestCase):
         ts1_aware = datetime(2023, 1, 1, 10, 0, 0, microsecond=123000, tzinfo=timezone.utc)
         ts2_aware = datetime(2023, 1, 1, 9, 0, 0, microsecond=456000, tzinfo=timezone.utc)
         mock_pg_row1 = MagicMock()
-        mock_pg_row1.get.side_effect = lambda k,d=None: {"doc_id":"id1", "updated_ts":ts1_aware, self.base_mapping_config.get("content_column"):"c1"}.get(k,d)
+        # Use the first item from content_column_names for simplicity in this mock
+        mock_pg_row1.get.side_effect = lambda k,d=None: {"doc_id":"id1", "updated_ts":ts1_aware, self.base_mapping_config["content_column_names"][0]:"c1"}.get(k,d)
         mock_pg_row2 = MagicMock()
-        mock_pg_row2.get.side_effect = lambda k,d=None: {"doc_id":"id2", "updated_ts":ts2_aware, self.base_mapping_config.get("content_column"):"c2"}.get(k,d)
+        mock_pg_row2.get.side_effect = lambda k,d=None: {"doc_id":"id2", "updated_ts":ts2_aware, self.base_mapping_config["content_column_names"][0]:"c2"}.get(k,d)
 
         # First call to fetch (page 1)
         # page_size=1, so limit for query is 1+1=2. We return 2 rows, so there is a next page.

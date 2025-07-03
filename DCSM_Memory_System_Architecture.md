@@ -527,7 +527,7 @@ GLM's primary configuration relates to its SQLite database file.
               # Example for type: "postgresql"
               table_name: "public.my_documents" # Name of the table to query
               id_column: "document_id"          # Column to use as KEM ID (must be unique)
-              content_column: "content_text"    # Column containing the main KEM content
+              content_column_names: ["title", "abstract", "body_text"] # List of columns whose text content will be concatenated (space-separated) to form KEM content
               timestamp_sort_column: "modified_date" # Column for ordering and keyset pagination (e.g., updated_at)
 
               # Optional:
