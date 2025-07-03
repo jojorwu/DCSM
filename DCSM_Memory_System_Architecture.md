@@ -546,18 +546,27 @@ GLM's primary configuration relates to its SQLite database file.
               filterable_metadata_columns: # Map KEM metadata keys to PG columns that can be used in WHERE clauses for exact matches
                                            # KEMQuery.metadata_filters will use these mappings.
                 category: "document_category_column" # Allows filtering by KEMQuery.metadata_filters["category"]
+                category: "document_category_column" # Allows filtering by KEMQuery.metadata_filters["category"]
                 status_flag: "current_processing_status_column"
 
-          # Example for another source (details would depend on its connector)
-          # - name: "my_csv_archive"
-          #   type: "csv_dir" # Hypothetical CSV connector
-          #   connection_details:
-          #     path: "/mnt/archive/csv_reports/"
-          #   mapping_config:
-          #     id_column_name: "ReportID"
-          #     content_column_indices: [2, 3] # e.g., join multiple columns for content
-          #     timestamp_column_name: "DateGenerated"
-          #     delimiter: ";"
+          - name: "my_reports_archive"
+            type: "csv_dir" # Connector for a directory of CSV files
+            connection_details: # For csv_dir, this is not typically used for host/port like DBs
+              # Custom connection details if any specific to the connector, usually empty.
+              # Directory path is part of mapping_config for this type.
+              placeholder: "not_used"
+            mapping_config:
+              directory_path: "/mnt/data/csv_reports" # Path to the directory containing CSV files
+              id_column_name: "ReportUUID"             # Header name for the column to use as KEM ID
+              content_column_names: ["Title", "Abstract", "Body"] # List of header names whose content will be concatenated
+              timestamp_column_name: "PublicationDate" # Header name for the column to use as KEM updated_at and for sorting
+
+              # Optional CSV settings:
+              csv_delimiter: ","         # Default is comma
+              encoding: "utf-8"          # Default is utf-8
+              content_type_value: "text/csv-derived-report" # Default KEM content_type
+              created_at_column_name: "SubmissionDate" # Defaults to timestamp_column_name if not given
+              metadata_column_names: ["Author", "Department", "ReportType"] # List of header names to map to KEM metadata
         ```
 
 **9.2. Short-Term Working Memory (SWM)**

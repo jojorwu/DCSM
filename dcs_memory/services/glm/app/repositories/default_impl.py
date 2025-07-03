@@ -30,6 +30,13 @@ def get_external_repository_connector(config: ExternalDataSourceConfig, glm_conf
         except Exception as e_pg_init:
             logger.error(f"Failed to initialize PostgresExternalRepository for '{config.name}': {e_pg_init}", exc_info=True)
             return None
+    elif config.type == "csv_dir":
+        from .csv_connector import CsvDirExternalRepository # Import new connector
+        try:
+            return CsvDirExternalRepository(config, glm_config)
+        except Exception as e_csv_init:
+            logger.error(f"Failed to initialize CsvDirExternalRepository for '{config.name}': {e_csv_init}", exc_info=True)
+            return None
     # Add other types here:
     # elif config.type == "mongodb":
     #     from .mongodb_connector import MongoDBExternalRepository
