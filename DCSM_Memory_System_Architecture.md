@@ -336,7 +336,77 @@ The three memory components work in concert, with data flowing between them and 
     -   Different modules (e.g., a planning module, an execution module, a monitoring module) communicate state and intermediate results via SWM's pub/sub or shared key-value store.
     -   Critical decisions or final outcomes from the collaboration can be logged into GLM for audit or future learning.
 
-## 6. Scalability and Persistence
+## 6. Data Lifecycle Management
+
+Effective management of data throughout its lifecycle is crucial for the reliability, efficiency, and relevance of the DCSM memory system. The lifecycle stages involve creation, usage/updating, archival, and deletion, with different considerations for GLM, SWM, and KPS.
+
+**6.1. Data Creation & Ingestion**
+
+*   **SWM:**
+    *   **Creation:** Data is typically created in SWM rapidly. This can be from direct agent input, sensor data, intermediate results of computations, or messages received via its pub/sub mechanism.
+    *   **Nature:** Often transient, session-specific, or small data chunks. Keys are arbitrary strings; values are strings. TTLs are commonly used.
+    *   **Example:** `StoreMemory(key="session_xyz_last_query", value="what is the weather?", ttl_seconds=3600)`
+
+*   **GLM:**
+    *   **Creation:** Data is stored in GLM when long-term persistence is required. This usually involves an explicit `StoreMemory` call by the agent/application, often after initial processing or validation. Data might originate from SWM or external sources.
+    *   **Nature:** Structured, persistent, and identified by a unique KEM URI. Content is stored as BLOB, metadata as JSON.
+    *   **Example:** `StoreMemory(kem_uri="kem:research:doc123:summary", content=b"<summary_bytes>", metadata_json="{\"source\": \"web_scraper\"}")`
+
+*   **KPS:**
+    *   **Creation (Indexing):** Data isn't "created" in KPS in the same way as GLM/SWM, but rather existing data (content associated with a KEM URI) is *indexed*. The agent calls `AddMemory` or `BatchAddMemories`, providing content and its KEM URI. KPS then generates an embedding and stores this along with the KEM URI and a copy of the content in its vector store (ChromaDB).
+    *   **Nature:** Derived data (embeddings) and a replicated copy of content, optimized for semantic search.
+    *   **Example:** `AddMemory(kem_uri="kem:research:doc123:summary", content="<summary_text>")`
+
+**6.2. Data Usage, Retrieval & Updates**
+
+*   **SWM:**
+    *   **Usage:** High-frequency reads and writes. `RetrieveMemory` for direct lookups, `Subscribe` for event-driven data consumption.
+    *   **Updates:** Achieved by calling `StoreMemory` again with the same key, overwriting the previous value and resetting TTL if specified.
+
+*   **GLM:**
+    *   **Usage:** `RetrieveMemory` by KEM URI for specific items. `QueryMemories` for complex SQL-based lookups. `ListMemories` for browsing.
+    *   **Updates:** The `UpdateMemory` gRPC call allows modification of content and/or metadata for an existing KEM URI. This updates the `updated_at` timestamp.
+
+*   **KPS:**
+    *   **Usage:** Primarily through semantic search: `QueryNearestNeighbors` (using a KEM URI of an exemplar document) or `QueryNearestNeighborsByVector` (using a raw query vector). `RetrieveMemory` can fetch the content KPS has stored for a KEM URI.
+    *   **Updates:** To "update" an item in KPS, the typical pattern is:
+        1.  Call `RemoveMemory` with the KEM URI to delete the old entry (and its embedding).
+        2.  Call `AddMemory` with the KEM URI and the new content to re-index it and generate a new embedding.
+        There's no direct in-place update for embeddings if the content changes, as the embedding itself is derived from the content.
+
+**6.3. Data Archival (Conceptual)**
+
+While the current services don't have explicit built-in "archival" APIs that move data to a colder, cheaper storage tier automatically, archival strategies can be implemented at the application level:
+
+*   **GLM:** For data in GLM that is rarely accessed but must be kept (e.g., for compliance or long-term historical analysis), an application-level process could:
+    1.  Query GLM for old/infrequently accessed data based on timestamps or metadata flags.
+    2.  Export this data to an external archival system (e.g., cloud object storage like S3 Glacier, tape backups).
+    3.  Optionally, delete the exported data from the active GLM SQLite database to reduce its size, or mark it as archived with specific metadata.
+*   **KPS:** If the source data in GLM is archived, the corresponding entries in KPS (vector store) might also need to be removed or flagged by the application to prevent semantic searches from returning pointers to archived (and potentially inaccessible) content. Alternatively, KPS could be maintained for discovery, with the understanding that full retrieval might require de-archiving from the external store.
+*   **SWM:** Data in SWM is generally too transient for archival to be a concern; it expires via TTL or is explicitly deleted.
+
+**6.4. Data Deletion**
+
+*   **SWM:**
+    *   **Explicit:** `DeleteMemory(key)` removes an item immediately.
+    *   **Automatic:** Items expire and are removed automatically when their TTL is reached.
+
+*   **GLM:**
+    *   **Explicit:** `DeleteMemory(KEMUri)` permanently removes the memory item from the SQLite database.
+    *   **Considerations:** Deleting data from GLM might orphan related data in KPS if not handled carefully. Application logic should ideally coordinate deletions.
+
+*   **KPS:**
+    *   **Explicit:** `RemoveMemory(kem_uri)` or `BatchRemoveMemories(kem_uris)` deletes the document and its embedding from the vector store (ChromaDB).
+    *   **Coordination:** When a memory is deleted from GLM, the agent/application should ideally also issue a corresponding delete request to KPS to keep the semantic index consistent with the persistent store. If KPS contains references to KEM URIs that no longer exist in GLM, search results might become stale or lead to errors when trying to retrieve full data.
+
+**6.5. Data Retention Policies**
+
+Data retention policies (how long data is kept in each system) are generally enforced by the application logic that interacts with GLM, SWM, and KPS, rather than by the services themselves (except for SWM's TTLs).
+
+*   Applications may implement cron jobs or scheduled tasks to periodically review data in GLM and KPS, applying deletion or archival logic based on age, relevance, or other criteria.
+*   Metadata in GLM (e.g., `created_at`, custom metadata flags) can be crucial for implementing these retention policies.
+
+## 7. Scalability and Persistence
 
 -   **GLM (SQLite):**
     -   **Persistence:** High (data stored on disk).
@@ -348,7 +418,7 @@ The three memory components work in concert, with data flowing between them and 
     -   **Persistence:** Depends on where it stores its artifacts. If embeddings/graphs are stored in GLM, persistence is high. If stored in a dedicated vector/graph database, that database's persistence characteristics apply.
     -   **Scalability:** Processing can be computationally intensive. KPS nodes could be scaled horizontally (more instances) if tasks are parallelizable. Scalability of semantic search depends heavily on the chosen vector store solution.
 
-## 7. API Reference (Conceptual Summary)
+## 8. API Reference (Conceptual Summary)
 
 This summarizes the primary gRPC service methods for each memory component. Refer to the respective `.proto` files (`glm_service.proto`, `swm_service.proto`, `kps_service.proto`) for detailed message definitions.
 
@@ -378,7 +448,7 @@ This summarizes the primary gRPC service methods for each memory component. Refe
 -   `BatchRemoveMemories(kem_uris: list<str>) returns (BatchRemoveMemoriesResponse)`
 -   `GetAllMemories(page_size: int, page_token: str) returns (GetAllMemoriesResponse)` (*GetAllMemoriesResponse contains list of MemoryContent and next_page_token*)
 
-## 8. Future Considerations / Potential Enhancements
+## 9. Future Considerations / Potential Enhancements
 
 -   **Distributed GLM:** For very large-scale applications, replacing SQLite with a distributed SQL/NoSQL database.
 -   **Advanced KPS Capabilities:** Integration of more sophisticated NLP models, reasoning engines, or automated knowledge discovery algorithms.
