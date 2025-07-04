@@ -14,9 +14,9 @@ from typing import List, Optional # Added for type hints
 import logging
 
 from .config import GLMConfig
-from .repositories.base import StorageError # For specific exception handling
+from .repositories.base import StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError # For specific exception handling
 # from .repositories import SqliteKemRepository, QdrantKemRepository # Will be used by DefaultGLMRepository
-from .repositories.base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
+from .repositories.base import BasePersistentStorageRepository #, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
 # Placeholder for the default implementation, will be created in a later step
 # from .repositories.default_impl import DefaultGLMRepository
 

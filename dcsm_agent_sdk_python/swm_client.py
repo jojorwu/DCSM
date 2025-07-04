@@ -18,35 +18,74 @@ logger = logging.getLogger(__name__)
 
 class SWMClient:
     def __init__(self,
-                 server_address: str = 'localhost:50053',
+                 server_address: str = 'localhost:50052', # Corrected default SWM port
                  retry_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                  retry_initial_delay_s: float = DEFAULT_INITIAL_DELAY_S,
                  retry_backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
-                 retry_jitter_fraction: float = DEFAULT_JITTER_FRACTION):
+                 retry_jitter_fraction: float = DEFAULT_JITTER_FRACTION,
+                 tls_enabled: bool = False, # Added
+                 tls_ca_cert_path: Optional[str] = None, # Added
+                 tls_client_cert_path: Optional[str] = None, # Added
+                 tls_client_key_path: Optional[str] = None, # Added
+                 tls_server_override_authority: Optional[str] = None): # Added
         self.server_address = server_address
         self.channel: Optional[grpc.Channel] = None
         self.stub: Optional[swm_service_pb2_grpc.SharedWorkingMemoryServiceStub] = None
+
         self.retry_max_attempts = retry_max_attempts
         self.retry_initial_delay_s = retry_initial_delay_s
         self.retry_backoff_factor = retry_backoff_factor
         self.retry_jitter_fraction = retry_jitter_fraction
 
+        self.tls_enabled = tls_enabled
+        self.tls_ca_cert_path = tls_ca_cert_path
+        self.tls_client_cert_path = tls_client_cert_path
+        self.tls_client_key_path = tls_client_key_path
+        self.tls_server_override_authority = tls_server_override_authority
+
+    def _reset_connection_state(self): # Helper
+        self.channel = None
+        self.stub = None
+
     def connect(self):
         if not self.channel:
             try:
-                self.channel = grpc.insecure_channel(self.server_address)
-                # Optional: Check connection readiness with a timeout
-                # grpc.channel_ready_future(self.channel).result(timeout=5) # 5 seconds to connect
+                if self.tls_enabled:
+                    credentials_list = []
+                    if self.tls_ca_cert_path:
+                        with open(self.tls_ca_cert_path, 'rb') as f: root_certificates = f.read()
+                        credentials_list.append(root_certificates)
+
+                    client_cert_chain = None
+                    if self.tls_client_cert_path and self.tls_client_key_path:
+                        with open(self.tls_client_cert_path, 'rb') as f: client_cert = f.read()
+                        with open(self.tls_client_key_path, 'rb') as f: client_key = f.read()
+                        client_cert_chain = (client_key, client_cert)
+
+                    channel_credentials = grpc.ssl_channel_credentials(
+                        root_certificates=credentials_list[0] if credentials_list else None,
+                        private_key=client_cert_chain[0] if client_cert_chain else None,
+                        certificate_chain=client_cert_chain[1] if client_cert_chain else None
+                    )
+                    options = (('grpc.ssl_target_name_override', self.tls_server_override_authority),) if self.tls_server_override_authority else None
+                    self.channel = grpc.secure_channel(self.server_address, channel_credentials, options=options)
+                    logger.info(f"SWMClient: Secure channel created for {self.server_address}.")
+                else:
+                    self.channel = grpc.insecure_channel(self.server_address)
+                    logger.info(f"SWMClient: Insecure channel created for {self.server_address}.")
+
                 self.stub = swm_service_pb2_grpc.SharedWorkingMemoryServiceStub(self.channel)
-                logger.info(f"SWMClient: Successfully connected to SWM service at: {self.server_address}")
-            except grpc.FutureTimeoutError: # type: ignore # grpc.FutureTimeoutError is valid
-                logger.error(f"SWMClient: Failed to connect to SWM service at {self.server_address} within the timeout.")
-                self.channel = None
-                self.stub = None
+                logger.info(f"SWMClient: Successfully connected to SWM service at: {self.server_address} (TLS: {self.tls_enabled})")
+
+            except grpc.FutureTimeoutError:
+                logger.error(f"SWMClient: Failed to connect to SWM service at {self.server_address} within the timeout (TLS: {self.tls_enabled}).")
+                self._reset_connection_state()
+            except FileNotFoundError as e_fnf:
+                logger.error(f"SWMClient: TLS certificate/key file not found: {e_fnf} (TLS: {self.tls_enabled}). Connection failed.")
+                self._reset_connection_state()
             except Exception as e:
-                logger.error(f"SWMClient: Error connecting to SWM service {self.server_address}: {e}", exc_info=True)
-                self.channel = None
-                self.stub = None
+                logger.error(f"SWMClient: Error connecting to SWM service {self.server_address} (TLS: {self.tls_enabled}): {e}", exc_info=True)
+                self._reset_connection_state()
 
     def _ensure_connected(self):
         if not self.stub:

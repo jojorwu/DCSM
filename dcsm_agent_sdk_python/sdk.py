@@ -1,12 +1,14 @@
 # dcsm_agent_sdk_python/sdk.py
+from .config import DCSMClientSDKConfig # Import the new config model
 from .glm_client import GLMClient
 from .swm_client import SWMClient
+from .kps_client import KPSClient # Import the new KPSClient
 from .local_memory import LocalAgentMemory
 from .proto_utils import kem_proto_to_dict # For SWM event handling
 import typing
-from typing import Optional, List, Tuple, Callable # Added Callable
-from datetime import datetime # For date parsing in KEMQuery helper
-import contextlib # For contextmanager
+from typing import Optional, List, Tuple, Callable
+from datetime import datetime
+import contextlib
 import grpc # For grpc.RpcError
 import threading # For background event handling
 import logging # For logging
@@ -20,28 +22,102 @@ from google.protobuf.timestamp_pb2 import Timestamp # For date parsing helper
 logger = logging.getLogger(__name__)
 
 class AgentSDK:
-    def __init__(self,
-                 glm_server_address: str = 'localhost:50051',
-                 swm_server_address: str = 'localhost:50053',
-                 lpa_max_size: int = 100,
-                 lpa_indexed_keys: Optional[List[str]] = None,
-                 connect_on_init: bool = True):
-        logger.info("AgentSDK: Initializing...")
-        self.glm_client = GLMClient(server_address=glm_server_address)
-        self.swm_client = SWMClient(server_address=swm_server_address)
-        self.local_memory = LocalAgentMemory(max_size=lpa_max_size, indexed_keys=lpa_indexed_keys if lpa_indexed_keys else [])
+    def __init__(self, config: Optional[DCSMClientSDKConfig] = None):
+        if config is None:
+            self.config = DCSMClientSDKConfig() # Load from env vars or defaults
+            logger.info("AgentSDK: No explicit config provided, loaded from environment/defaults.")
+        else:
+            self.config = config
+            logger.info("AgentSDK: Initializing with provided DCSMClientSDKConfig.")
 
-        if connect_on_init:
-            try:
-                self.glm_client.connect()
-            except Exception as e_glm:
-                logger.warning(f"AgentSDK: Warning - failed to connect to GLM during initialization: {e_glm}")
-            try:
-                self.swm_client.connect()
-            except Exception as e_swm:
-                logger.warning(f"AgentSDK: Warning - failed to connect to SWM during initialization: {e_swm}")
+        self._glm_client: Optional[GLMClient] = None
+        self._swm_client: Optional[SWMClient] = None
+        self._kps_client: Optional[KPSClient] = None # Add KPS client attribute
 
-        logger.info(f"AgentSDK: GLMClient, SWMClient, and LocalAgentMemory (indexed_keys: {lpa_indexed_keys if lpa_indexed_keys else []}) initialized.")
+        if self.config.glm_address:
+            self._glm_client = GLMClient(
+                server_address=self.config.glm_address,
+                retry_max_attempts=self.config.retry_max_attempts,
+                retry_initial_delay_s=self.config.retry_initial_delay_s,
+                retry_backoff_factor=self.config.retry_backoff_factor,
+                retry_jitter_fraction=self.config.retry_jitter_fraction,
+                tls_enabled=self.config.tls_enabled,
+                tls_ca_cert_path=self.config.tls_ca_cert_path,
+                tls_client_cert_path=self.config.tls_client_cert_path,
+                tls_client_key_path=self.config.tls_client_key_path,
+                tls_server_override_authority=self.config.tls_server_override_authority
+            )
+            logger.info(f"AgentSDK: GLMClient configured for {self.config.glm_address}")
+
+        if self.config.swm_address:
+            self._swm_client = SWMClient(
+                server_address=self.config.swm_address,
+                retry_max_attempts=self.config.retry_max_attempts,
+                retry_initial_delay_s=self.config.retry_initial_delay_s,
+                retry_backoff_factor=self.config.retry_backoff_factor,
+                retry_jitter_fraction=self.config.retry_jitter_fraction,
+                tls_enabled=self.config.tls_enabled,
+                tls_ca_cert_path=self.config.tls_ca_cert_path,
+                tls_client_cert_path=self.config.tls_client_cert_path,
+                tls_client_key_path=self.config.tls_client_key_path,
+                tls_server_override_authority=self.config.tls_server_override_authority
+            )
+            logger.info(f"AgentSDK: SWMClient configured for {self.config.swm_address}")
+
+        if self.config.kps_address:
+            self._kps_client = KPSClient(
+                server_address=self.config.kps_address,
+                retry_max_attempts=self.config.retry_max_attempts,
+                retry_initial_delay_s=self.config.retry_initial_delay_s,
+                retry_backoff_factor=self.config.retry_backoff_factor,
+                retry_jitter_fraction=self.config.retry_jitter_fraction,
+                tls_enabled=self.config.tls_enabled,
+                tls_ca_cert_path=self.config.tls_ca_cert_path,
+                tls_client_cert_path=self.config.tls_client_cert_path,
+                tls_client_key_path=self.config.tls_client_key_path,
+                tls_server_override_authority=self.config.tls_server_override_authority
+            )
+            logger.info(f"AgentSDK: KPSClient configured for {self.config.kps_address}")
+
+        self.local_memory = LocalAgentMemory(
+            max_size=self.config.lpa_max_size,
+            indexed_keys=self.config.lpa_indexed_keys if self.config.lpa_indexed_keys else []
+        )
+
+        if self.config.connect_on_init:
+            if self._glm_client:
+                try: self._glm_client.connect()
+                except Exception as e_glm: logger.warning(f"AgentSDK: Warning - failed to connect to GLM during initialization: {e_glm}")
+            if self._swm_client:
+                try: self._swm_client.connect()
+                except Exception as e_swm: logger.warning(f"AgentSDK: Warning - failed to connect to SWM during initialization: {e_swm}")
+            if self._kps_client:
+                try: self._kps_client.connect()
+                except Exception as e_kps: logger.warning(f"AgentSDK: Warning - failed to connect to KPS during initialization: {e_kps}")
+
+        logger.info(f"AgentSDK: Initialization complete. LAM indexed_keys: {self.config.lpa_indexed_keys if self.config.lpa_indexed_keys else []}.")
+
+    @property
+    def glm(self) -> GLMClient:
+        if not self._glm_client:
+            raise RuntimeError("AgentSDK: GLM service not configured or initialization failed.")
+        self._glm_client._ensure_connected() # Ensure connection before returning
+        return self._glm_client
+
+    @property
+    def swm(self) -> SWMClient:
+        if not self._swm_client:
+            raise RuntimeError("AgentSDK: SWM service not configured or initialization failed.")
+        self._swm_client._ensure_connected()
+        return self._swm_client
+
+    @property
+    def kps(self) -> KPSClient:
+        if not self._kps_client:
+            raise RuntimeError("AgentSDK: KPS service not configured or initialization failed.")
+        self._kps_client._ensure_connected()
+        return self._kps_client
+
 
     def query_local_memory(self, metadata_filters: Optional[dict] = None, ids: Optional[list[str]] = None) -> list[dict]:
         """Queries KEMs from Local Agent Memory (LAM) with filtering capabilities."""
@@ -56,7 +132,7 @@ class AgentSDK:
                 return cached_kem
 
         logger.info(f"AgentSDK: KEM ID '{kem_id}' not found in LAM or remote fetch forced. Contacting GLM...")
-        remote_kems_tuple = self.glm_client.retrieve_kems(ids_filter=[kem_id], page_size=1)
+        remote_kems_tuple = self.glm.retrieve_kems(ids_filter=[kem_id], page_size=1) # Use property
         kems_list_candidate = None
         if remote_kems_tuple and remote_kems_tuple[0] is not None:
             kems_list_candidate = remote_kems_tuple[0]
@@ -72,7 +148,7 @@ class AgentSDK:
     def store_kems(self, kems_data: list[dict]) -> tuple[Optional[list[dict]], Optional[list[str]], Optional[str]]:
         """Stores a batch of KEMs in GLM and updates LAM with the server's response data."""
         logger.info(f"AgentSDK: Requesting store_kems for {len(kems_data)} KEMs.")
-        stored_kems_dicts, failed_refs, error_msg = self.glm_client.batch_store_kems(kems_data)
+        stored_kems_dicts, failed_refs, error_msg = self.glm.batch_store_kems(kems_data) # Use property
 
         if stored_kems_dicts:
             logger.info(f"AgentSDK: Successfully stored/updated {len(stored_kems_dicts)} KEMs in GLM. Updating LAM.")
@@ -86,7 +162,7 @@ class AgentSDK:
 
     def update_kem(self, kem_id: str, kem_data_update: dict) -> Optional[dict]:
         logger.info(f"AgentSDK: Requesting update_kem for ID '{kem_id}'.")
-        updated_kem_on_server = self.glm_client.update_kem(kem_id, kem_data_update)
+        updated_kem_on_server = self.glm.update_kem(kem_id, kem_data_update) # Use property
         if updated_kem_on_server:
             logger.info(f"AgentSDK: KEM ID '{kem_id}' successfully updated in GLM. Updating LAM.")
             self.local_memory.put(kem_id, updated_kem_on_server)
@@ -96,7 +172,7 @@ class AgentSDK:
 
     def delete_kem(self, kem_id: str) -> bool:
         logger.info(f"AgentSDK: Requesting delete_kem for ID '{kem_id}'.")
-        success = self.glm_client.delete_kem(kem_id)
+        success = self.glm.delete_kem(kem_id) # Use property
         if success:
             logger.info(f"AgentSDK: KEM ID '{kem_id}' successfully deleted from GLM. Removing from LAM.")
             self.local_memory.delete(kem_id)
@@ -106,19 +182,28 @@ class AgentSDK:
 
     def close(self):
         logger.info("AgentSDK: Closing connections...")
-        if self.glm_client:
-            self.glm_client.close()
-        if self.swm_client:
-            self.swm_client.close()
+        if self._glm_client:
+            self._glm_client.close()
+        if self._swm_client:
+            self._swm_client.close()
+        if self._kps_client: # Close KPS client
+            self._kps_client.close()
         logger.info("AgentSDK: Connections closed.")
 
     def __enter__(self):
-        if self.glm_client and not self.glm_client.stub:
-            try: self.glm_client.connect()
+        # Connect on init now handles this if true, otherwise properties will connect on first use.
+        # This __enter__ can ensure they are connected if not already.
+        if self._glm_client and not self._glm_client.stub: # Check internal client, not property
+            try: self._glm_client.connect()
             except Exception as e_glm: logger.warning(f"AgentSDK (__enter__): Warning - failed to connect to GLM: {e_glm}")
-        if self.swm_client and not self.swm_client.stub:
-            try: self.swm_client.connect()
+
+        if self._swm_client and not self._swm_client.stub:
+            try: self._swm_client.connect()
             except Exception as e_swm: logger.warning(f"AgentSDK (__enter__): Warning - failed to connect to SWM: {e_swm}")
+
+        if self._kps_client and not self._kps_client.stub:
+            try: self._kps_client.connect()
+            except Exception as e_kps: logger.warning(f"AgentSDK (__enter__): Warning - failed to connect to KPS: {e_kps}")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -132,15 +217,14 @@ class AgentSDK:
         Each item in the success list is a dict returned by SWMClient.publish_kem_to_swm.
         Each item in the failure list is the original KEM dict that failed.
         """
-        if not self.swm_client:
-            logger.error("AgentSDK: SWMClient not initialized. Cannot publish to SWM.")
-            return [], kems_data
+        # Use self.swm property which ensures client is available and connected
+        swm_service = self.swm
         successfully_published_results = []
         failed_to_publish_kems = []
         for kem_data_item in kems_data:
             try:
-                self.swm_client._ensure_connected()
-                result = self.swm_client.publish_kem_to_swm(kem_data_item, persist_to_glm)
+                # swm_service is already ensured to be connected by the property access
+                result = swm_service.publish_kem_to_swm(kem_data_item, persist_to_glm)
                 if result and result.get("published_to_swm"):
                     successfully_published_results.append(result)
                 else:
@@ -168,9 +252,7 @@ class AgentSDK:
                                  If > 0, attempts to load up to this number, possibly making multiple paginated requests.
         :return: List of KEMs (as dicts) loaded into LAM.
         """
-        if not self.swm_client:
-            logger.error("AgentSDK: SWMClient not initialized. Cannot load from SWM.")
-            return []
+        swm_service = self.swm # Use property
         query_proto = common_glm_pb2.KEMQuery()
         if kem_query_dict.get("text_query"): query_proto.text_query = kem_query_dict["text_query"]
         if kem_query_dict.get("embedding_query"): query_proto.embedding_query.extend(kem_query_dict["embedding_query"])
@@ -197,15 +279,14 @@ class AgentSDK:
         keep_fetching = True
         while keep_fetching:
             try:
-                self.swm_client._ensure_connected()
-
+                # swm_service is already ensured to be connected
                 page_size_for_this_request = 0
                 if max_kems_to_load > 0:
                     remaining_to_load = max_kems_to_load - kems_loaded_count
                     if remaining_to_load <= 0: keep_fetching = False; break
                     page_size_for_this_request = remaining_to_load
 
-                kems_page_list, next_page_token = self.swm_client.query_swm(
+                kems_page_list, next_page_token = swm_service.query_swm( # Use swm_service
                     kem_query=query_proto,
                     page_size=page_size_for_this_request,
                     page_token=current_page_token
@@ -235,18 +316,13 @@ class AgentSDK:
         Can automatically update LAM based on events.
         :param requested_queue_size: Optional: Client's requested size for its event queue on SWM server.
         """
-        if not self.swm_client: logger.error("AgentSDK: SWMClient not initialized. Cannot subscribe to events."); return None
+        swm_service = self.swm # Use property
+        # Connection is ensured by property access
 
-        try:
-            self.swm_client._ensure_connected()
-        except ConnectionError as e:
-            logger.error(f"AgentSDK: Cannot subscribe to SWM events, connection failed: {e}")
-            return None
-
-        event_stream_generator = self.swm_client.subscribe_to_swm_events(
+        event_stream_generator = swm_service.subscribe_to_swm_events( # Use swm_service
             topics=topics,
             agent_id=agent_id,
-            requested_queue_size=requested_queue_size # Pass to client
+            requested_queue_size=requested_queue_size
         )
         if not event_stream_generator: logger.error(f"AgentSDK: Failed to get event stream generator from SWMClient for agent_id {agent_id}."); return None
 
@@ -278,19 +354,16 @@ class AgentSDK:
     def acquire_distributed_lock(self, resource_id: str, agent_id: str, timeout_ms: int = 0,
                                  lease_duration_ms: int = 0, rpc_timeout: int = 5) -> Optional[common_swm_pb2.AcquireLockResponse]:
         """Acquires a distributed lock on a resource via SWM."""
-        if not self.swm_client: logger.error("AgentSDK: SWMClient not initialized. Cannot acquire lock."); return None
-        return self.swm_client.acquire_lock(resource_id, agent_id, timeout_ms, lease_duration_ms, rpc_timeout)
+        return self.swm.acquire_lock(resource_id, agent_id, timeout_ms, lease_duration_ms, rpc_timeout) # Use property
 
     def release_distributed_lock(self, resource_id: str, agent_id: str, lock_id: Optional[str] = None,
                                  rpc_timeout: int = 5) -> Optional[common_swm_pb2.ReleaseLockResponse]:
         """Releases a distributed lock on a resource via SWM."""
-        if not self.swm_client: logger.error("AgentSDK: SWMClient not initialized. Cannot release lock."); return None
-        return self.swm_client.release_lock(resource_id, agent_id, lock_id, rpc_timeout)
+        return self.swm.release_lock(resource_id, agent_id, lock_id, rpc_timeout) # Use property
 
     def get_distributed_lock_info(self, resource_id: str, rpc_timeout: int = 5) -> Optional[common_swm_pb2.LockInfo]:
         """Gets information about the state of a distributed lock for a resource."""
-        if not self.swm_client: logger.error("AgentSDK: SWMClient not initialized. Cannot get lock info."); return None
-        return self.swm_client.get_lock_info(resource_id, rpc_timeout)
+        return self.swm.get_lock_info(resource_id, rpc_timeout) # Use property
 
     @contextlib.contextmanager
     def distributed_lock(self, resource_id: str, agent_id: str, acquire_timeout_ms: int = 10000,
@@ -331,16 +404,14 @@ class AgentSDK:
     # --- Distributed Counter High-Level Methods ---
     def increment_distributed_counter(self, counter_id: str, increment_by: int = 1, rpc_timeout: int = 5) -> Optional[int]:
         """Increments (or decrements) a distributed counter in SWM."""
-        if not self.swm_client: logger.error("AgentSDK: SWMClient not initialized. Cannot increment counter."); return None
-        response = self.swm_client.increment_counter(counter_id, increment_by, rpc_timeout)
+        response = self.swm.increment_counter(counter_id, increment_by, rpc_timeout) # Use property
         if response and (not response.status_message or "successfully updated" in response.status_message.lower() or not "error" in response.status_message.lower()):
             return response.current_value
         else: logger.error(f"AgentSDK: Error incrementing counter '{counter_id}'. Message: {response.status_message if response else 'No response'}"); return None
 
     def get_distributed_counter(self, counter_id: str, rpc_timeout: int = 5) -> Optional[int]:
         """Gets the current value of a distributed counter from SWM."""
-        if not self.swm_client: logger.error("AgentSDK: SWMClient not initialized. Cannot get counter value."); return None
-        response = self.swm_client.get_counter(counter_id, rpc_timeout)
+        response = self.swm.get_counter(counter_id, rpc_timeout) # Use property
         if response and (not response.status_message or
                          "successfully retrieved" in response.status_message.lower() or
                          "not found, returned default value 0" in response.status_message.lower() or
@@ -349,14 +420,17 @@ class AgentSDK:
         else: logger.error(f"AgentSDK: Error getting counter '{counter_id}'. Message: {response.status_message if response else 'No response'}"); return None
 
 if __name__ == '__main__':
-    logger.info("Running AgentSDK example (requires GLM and SWM servers)")
-    # Example usage can be found in dcsm_agent_sdk_python/example.py
-    # This __main__ block can be expanded or refer to example.py for full demonstrations.
+    logger.info("Running AgentSDK example (requires GLM, SWM, and potentially KPS servers)")
+    # This __main__ block is a simplified test. See example.py for more comprehensive usage.
 
     if os.getenv("RUN_AGENT_SDK_EXAMPLE") == "true":
         try:
-            with AgentSDK(connect_on_init=True) as sdk:
-                logger.info("\n--- Testing SWM functions ---")
+            # Load configuration (from .env file or environment variables)
+            sdk_config = DCSMClientSDKConfig()
+            logger.info(f"SDK Config loaded: GLM @ {sdk_config.glm_address}, SWM @ {sdk_config.swm_address}, KPS @ {sdk_config.kps_address}")
+
+            with AgentSDK(config=sdk_config) as sdk: # New constructor with config
+                logger.info("\n--- Testing SWM functions (via sdk.swm) ---")
                 kems_to_pub_swm = [
                     {"id": "sdk_swm_pub_001", "content": "SWM pub 1", "metadata": {"tag": "swm_batch"}},
                     {"id": "sdk_swm_pub_002", "content": "SWM pub 2", "metadata": {"tag": "swm_batch"}}

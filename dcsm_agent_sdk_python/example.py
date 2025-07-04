@@ -14,12 +14,18 @@ if project_root not in sys.path:
 
 try:
     from dcsm_agent_sdk_python.sdk import AgentSDK
+    from dcsm_agent_sdk_python.config import DCSMClientSDKConfig # Import new config
     from dcsm_agent_sdk_python.generated_grpc_code import swm_service_pb2 as common_swm_pb2 # For SWM enums
+    # For KPS example, if adding one:
+    # from dcsm_agent_sdk_python.generated_grpc_code import kps_service_pb2
 except ImportError:
     # Fallback for direct execution if the above fails
-    logging.warning("Could not import 'from dcsm_agent_sdk_python.sdk import AgentSDK', trying 'from sdk import AgentSDK'")
+    logging.warning("Could not import from 'dcsm_agent_sdk_python.*', trying local imports for 'sdk', 'config', etc.")
     from sdk import AgentSDK
+    from config import DCSMClientSDKConfig
     from generated_grpc_code import swm_service_pb2 as common_swm_pb2
+    # from generated_grpc_code import kps_service_pb2
+
 
 logger = logging.getLogger("AgentSDKExample")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -27,25 +33,31 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 
 def run_example():
     logger.info("Starting comprehensive AgentSDK example...")
-    logger.info("Ensure GLM and SWM servers are running (e.g., on localhost:50051 and localhost:50053).")
+    logger.info("This example demonstrates usage with DCSMClientSDKConfig.")
+    logger.info("Ensure GLM, SWM, and KPS servers are running and configured as per SDK defaults or .env/environment variables.")
     logger.info("To actually run network-dependent parts, set environment variable RUN_SDK_EXAMPLE=true")
-
-    sdk_instance: typing.Optional[AgentSDK] = None
-    glm_server_address = os.getenv("DCSM_GLM_ADDRESS", 'localhost:50051')
-    swm_server_address = os.getenv("DCSM_SWM_ADDRESS", 'localhost:50053')
 
     if os.getenv("RUN_SDK_EXAMPLE") != "true":
         logger.warning("RUN_SDK_EXAMPLE environment variable not set to 'true'. Example will not connect to servers.")
-        logger.info("Only local SDK parts (like LocalAgentMemory) might be demonstrated if possible without server.")
-        sdk_instance = AgentSDK(glm_server_address=glm_server_address, swm_server_address=swm_server_address, lpa_max_size=5, connect_on_init=False)
-        sdk_instance.local_memory.put("local_test_001", {"id":"local_test_001", "data":"test_content"})
-        logger.info(f"Local Agent Memory contains local_test_001: {sdk_instance.local_memory.get('local_test_001')}")
-        sdk_instance.close()
+        # Demonstrate config loading even if not connecting
+        try:
+            sdk_config_nocoonnect = DCSMClientSDKConfig()
+            logger.info(f"SDK Config (no connect): GLM @ {sdk_config_nocoonnect.glm_address}, SWM @ {sdk_config_nocoonnect.swm_address}, KPS @ {sdk_config_nocoonnect.kps_address}")
+            sdk_instance_noconnect = AgentSDK(config=sdk_config_nocoonnect) # connect_on_init is part of config now
+            sdk_instance_noconnect.local_memory.put("local_test_001", {"id":"local_test_001", "data":"test_content"})
+            logger.info(f"Local Agent Memory contains local_test_001: {sdk_instance_noconnect.local_memory.get('local_test_001')}")
+            sdk_instance_noconnect.close()
+        except Exception as e_no_connect:
+            logger.error(f"Error during no-connect demonstration: {e_no_connect}")
         return
 
     try:
-        with AgentSDK(glm_server_address=glm_server_address, swm_server_address=swm_server_address, lpa_max_size=5, connect_on_init=True) as sdk:
-            sdk_instance = sdk
+        # Load configuration from .env file or environment variables
+        sdk_config = DCSMClientSDKConfig()
+        logger.info(f"SDK Config loaded: GLM @ {sdk_config.glm_address}, SWM @ {sdk_config.swm_address}, KPS @ {sdk_config.kps_address}, TLS: {sdk_config.tls_enabled}")
+
+        with AgentSDK(config=sdk_config) as sdk:
+            # sdk_instance = sdk # Not needed as 'sdk' is already the instance
 
             sdk.local_memory.clear()
             logger.info("\n--- Local Agent Memory (LAM) cleared ---")
@@ -156,15 +168,47 @@ def run_example():
             lock_info_after = sdk.get_distributed_lock_info(res_id_example)
             assert lock_info_after is not None and not lock_info_after.is_locked, "Lock was not released by context manager!"
 
+            logger.info("\n--- Testing KPS functions (placeholder) ---")
+            if sdk.config.kps_address: # Check if KPS is configured
+                try:
+                    # Example: Add a memory item to KPS
+                    kps_kem_uri = "kem:example:doc:sdk_kps_test_001"
+                    kps_content = "This is a test document for KPS via AgentSDK."
+                    # Note: KPSClient.add_memory expects kem_uri and content directly.
+                    # The AgentSDK could offer a higher-level wrapper if desired.
+                    # For now, assume direct pass-through or simple wrapping if sdk.kps.add_memory existed.
+
+                    # Placeholder: Direct call to a hypothetical sdk.kps.add_memory
+                    # This assumes KPSClient has an add_memory method similar to what was built.
+                    # add_response = sdk.kps.add_memory(kem_uri=kps_kem_uri, content=kps_content)
+                    # if add_response and add_response.status_message == "OK": # Or however KPSClient signals success
+                    #    logger.info(f"Successfully added/updated KEM '{kps_kem_uri}' in KPS.")
+                    # else:
+                    #    logger.error(f"Failed to add/update KEM '{kps_kem_uri}' in KPS. Response: {add_response}")
+                    logger.info(f"KPS client is available at sdk.kps. Example KPS call placeholder executed for {kps_kem_uri}.")
+                    logger.info("Actual KPS interaction example would involve calling methods on sdk.kps like sdk.kps.add_memory(...)")
+
+                except RuntimeError as e_kps_runtime: # If KPS client wasn't configured/connected
+                    logger.warning(f"KPS example skipped: {e_kps_runtime}")
+                except grpc.RpcError as e_kps:
+                    logger.error(f"KPS example: gRPC error communicating with KPS: {e_kps.code()} - {e_kps.details()}")
+                except Exception as e_kps_other:
+                    logger.error(f"KPS example: Unexpected error: {e_kps_other}", exc_info=True)
+            else:
+                logger.info("KPS not configured in DCSMClientSDKConfig, skipping KPS example.")
+
+
             logger.info("\n--- AgentSDK Example Run Successfully Completed! ---")
 
     except grpc.RpcError as e:
         logger.error(f"!!!!!!!!!! gRPC ERROR !!!!!!!!!")
-        logger.error(f"Failed to connect to GLM/SWM server or other gRPC error occurred.")
-        if sdk_instance:
-            if sdk_instance.glm_client: logger.error(f"GLM Server Address: {sdk_instance.glm_client.server_address}")
-            if sdk_instance.swm_client: logger.error(f"SWM Server Address: {sdk_instance.swm_client.server_address}")
-        logger.error("Please ensure GLM and SWM servers are running.")
+        logger.error(f"Failed to connect to a DCSM server or other gRPC error occurred.")
+        # Access config directly from the sdk instance if it was created
+        if 'sdk' in locals() and hasattr(sdk, 'config'):
+            if sdk.config.glm_address: logger.error(f"GLM Address from config: {sdk.config.glm_address}")
+            if sdk.config.swm_address: logger.error(f"SWM Address from config: {sdk.config.swm_address}")
+            if sdk.config.kps_address: logger.error(f"KPS Address from config: {sdk.config.kps_address}")
+        logger.error("Please ensure DCSM servers (GLM, SWM, KPS) are running and accessible.")
         logger.error(f"Error Code: {e.code()}")
         logger.error(f"Details: {e.details()}", exc_info=True)
     except Exception as e:
