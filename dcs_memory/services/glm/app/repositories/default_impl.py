@@ -216,7 +216,9 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         current_time_proto = Timestamp(); current_time_proto.GetCurrentTime()
 
         # Preserve created_at if KEM exists, otherwise set to now or use provided
-        existing_created_at_str = self.sqlite_repo.get_kem_creation_timestamp(kem_id)
+        existing_created_at_str = await asyncio.to_thread(
+            self.sqlite_repo.get_kem_creation_timestamp, kem_id
+        )
         final_created_at_proto = Timestamp()
         if existing_created_at_str:
             try:
@@ -240,13 +242,13 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         if self.qdrant_repo and has_embeddings:
             qdrant_payload = {"kem_id_ref": kem_id}
             if kem_to_store.metadata:
-                for k, v_str in kem_to_store.metadata.items(): qdrant_payload[f"md_{k}"] = v_str # metadata is map<string,string>
+                for k, v_str in kem_to_store.metadata.items(): qdrant_payload[f"md_{k}"] = v_str
             if kem_to_store.HasField("created_at"): qdrant_payload["created_at_ts"] = kem_to_store.created_at.seconds
             if kem_to_store.HasField("updated_at"): qdrant_payload["updated_at_ts"] = kem_to_store.updated_at.seconds
 
             try:
                 point = PointStruct(id=kem_id, vector=list(kem_to_store.embeddings), payload=qdrant_payload)
-                self.qdrant_repo.upsert_point(point)
+                await asyncio.to_thread(self.qdrant_repo.upsert_point, point)
                 qdrant_op_done = True
             except Exception as e_qdrant:
                 logger.error(f"store_kem: Qdrant error for ID '{kem_id}': {e_qdrant}", exc_info=True)
@@ -257,41 +259,39 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
 
         # 2. Store/Update SQLite record
         try:
-            self.sqlite_repo.store_or_replace_kem(
+            await asyncio.to_thread(
+                self.sqlite_repo.store_or_replace_kem,
                 kem_id=kem_to_store.id,
                 content_type=kem_to_store.content_type,
                 content=kem_to_store.content,
-                metadata_json=json.dumps(dict(kem_to_store.metadata)), # Protobuf map to dict then to JSON string
+                metadata_json=json.dumps(dict(kem_to_store.metadata)),
                 created_at_iso=kem_to_store.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
                 updated_at_iso=kem_to_store.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
             )
-        except sqlite3.Error as e_sqlite: # Catch specific sqlite3.Error
+        except sqlite3.Error as e_sqlite:
             logger.error(f"store_kem: SQLite error for ID '{kem_id}': {e_sqlite}", exc_info=True)
-            if qdrant_op_done and self.qdrant_repo: # If Qdrant op was done, try to roll it back
+            if qdrant_op_done and self.qdrant_repo:
                 logger.warning(f"store_kem: Attempting to roll back Qdrant upsert for KEM ID '{kem_id}' due to SQLite error.")
                 try:
-                    self.qdrant_repo.delete_points_by_ids([kem_id])
+                    await asyncio.to_thread(self.qdrant_repo.delete_points_by_ids, [kem_id])
                     logger.info(f"store_kem: Qdrant rollback successful for KEM ID '{kem_id}'.")
                 except Exception as e_qdrant_rollback:
                     logger.critical(f"store_kem: CRITICAL - Failed Qdrant rollback for KEM ID '{kem_id}': {e_qdrant_rollback}", exc_info=True)
-                    # Original error is more relevant to propagate if rollback also fails
             if "unable to open" in str(e_sqlite) or "database is locked" in str(e_sqlite):
                  raise BackendUnavailableError(f"SQLite unavailable or busy: {e_sqlite}") from e_sqlite
             raise StorageError(f"SQLite processing error: {e_sqlite}") from e_sqlite
-        except Exception as e_other_sqlite: # Catch other potential errors
+        except Exception as e_other_sqlite:
             logger.error(f"store_kem: Unexpected error during SQLite operation for ID '{kem_id}': {e_other_sqlite}", exc_info=True)
-            # Similar rollback logic for Qdrant if applicable
             if qdrant_op_done and self.qdrant_repo:
                 logger.warning(f"store_kem: Attempting to roll back Qdrant upsert for KEM ID '{kem_id}' due to unexpected SQLite error.")
                 try:
-                    self.qdrant_repo.delete_points_by_ids([kem_id])
+                    await asyncio.to_thread(self.qdrant_repo.delete_points_by_ids, [kem_id])
                 except Exception as e_q_rb_unexpected:
                     logger.critical(f"store_kem: CRITICAL - Failed Qdrant rollback (unexpected SQLite err) for KEM ID '{kem_id}': {e_q_rb_unexpected}", exc_info=True)
             raise StorageError(f"Unexpected error during SQLite operation: {e_other_sqlite}") from e_other_sqlite
 
         return kem_to_store
 
-    # ... other methods will be implemented progressively ...
     async def retrieve_kems(
         self,
         query: glm_service_pb2.KEMQuery,
@@ -533,40 +533,41 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         # sqlite_healthy = await loop.run_in_executor(None, self.sqlite_repo._check_sqlite_health_internal_logic)
         # qdrant_healthy = await loop.run_in_executor(None, self.qdrant_repo._check_qdrant_health_internal_logic)
 
-        # For now, direct call for placeholder:
         all_ok = True
         msg_parts = []
 
-        # 1. Check native SQLite health
+        # 1. Check native SQLite health (using asyncio.to_thread for sync calls)
         try:
-            conn = self.sqlite_repo._get_sqlite_conn()
-            cursor = conn.cursor()
-            sqlite_query = getattr(self.config, "HEALTH_CHECK_SQLITE_QUERY", "SELECT 1")
-            cursor.execute(sqlite_query)
-            cursor.fetchone()
+            def sqlite_health_check_sync():
+                conn = self.sqlite_repo._get_sqlite_conn()
+                cursor = conn.cursor()
+                sqlite_query = getattr(self.config, "HEALTH_CHECK_SQLITE_QUERY", "SELECT 1")
+                cursor.execute(sqlite_query)
+                cursor.fetchone()
+            await asyncio.to_thread(sqlite_health_check_sync)
             msg_parts.append("NativeSQLite:OK")
         except Exception as e_sqlite_check:
             logger.warning(f"DefaultGLMRepository Health Check: Native SQLite check failed: {e_sqlite_check}")
             all_ok = False
-            msg_parts.append(f"NativeSQLite:FAIL ({e_sqlite_check})")
+            msg_parts.append(f"NativeSQLite:FAIL ({type(e_sqlite_check).__name__}: {e_sqlite_check})")
 
-        # 2. Check native Qdrant health (if configured)
+        # 2. Check native Qdrant health (if configured, using asyncio.to_thread for sync calls)
         if self.qdrant_repo and self.qdrant_repo.client:
             try:
-                self.qdrant_repo.client.get_collections() # Simple connectivity test
+                await asyncio.to_thread(self.qdrant_repo.client.get_collections) # Simple connectivity test
                 msg_parts.append("NativeQdrant:OK")
             except Exception as e_qdrant_check:
                 logger.warning(f"DefaultGLMRepository Health Check: Native Qdrant check failed: {e_qdrant_check}")
                 all_ok = False
-                msg_parts.append(f"NativeQdrant:FAIL ({e_qdrant_check})")
+                msg_parts.append(f"NativeQdrant:FAIL ({type(e_qdrant_check).__name__}: {e_qdrant_check})")
         elif not self.config.QDRANT_HOST:
             msg_parts.append("NativeQdrant:N/A (not configured)")
-        else: # Configured but Qdrant client not initialized (e.g. init failed)
-            logger.warning("DefaultGLMRepository Health Check: Native Qdrant configured but client not available.")
+        else: # Configured but Qdrant client not initialized (e.g. init failed during __init__)
+            logger.warning("DefaultGLMRepository Health Check: Native Qdrant configured but client not available (init failed?).")
             all_ok = False
             msg_parts.append("NativeQdrant:FAIL (client not initialized)")
 
-        # 3. Check health of external repositories
+        # 3. Check health of external repositories (assuming their check_health() is already async)
         if self.external_repos:
             for name, repo in self.external_repos.items():
                 try:
