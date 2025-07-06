@@ -8,7 +8,7 @@ from typing import List, Tuple, Optional, Dict, Any
 # if we want to decouple this interface from specific proto versions.
 # However, for now, using the proto types directly for clarity.
 from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
-from ..config import ExternalDataSourceConfig # Relative import for config within the same app
+from ..config import ExternalDataSourceConfig, GLMConfig # Relative import for config within the same app (GLMConfig moved up)
 
 
 class BaseExternalRepository(ABC):
@@ -96,5 +96,4 @@ class BaseExternalRepository(ABC):
 # It might be useful to also import common exceptions from .base if they are reused.
 # from .base import StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
 # For now, assuming concrete implementations will raise appropriate exceptions.
-# If GLMConfig is needed for type hint in __init__
-from ..config import GLMConfig
+# GLMConfig import was moved to the top.

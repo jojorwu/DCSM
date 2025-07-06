@@ -157,73 +157,91 @@ class PostgresExternalRepository(BaseExternalRepository):
 
         where_clauses: List[str] = []
         query_params: List[Any] = [] # Parameters for asyncpg, $1, $2, etc.
-        param_idx = 1 # For asyncpg parameter numbering
+        param_idx = 1
 
-        def _to_utc_datetime(dt: Optional[datetime]) -> Optional[datetime]:
-            if dt is None:
-                return None
-            if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None: # Naive datetime
-                if self.assume_naive_timestamp_is_utc:
-                    return dt.replace(tzinfo=timezone.utc)
-                else: # Try to localize to system timezone then convert to UTC (can be problematic)
-                    logger.warning(f"Naive datetime '{dt}' found; localizing to system time then UTC. Explicit TIMESTAMPTZ in PG is safer.")
+        # Helper: Convert various date/time inputs to timezone-aware UTC datetime object
+        def _parse_to_utc_datetime(value: Any, field_name_for_log: str) -> Optional[datetime]:
+            if isinstance(value, datetime):
+                if value.tzinfo is None or value.tzinfo.utcoffset(value) is None: # Naive datetime
+                    return value.replace(tzinfo=timezone.utc) if self.assume_naive_timestamp_is_utc else value.astimezone(timezone.utc)
+                return value.astimezone(timezone.utc)
+            elif isinstance(value, str):
+                try:
+                    dt = datetime.fromisoformat(value.replace(" ", "T"))
+                    if dt.tzinfo is None: return dt.replace(tzinfo=timezone.utc) if self.assume_naive_timestamp_is_utc else dt.astimezone(timezone.utc)
                     return dt.astimezone(timezone.utc)
-            return dt.astimezone(timezone.utc) # Ensure it's UTC
-
-        def _datetime_to_iso_utc_string(dt: Optional[datetime]) -> Optional[str]:
-            if dt is None:
-                return None
-            utc_dt = _to_utc_datetime(dt)
-            if utc_dt:
-                return utc_dt.isoformat(timespec='microseconds') # Includes timezone offset like +00:00
+                except ValueError:
+                    logger.warning(f"Could not parse ISO string '{value}' for field '{field_name_for_log}'.")
+                    return None
+            elif isinstance(value, (int, float)): # Assume Unix timestamp (seconds)
+                try:
+                    return datetime.fromtimestamp(value, tz=timezone.utc)
+                except ValueError:
+                    logger.warning(f"Could not parse numeric timestamp '{value}' for field '{field_name_for_log}'.")
+                    return None
+            logger.warning(f"Unsupported type '{type(value)}' for timestamp field '{field_name_for_log}'.")
             return None
 
-        def _iso_utc_string_to_datetime(iso_str: str) -> Optional[datetime]:
-            try:
-                dt = datetime.fromisoformat(iso_str)
-                return _to_utc_datetime(dt) # Ensure it's UTC for comparison
-            except (ValueError, TypeError):
-                logger.warning(f"Could not parse ISO string '{iso_str}' to datetime.")
-                return None
-
-        # 1. Add metadata filter conditions from KEMQuery
+        # 1. Add metadata filter conditions (exact match)
         if internal_query.metadata_filters and self.filterable_metadata_columns:
             for filter_key, filter_value in internal_query.metadata_filters.items():
                 if filter_key in self.filterable_metadata_columns:
                     pg_column_name = self.filterable_metadata_columns[filter_key]
-                    # For timestamp columns, we might need to parse filter_value if it's an ISO string
-                    # and the PG column is a timestamp type. For now, assume direct equality for non-ts.
-                    # This logic might need to be more type-aware based on pg_column_name's type.
                     where_clauses.append(f'"{pg_column_name}" = ${param_idx}')
-                    query_params.append(filter_value) # asyncpg handles basic type conversion
+                    query_params.append(filter_value)
                     param_idx += 1
-                    logger.debug(f"PostgreSQL connector '{self.config.name}': Applying metadata filter: \"{pg_column_name}\" = '{filter_value}'")
-                else:
-                    logger.warning(f"PostgreSQL connector '{self.config.name}': Metadata filter key '{filter_key}' is not configured as filterable. Ignoring.")
+                else: # Log if a filter key is provided but not configured as filterable
+                    logger.warning(f"Metadata filter key '{filter_key}' not in 'filterable_metadata_columns'. Ignoring.")
 
-        # 2. Add keyset pagination conditions (if page_token is present)
+        # 2. Add ID list filter
+        if internal_query.ids:
+            if self.id_column: # Ensure id_column is configured
+                id_placeholders = ", ".join(f"${i}" for i in range(param_idx, param_idx + len(internal_query.ids)))
+                where_clauses.append(f'"{self.id_column}" IN ({id_placeholders})')
+                query_params.extend(list(internal_query.ids))
+                param_idx += len(internal_query.ids)
+            else:
+                logger.warning("ID filter provided in query, but 'id_column' not configured in mapping. Ignoring ID filter.")
+
+        # 3. Add date range filters
+        ts_map = {
+            "created_at_start": (self.created_at_column, ">="),
+            "created_at_end": (self.created_at_column, "<="),
+            "updated_at_start": (self.updated_at_column, ">="),
+            "updated_at_end": (self.updated_at_column, "<="),
+        }
+        for field_name, (pg_col, op) in ts_map.items():
+            if internal_query.HasField(field_name) and pg_col:
+                proto_ts = getattr(internal_query, field_name)
+                # Convert google.protobuf.Timestamp to datetime object for query
+                dt_val = datetime.fromtimestamp(proto_ts.seconds + proto_ts.nanos / 1e9, tz=timezone.utc)
+                if dt_val:
+                    where_clauses.append(f'"{pg_col}" {op} ${param_idx}')
+                    query_params.append(dt_val) # asyncpg handles datetime objects
+                    param_idx += 1
+                else:
+                    logger.warning(f"Could not parse KEMQuery field '{field_name}' for date range filter.")
+
+
+        # 4. Add keyset pagination conditions
         if page_token:
             try:
                 last_ts_iso_str, last_id_val_str = page_token.split('|', 1)
-                last_ts_dt = _iso_utc_string_to_datetime(last_ts_iso_str)
+                # Use the _parse_to_utc_datetime helper for robust parsing of token timestamp
+                last_ts_dt = _parse_to_utc_datetime(last_ts_iso_str, "page_token_timestamp")
 
-                if last_ts_dt:
-                    # For (timestamp_sort_column DESC, id_tiebreaker_column DESC):
-                    # ( (timestamp_sort_column < $ts) OR
-                    #   (timestamp_sort_column = $ts AND id_tiebreaker_column < $id) )
+                if last_ts_dt and self.timestamp_sort_column and self.id_tiebreaker_column:
                     keyset_condition = (
                         f'(("{self.timestamp_sort_column}" < ${param_idx}) OR '
                         f' ("{self.timestamp_sort_column}" = ${param_idx+1} AND "{self.id_tiebreaker_column}" < ${param_idx+2}))'
-                    )
+                    ) # Assumes DESC, DESC order
                     where_clauses.append(keyset_condition)
-                    # asyncpg expects datetime objects for timestamp columns, not strings.
-                    query_params.extend([last_ts_dt, last_ts_dt, last_id_val_str]) # last_id_val_str might need casting depending on PG col type
+                    query_params.extend([last_ts_dt, last_ts_dt, last_id_val_str])
                     param_idx += 3
-                    logger.debug(f"PostgreSQL connector '{self.config.name}': Applying keyset pagination from token '{page_token}' (parsed ts: {last_ts_dt})")
                 else:
-                    logger.warning(f"PostgreSQL connector '{self.config.name}': Could not parse timestamp from page_token '{page_token}'. Ignoring for pagination.")
-            except ValueError: # Handles split error
-                logger.warning(f"PostgreSQL connector '{self.config.name}': Invalid page_token format '{page_token}'. Ignoring for pagination (fetching first page of filtered results).", exc_info=True)
+                    logger.warning(f"Invalid page_token or missing sort/tiebreaker columns. Ignoring pagination token: {page_token}")
+            except ValueError:
+                logger.warning(f"Invalid page_token format: {page_token}. Ignoring pagination token.", exc_info=True)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
