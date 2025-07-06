@@ -465,18 +465,33 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     for i in range(0, len(kps_payloads), kps_batch_size):
                         batch_to_send = kps_payloads[i:i + kps_batch_size]
                         try:
-                            # KPS client call is sync, run in executor for async context
                             kps_request = kps_service_pb2.BatchAddMemoriesRequest(memories=batch_to_send)
-                            loop = asyncio.get_running_loop()
-                            kps_response: kps_service_pb2.BatchAddMemoriesResponse = await loop.run_in_executor(
-                                None, self.kps_client_stub.BatchAddMemories, kps_request, 30 # timeout
+                            # loop = asyncio.get_running_loop() # Not strictly needed for asyncio.to_thread
+                            kps_response: kps_service_pb2.BatchAddMemoriesResponse = await asyncio.to_thread(
+                                self.kps_client_stub.BatchAddMemories, kps_request, timeout=30
                             )
                             items_processed_total += len(batch_to_send) - len(kps_response.failed_kem_references)
                             items_failed_total += len(kps_response.failed_kem_references)
-                            if kps_response.failed_kem_references: logger.warning(f"KPS failed items: {kps_response.failed_kem_references}")
+                            if kps_response.failed_kem_references:
+                                logger.warning(f"IndexExternalDataSource: KPS BatchAddMemories reported failures for {len(kps_response.failed_kem_references)} KEM URIs: {kps_response.failed_kem_references}")
+                            if kps_response.overall_error_message:
+                                logger.warning(f"IndexExternalDataSource: KPS BatchAddMemories overall error: {kps_response.overall_error_message}")
+
+                        except grpc.RpcError as e_kps_rpc:
+                            logger.error(f"IndexExternalDataSource: gRPC error calling KPS BatchAddMemories for source '{data_source_name}': {e_kps_rpc.code()} - {e_kps_rpc.details()}", exc_info=True)
+                            # If KPS is unavailable or call fails critically, abort the whole indexing job for this source
+                            if e_kps_rpc.code() in [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.INTERNAL]:
+                                logger.error(f"IndexExternalDataSource: Aborting indexing for '{data_source_name}' due to critical KPS error.")
+                                await context.abort(e_kps_rpc.code(), f"Failed to index data source '{data_source_name}': KPS service error ({e_kps_rpc.code()}).")
+                                return glm_service_pb2.IndexExternalDataSourceResponse() # Unreachable
+                            else: # For other errors (e.g., INVALID_ARGUMENT from KPS), count batch as failed and continue with next external page.
+                                items_failed_total += len(batch_to_send)
                         except Exception as e_kps_batch:
-                            logger.error(f"Error calling KPS BatchAddMemories: {e_kps_batch}", exc_info=True)
-                            items_failed_total += len(batch_to_send)
+                            logger.error(f"IndexExternalDataSource: Unexpected error calling KPS BatchAddMemories for source '{data_source_name}': {e_kps_batch}", exc_info=True)
+                            # Consider this critical enough to abort, as KPS interaction is broken
+                            logger.error(f"IndexExternalDataSource: Aborting indexing for '{data_source_name}' due to unexpected KPS call error.")
+                            await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error during KPS communication for data source '{data_source_name}'.")
+                            return glm_service_pb2.IndexExternalDataSourceResponse() # Unreachable
 
                 current_page_token = next_page_token_from_connector
                 if not current_page_token: has_more_pages = False
@@ -486,17 +501,22 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             logger.info(f"IndexExternalDataSource: {status_msg}")
             return glm_service_pb2.IndexExternalDataSourceResponse(status_message=status_msg, items_processed=items_processed_total, items_failed=items_failed_total)
 
-        except StorageError as e_storage_ext:
-            await context.abort(grpc.StatusCode.INTERNAL, f"Storage error accessing external source: {e_storage_ext}")
-        except Exception as e_main_idx:
-            await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error indexing: {e_main_idx}")
+        except StorageError as e_storage_ext: # Errors from fetching from external source
+            logger.error(f"IndexExternalDataSource: StorageError fetching from '{data_source_name}': {e_storage_ext}", exc_info=True)
+            await context.abort(grpc.StatusCode.INTERNAL, f"Storage error accessing external source '{data_source_name}': {e_storage_ext}")
+        except grpc.RpcError: # To catch aborts from KPS call exceptions
+            raise # Re-raise to let gRPC framework handle it
+        except Exception as e_main_idx: # Other unexpected errors in the main loop
+            logger.error(f"IndexExternalDataSource: Unexpected error during indexing of '{data_source_name}': {e_main_idx}", exc_info=True)
+            await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error indexing data source '{data_source_name}': {e_main_idx}")
 
-        return glm_service_pb2.IndexExternalDataSourceResponse( # Should be unreachable
-            status_message="Failed due to unexpected error after loop.",
+        # Fallback, should ideally be unreachable if all paths abort or return correctly.
+        return glm_service_pb2.IndexExternalDataSourceResponse(
+            status_message=f"Indexing for '{data_source_name}' concluded with {items_processed_total} processed, {items_failed_total} failed due to an issue.",
             items_processed=items_processed_total, items_failed=items_failed_total
         )
 
-async def serve(): # Changed to async def
+async def serve():
     logger.info(f"GLM Config: Qdrant={config.QDRANT_HOST}:{config.QDRANT_PORT} ('{config.QDRANT_COLLECTION}'), "
                 f"SQLite='{os.path.join(app_dir, config.DB_FILENAME)}', gRPC={config.GRPC_LISTEN_ADDRESS}, LogLvl={config.LOG_LEVEL}")
 
