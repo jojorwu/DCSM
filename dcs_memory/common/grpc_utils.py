@@ -101,26 +101,18 @@ def retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                             f"gRPC call to {func.__name__} failed with non-retryable status "
                             f"{rpc_code if rpc_code else 'N/A'}. "
                             f"Details: {e.details() if hasattr(e, 'details') and callable(e.details) else str(e)}",
-                            exc_info=True # Log full stack trace for non-retryable errors
+                        exc_info=True
                         )
                         raise
-                except Exception as e_generic: # Catch other potential exceptions (e.g., network issues before gRPC layer)
+                except Exception as e_generic:
+                    # For generic Python exceptions, do not retry. Log and re-raise.
                     logger.error(
-                        f"A non-gRPC error occurred during call to {func.__name__} (attempt {attempt}/{max_attempts}): {e_generic}",
-                        exc_info=True # Changed from False to True
+                        f"A non-gRPC, non-CircuitBreaker error occurred during call to {func.__name__}: {e_generic}",
+                        exc_info=True
                     )
-                    if attempt == max_attempts:
-                        raise
+                    raise # Re-raise immediately, no retry for these.
 
-                    # For non-gRPC errors, apply similar delay logic before retrying
-                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                    actual_delay_s = max(0, current_delay_s + jitter_value)
-                    logger.info(f"Retrying {func.__name__} after non-gRPC error in {actual_delay_s:.2f}s.")
-                    time.sleep(actual_delay_s)
-                    current_delay_s *= backoff_factor
-
-            # This part should not be reached if max_attempts >= 1,
-            # as the loop will either return a successful result or raise an exception.
+            # This part should be unreachable if logic is correct (always returns or raises within loop)
             logger.error(f"Sync gRPC call to {func.__name__} exhausted attempts without success or specific error handling.")
             return None # Should ideally not happen with proper error raising.
         return wrapper
@@ -188,19 +180,14 @@ def async_retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                 except Exception as e_generic: # Catch other errors
                     # If this was a CircuitBreakerError from a non-pybreaker source, it would be caught here.
                     # However, we explicitly catch pybreaker.CircuitBreakerError above.
+                    # For generic Python exceptions, do not retry. Log and re-raise.
                     logger.error(
-                        f"A non-gRPC error occurred during async call to {async_func.__name__} (attempt {attempt}/{max_attempts}): {e_generic}",
-                        exc_info=True # Ensure this is True for unexpected errors
+                        f"A non-gRPC, non-CircuitBreaker error occurred during async call to {async_func.__name__}: {e_generic}",
+                        exc_info=True
                     )
-                    if attempt == max_attempts:
-                        raise
-                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                    actual_delay_s = max(0, current_delay_s + jitter_value)
-                    logger.info(f"Retrying async {async_func.__name__} after non-gRPC error in {actual_delay_s:.2f}s.")
-                    await asyncio.sleep(actual_delay_s)
-                    current_delay_s *= backoff_factor
+                    raise # Re-raise immediately, no retry for these.
 
-            # Should be unreachable if max_attempts >=1
+            # Should be unreachable if max_attempts >=1 and logic is correct
             logger.error(f"Async gRPC call to {async_func.__name__} exhausted attempts without returning or raising.")
             raise RuntimeError(f"Async call {async_func.__name__} failed after all retries.") # Ensure something is raised
         return wrapper

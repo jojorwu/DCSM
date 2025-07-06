@@ -19,11 +19,13 @@ from dcsm_agent_sdk_python.sdk import AgentSDK
 # Это значение берется из конфигурации GLM по умолчанию, если не переопределено.
 # Чтобы тест был более надежным, он должен либо знать это значение, либо не проверять длину эмбеддинга.
 # Пока что захардкодим ожидаемый размер, соответствующий all-MiniLM-L6-v2
-EXPECTED_EMBEDDING_SIZE = 384
+EXPECTED_EMBEDDING_SIZE = int(os.getenv("DCSM_EXPECTED_EMBEDDING_SIZE", "384"))
 
 
 KPS_SERVICE_URL = os.getenv("KPS_SERVICE_URL", "localhost:50052")
 GLM_SERVICE_URL = os.getenv("GLM_SERVICE_URL", "localhost:50051")
+# SWM_SERVICE_URL for AgentSDK config, though not directly used in this test's SDK interaction
+SWM_SERVICE_URL = os.getenv("SWM_SERVICE_URL", "localhost:50053")
 
 
 class TestFullCycleKemCreationRetrieval(unittest.TestCase):
@@ -59,10 +61,21 @@ class TestFullCycleKemCreationRetrieval(unittest.TestCase):
         print(f"\nШаг 2: Получение КЕП ID '{kem_id_from_kps}' через AgentSDK из GLM...")
         sdk = None
         retrieved_kem = None
+        from dcsm_agent_sdk_python.config import DCSMClientSDKConfig # Import config
         try:
-            # Используем lpa_max_size=0, чтобы гарантированно не использовать ЛПА для этого get
-            # и всегда идти на сервер. Или force_remote=True.
-            sdk = AgentSDK(glm_server_address=GLM_SERVICE_URL, lpa_max_size=0)
+            # Updated AgentSDK initialization
+            glm_host, glm_port_str = GLM_SERVICE_URL.split(':')
+            kps_host, kps_port_str = KPS_SERVICE_URL.split(':') # Though KPS not used by SDK here
+            swm_host, swm_port_str = SWM_SERVICE_URL.split(':') # Though SWM not used by SDK here
+
+            sdk_config = DCSMClientSDKConfig(
+                glm_host=glm_host, glm_port=int(glm_port_str),
+                kps_host=kps_host, kps_port=int(kps_port_str), # Provide all for complete config
+                swm_host=swm_host, swm_port=int(swm_port_str),
+                connect_on_init=True # For integration test, connect eagerly
+            )
+            sdk = AgentSDK(config=sdk_config)
+            # Using force_remote=True is good to bypass LPA for this test
             retrieved_kem = sdk.get_kem(kem_id_from_kps, force_remote=True)
         except Exception as e:
             self.fail(f"AgentSDK не смог подключиться или получить КЕП: {e}")
