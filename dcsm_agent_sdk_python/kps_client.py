@@ -109,7 +109,7 @@ class KPSClient:
     def _ensure_connected(self):
         if not self.stub:
             self.connect()
-        if not self.stub:
+        if not self.stub: # If still no stub after connect(), an error occurred
             raise ConnectionError(f"KPSClient: Failed to establish connection with KPS service at {self.server_address}")
 
     @retry_grpc_call

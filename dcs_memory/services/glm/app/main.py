@@ -453,51 +453,64 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     raise StorageError(f"Failed to fetch from external source '{data_source_name}': {e_fetch}") from e_fetch
 
                 if not kems_from_external_source: has_more_pages = False; break
-
-                kps_payloads: List[kps_service_pb2.MemoryContent] = []
+                # Process each KEM individually using KPS's ProcessRawData
                 for kem_ext in kems_from_external_source:
-                    kps_kem_uri = f"kem:external:{data_source_name}:{kem_ext.id}"
-                    try: content_str = kem_ext.content.decode('utf-8')
-                    except UnicodeDecodeError: logger.warning(f"UTF-8 decode error for KEM ID '{kem_ext.id}'. Skipping."); items_failed_total +=1; continue
-                    kps_payloads.append(kps_service_pb2.MemoryContent(kem_uri=kps_kem_uri, content=content_str))
+                    if not kem_ext.id:
+                        logger.warning(f"IndexExternalDataSource: Skipping KEM from external source '{data_source_name}' due to missing ID.")
+                        items_failed_total += 1
+                        continue
 
-                if kps_payloads:
-                    for i in range(0, len(kps_payloads), kps_batch_size):
-                        batch_to_send = kps_payloads[i:i + kps_batch_size]
-                        try:
-                            kps_request = kps_service_pb2.BatchAddMemoriesRequest(memories=batch_to_send)
-                            # loop = asyncio.get_running_loop() # Not strictly needed for asyncio.to_thread
-                            kps_response: kps_service_pb2.BatchAddMemoriesResponse = await asyncio.to_thread(
-                                self.kps_client_stub.BatchAddMemories, kps_request, timeout=30
-                            )
-                            items_processed_total += len(batch_to_send) - len(kps_response.failed_kem_references)
-                            items_failed_total += len(kps_response.failed_kem_references)
-                            if kps_response.failed_kem_references:
-                                logger.warning(f"IndexExternalDataSource: KPS BatchAddMemories reported failures for {len(kps_response.failed_kem_references)} KEM URIs: {kps_response.failed_kem_references}")
-                            if kps_response.overall_error_message:
-                                logger.warning(f"IndexExternalDataSource: KPS BatchAddMemories overall error: {kps_response.overall_error_message}")
+                    # Use kem_ext.id as the data_id for KPS ProcessRawData.
+                    # KPS itself should handle idempotency based on this data_id if configured.
+                    kps_data_id = kem_ext.id
 
-                        except grpc.RpcError as e_kps_rpc:
-                            logger.error(f"IndexExternalDataSource: gRPC error calling KPS BatchAddMemories for source '{data_source_name}': {e_kps_rpc.code()} - {e_kps_rpc.details()}", exc_info=True)
-                            # If KPS is unavailable or call fails critically, abort the whole indexing job for this source
-                            if e_kps_rpc.code() in [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.INTERNAL]:
-                                logger.error(f"IndexExternalDataSource: Aborting indexing for '{data_source_name}' due to critical KPS error.")
-                                await context.abort(e_kps_rpc.code(), f"Failed to index data source '{data_source_name}': KPS service error ({e_kps_rpc.code()}).")
-                                return glm_service_pb2.IndexExternalDataSourceResponse() # Unreachable
-                            else: # For other errors (e.g., INVALID_ARGUMENT from KPS), count batch as failed and continue with next external page.
-                                items_failed_total += len(batch_to_send)
-                        except Exception as e_kps_batch:
-                            logger.error(f"IndexExternalDataSource: Unexpected error calling KPS BatchAddMemories for source '{data_source_name}': {e_kps_batch}", exc_info=True)
-                            # Consider this critical enough to abort, as KPS interaction is broken
-                            logger.error(f"IndexExternalDataSource: Aborting indexing for '{data_source_name}' due to unexpected KPS call error.")
-                            await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error during KPS communication for data source '{data_source_name}'.")
+                    # Ensure metadata is a Python dict for the KPS request
+                    kps_initial_metadata = dict(kem_ext.metadata) if kem_ext.metadata else {}
+
+                    kps_request = kps_service_pb2.ProcessRawDataRequest(
+                        data_id=kps_data_id,
+                        content_type=kem_ext.content_type,
+                        raw_content=kem_ext.content, # kem_ext.content should be bytes
+                        initial_metadata=kps_initial_metadata
+                    )
+
+                    try:
+                        logger.debug(f"IndexExternalDataSource: Calling KPS.ProcessRawData for data_id '{kps_data_id}' from source '{data_source_name}'.")
+                        # TODO: Make KPS call timeout configurable via GLMConfig if not already covered by a global KPS client timeout
+                        kps_process_timeout = getattr(self.config, "KPS_PROCESS_RAW_DATA_TIMEOUT_S", 30.0)
+
+                        kps_response: kps_service_pb2.ProcessRawDataResponse = await asyncio.to_thread(
+                            self.kps_client_stub.ProcessRawData, kps_request, timeout=kps_process_timeout
+                        )
+
+                        if kps_response.success:
+                            items_processed_total += 1
+                            logger.info(f"IndexExternalDataSource: Successfully processed data_id '{kps_data_id}' via KPS. KEM_ID: {kps_response.kem_id}")
+                        else:
+                            items_failed_total += 1
+                            logger.warning(f"IndexExternalDataSource: KPS failed to process data_id '{kps_data_id}'. Status: {kps_response.status_message}")
+
+                    except grpc.RpcError as e_kps_rpc:
+                        items_failed_total += 1
+                        logger.error(f"IndexExternalDataSource: gRPC error calling KPS.ProcessRawData for data_id '{kps_data_id}' (source '{data_source_name}'): {e_kps_rpc.code()} - {e_kps_rpc.details()}", exc_info=True)
+                        if e_kps_rpc.code() in [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.INTERNAL]:
+                            logger.error(f"IndexExternalDataSource: Aborting indexing for '{data_source_name}' due to critical KPS error for data_id '{kps_data_id}'.")
+                            await context.abort(e_kps_rpc.code(), f"Failed to index data source '{data_source_name}': KPS service error ({e_kps_rpc.code()}) processing item '{kps_data_id}'.")
                             return glm_service_pb2.IndexExternalDataSourceResponse() # Unreachable
+                        # For other errors (e.g., INVALID_ARGUMENT from KPS for a specific item), we log, count as failed, and continue.
+                    except Exception as e_kps_call:
+                        items_failed_total += 1
+                        logger.error(f"IndexExternalDataSource: Unexpected error calling KPS.ProcessRawData for data_id '{kps_data_id}' (source '{data_source_name}'): {e_kps_call}", exc_info=True)
+                        # Consider this critical enough to abort if it's not an RpcError already handled
+                        logger.error(f"IndexExternalDataSource: Aborting indexing for '{data_source_name}' due to unexpected KPS call error for data_id '{kps_data_id}'.")
+                        await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error during KPS communication for data_id '{kps_data_id}' from source '{data_source_name}'.")
+                        return glm_service_pb2.IndexExternalDataSourceResponse() # Unreachable
 
                 current_page_token = next_page_token_from_connector
                 if not current_page_token: has_more_pages = False
 
             duration = time.monotonic() - start_time
-            status_msg = f"Completed indexing for '{data_source_name}'. Processed: {items_processed_total}, Failed: {items_failed_total}. Duration: {duration:.2f}s."
+            status_msg = f"Completed indexing for '{data_source_name}'. Items submitted to KPS: {items_processed_total}, Items failed before/during KPS submission: {items_failed_total}. Duration: {duration:.2f}s."
             logger.info(f"IndexExternalDataSource: {status_msg}")
             return glm_service_pb2.IndexExternalDataSourceResponse(status_message=status_msg, items_processed=items_processed_total, items_failed=items_failed_total)
 

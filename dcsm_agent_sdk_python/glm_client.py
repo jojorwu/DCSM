@@ -92,6 +92,8 @@ class GLMClient:
     def _ensure_connected(self):
         if not self.stub:
             self.connect()
+        if not self.stub: # If still no stub after connect(), an error occurred
+            raise ConnectionError(f"GLMClient: Failed to establish connection with GLM service at {self.server_address}")
 
     # _kem_dict_to_proto and _kem_proto_to_dict are now imported from proto_utils
 
