@@ -1,108 +1,61 @@
 import asyncio
 import uuid
 import json
-import sqlite3 # For specific exception types
+# import sqlite3 # No longer directly needed here due to aiosqlite_repo
+import aiosqlite # For aiosqlite.Error
 import logging
 from typing import List, Tuple, Optional, Dict, Any
 
-from qdrant_client import QdrantClient, models as qdrant_models # Alias to avoid conflict
+from qdrant_client import AsyncQdrantClient, models as qdrant_models # For AsyncQdrantClient
 from qdrant_client.http.models import PointStruct # Keep this direct import
 
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.protobuf.json_format import ParseDict
 
 from generated_grpc import kem_pb2, glm_service_pb2
-from ..config import GLMConfig, ExternalDataSourceConfig # Relative import for config within the same app
+from ..config import GLMConfig, ExternalDataSourceConfig
 from .base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
-from . import SqliteKemRepository
-from . import QdrantKemRepository
-from .external_base import BaseExternalRepository # Import the new ABC
+from .sqlite_repo import SqliteKemRepository
+from .qdrant_repo import QdrantKemRepository
+from .external_base import BaseExternalRepository
 
 logger = logging.getLogger(__name__)
 
-# Placeholder for dynamic connector loading/factory
-# In a real system, this might use entry points or a more robust plugin mechanism.
 def get_external_repository_connector(config: ExternalDataSourceConfig, glm_config: GLMConfig) -> Optional[BaseExternalRepository]:
+    # ... (content remains the same)
     if config.type == "postgresql":
-        from .postgres_connector import PostgresExternalRepository # Now this file exists
+        from .postgres_connector import PostgresExternalRepository
         try:
             return PostgresExternalRepository(config, glm_config)
         except Exception as e_pg_init:
             logger.error(f"Failed to initialize PostgresExternalRepository for '{config.name}': {e_pg_init}", exc_info=True)
             return None
     elif config.type == "csv_dir":
-        from .csv_connector import CsvDirExternalRepository # Import new connector
+        from .csv_connector import CsvDirExternalRepository
         try:
             return CsvDirExternalRepository(config, glm_config)
         except Exception as e_csv_init:
             logger.error(f"Failed to initialize CsvDirExternalRepository for '{config.name}': {e_csv_init}", exc_info=True)
             return None
-    # Add other types here:
-    # elif config.type == "mongodb":
-    #     from .mongodb_connector import MongoDBExternalRepository
-    #     return MongoDBExternalRepository(config, glm_config)
     else:
         logger.warning(f"Unsupported external data source type '{config.type}' for source '{config.name}'.")
         return None
 
-
 class DefaultGLMRepository(BasePersistentStorageRepository):
-    """
-    Default implementation of BasePersistentStorageRepository.
-    It uses SqliteKemRepository for metadata/content and QdrantKemRepository for embeddings,
-    orchestrating them to provide a unified storage interface.
-    """
-
     def __init__(self, config: GLMConfig, app_dir: str):
         self.config = config
-
-        db_path = os.path.join(app_dir, self.config.DB_FILENAME)
-        try:
-            self.sqlite_repo = SqliteKemRepository(db_path, self.config)
-            logger.info("DefaultGLMRepository: SqliteKemRepository initialized successfully.")
-        except Exception as e_sqlite_init:
-            logger.critical(f"DefaultGLMRepository: CRITICAL ERROR initializing SqliteKemRepository: {e_sqlite_init}", exc_info=True)
-            raise BackendUnavailableError(f"SQLite backend failed to initialize: {e_sqlite_init}") from e_sqlite_init
-
+        self.app_dir = app_dir # Store app_dir for db_path in async_init
+        self.sqlite_repo: Optional[SqliteKemRepository] = None
         self.qdrant_repo: Optional[QdrantKemRepository] = None
-        if self.config.QDRANT_HOST:
-            try:
-                # TODO: QdrantClient initialization might need to handle potential TLS settings for connecting to Qdrant itself.
-                # This is separate from GLM's gRPC server TLS.
-                # For now, assuming QDRANT_HOST includes http/https scheme if needed by client.
-                qdrant_client = QdrantClient(
-                    host=self.config.QDRANT_HOST,
-                    port=self.config.QDRANT_PORT,
-                    timeout=self.config.QDRANT_CLIENT_TIMEOUT_S
-                )
-                # A light connection test - this might throw if Qdrant is down
-                qdrant_client.get_collections()
-                logger.info(f"DefaultGLMRepository: Qdrant client successfully connected to {self.config.QDRANT_HOST}:{self.config.QDRANT_PORT}.")
-
-                self.qdrant_repo = QdrantKemRepository(
-                    qdrant_client=qdrant_client,
-                    collection_name=self.config.QDRANT_COLLECTION,
-                    default_vector_size=self.config.DEFAULT_VECTOR_SIZE,
-                    default_distance_metric=self.config.QDRANT_DEFAULT_DISTANCE_METRIC
-                )
-                self.qdrant_repo.ensure_collection()
-                logger.info("DefaultGLMRepository: QdrantKemRepository initialized and collection ensured.")
-            except Exception as e_qdrant_init:
-                logger.error(f"DefaultGLMRepository: ERROR during Qdrant client/repository initialization: {e_qdrant_init}. Qdrant features will be unavailable.", exc_info=True)
-                # We don't raise BackendUnavailableError here if Qdrant is optional for some operations.
-                # Methods using qdrant_repo will need to check if it's None.
-                self.qdrant_repo = None
-        else:
-            logger.warning("DefaultGLMRepository: QDRANT_HOST not configured. Qdrant features will be unavailable.")
-            self.qdrant_repo = None
-
-        # Initialize external repositories
         self.external_repos: Dict[str, BaseExternalRepository] = {}
+        self._initialized: bool = False # Flag for async initialization
+
+        # Synchronous parts of initialization
         if hasattr(self.config, 'external_data_sources') and self.config.external_data_sources:
             logger.info(f"Found {len(self.config.external_data_sources)} external data source configurations.")
             for ext_ds_config in self.config.external_data_sources:
                 try:
-                    logger.info(f"Initializing external data source: Name='{ext_ds_config.name}', Type='{ext_ds_config.type}'")
+                    logger.info(f"Initializing external data source connector: Name='{ext_ds_config.name}', Type='{ext_ds_config.type}'")
                     connector = get_external_repository_connector(ext_ds_config, self.config)
                     if connector:
                         self.external_repos[ext_ds_config.name] = connector
@@ -110,115 +63,133 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
                     else:
                         logger.warning(f"Failed to initialize or no connector available for external data source '{ext_ds_config.name}' of type '{ext_ds_config.type}'.")
                 except Exception as e_ext_init:
-                    logger.error(f"Error initializing external data source '{ext_ds_config.name}': {e_ext_init}", exc_info=True)
+                    logger.error(f"Error initializing external data source connector '{ext_ds_config.name}': {e_ext_init}", exc_info=True)
         else:
             logger.info("No external data sources configured for GLM.")
 
-        logger.info("DefaultGLMRepository initialized.")
+        logger.info("DefaultGLMRepository synchronous initialization part complete.")
 
-    # Helper methods (adapted from GlobalLongTermMemoryServicerImpl)
+    async def ensure_initialized(self):
+        """Performs asynchronous parts of initialization."""
+        if self._initialized:
+            return
+
+        # Initialize SqliteKemRepository (now async)
+        db_path = os.path.join(self.app_dir, self.config.DB_FILENAME)
+        try:
+            self.sqlite_repo = SqliteKemRepository(db_path, self.config)
+            await self.sqlite_repo.ensure_schema_initialized() # Call its async schema setup
+            logger.info("DefaultGLMRepository: Async SqliteKemRepository initialized and schema ensured.")
+        except Exception as e_sqlite_init:
+            logger.critical(f"DefaultGLMRepository: CRITICAL ERROR initializing async SqliteKemRepository: {e_sqlite_init}", exc_info=True)
+            raise BackendUnavailableError(f"Async SQLite backend failed to initialize: {e_sqlite_init}") from e_sqlite_init
+
+        # Initialize QdrantKemRepository (now async)
+        if self.config.QDRANT_HOST:
+            try:
+                self.qdrant_repo = QdrantKemRepository(
+                    collection_name=self.config.QDRANT_COLLECTION,
+                    default_vector_size=self.config.DEFAULT_VECTOR_SIZE,
+                    default_distance_metric=self.config.QDRANT_DEFAULT_DISTANCE_METRIC,
+                    qdrant_host=self.config.QDRANT_HOST,
+                    qdrant_port=self.config.QDRANT_PORT,
+                    # qdrant_api_key=self.config.QDRANT_API_KEY, # If you add API key to GLMConfig
+                    qdrant_client_timeout_s=self.config.QDRANT_CLIENT_TIMEOUT_S
+                )
+                # Test connection and ensure collection exists (now an async method)
+                await self.qdrant_repo.ensure_collection()
+                logger.info("DefaultGLMRepository: Async QdrantKemRepository initialized and collection ensured.")
+            except Exception as e_qdrant_init:
+                logger.error(f"DefaultGLMRepository: ERROR during async QdrantKemRepository initialization: {e_qdrant_init}. Qdrant features will be unavailable.", exc_info=True)
+                self.qdrant_repo = None # Keep it None if init fails
+        else:
+            logger.warning("DefaultGLMRepository: QDRANT_HOST not configured. Qdrant features will be unavailable.")
+            self.qdrant_repo = None
+
+        self._initialized = True
+        logger.info("DefaultGLMRepository async initialization complete.")
+
+    async def close_connections(self):
+        """Closes any open connections, like the AsyncQdrantClient."""
+        if self.qdrant_repo and hasattr(self.qdrant_repo, 'close'):
+            try:
+                await self.qdrant_repo.close()
+                logger.info("DefaultGLMRepository: QdrantKemRepository connections closed.")
+            except Exception as e_q_close:
+                logger.error(f"Error closing QdrantKemRepository: {e_q_close}", exc_info=True)
+        # aiosqlite connections are typically managed per-operation with async with, so no explicit repo-level close needed for sqlite_repo
+
+    # ... (helper methods _kem_dict_to_proto, _kem_from_db_dict_to_proto remain the same) ...
     def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
-        # This helper might be better placed in a common utils or within the KEM proto generation itself if complex.
-        # For now, keeping it here as it's specific to how this repo reconstructs protos.
         kem_data_copy = kem_data.copy()
         if 'content' in kem_data_copy and isinstance(kem_data_copy['content'], str):
              kem_data_copy['content'] = kem_data_copy['content'].encode('utf-8')
-
-        # Handle metadata if it's a JSON string (from SQLite)
         if 'metadata' in kem_data_copy and isinstance(kem_data_copy['metadata'], str):
             try:
                 kem_data_copy['metadata'] = json.loads(kem_data_copy['metadata'])
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse metadata JSON string in _kem_dict_to_proto: {kem_data_copy['metadata']}")
-                kem_data_copy['metadata'] = {} # Default to empty dict
-
-        # Handle timestamps if they are ISO strings (from SQLite)
+                kem_data_copy['metadata'] = {}
         for ts_field_name in ['created_at', 'updated_at']:
             ts_val = kem_data_copy.get(ts_field_name)
             if isinstance(ts_val, str):
                 ts_proto = Timestamp()
                 try:
-                    # Ensure 'Z' for UTC if naive, for FromJsonString
                     ts_str_for_parse = ts_val
                     if 'T' in ts_val and not ts_val.endswith("Z") and '+' not in ts_val and '-' not in ts_val[10:]:
                         ts_str_for_parse = ts_val + "Z"
                     ts_proto.FromJsonString(ts_str_for_parse)
                     kem_data_copy[ts_field_name] = ts_proto
-                except Exception as e_ts:
-                    logger.error(f"Error parsing timestamp string '{ts_val}' to proto for field '{ts_field_name}': {e}")
-                    # Decide on fallback: remove or set to current time? For now, remove if unparseable.
+                except Exception as e_ts: # More specific error might be google.protobuf.json_format.ParseError
+                    logger.error(f"Error parsing timestamp string '{ts_val}' to proto for field '{ts_field_name}': {e_ts}", exc_info=True)
                     if ts_field_name in kem_data_copy: del kem_data_copy[ts_field_name]
-
         return ParseDict(kem_data_copy, kem_pb2.KEM(), ignore_unknown_fields=True)
 
     def _kem_from_db_dict_to_proto(self, kem_db_dict: Dict[str, Any],
                                    embeddings_list: Optional[List[float]] = None) -> kem_pb2.KEM:
-        """
-        Converts a dictionary (typically from SQLite row) and an optional embeddings list
-        into a KEM protobuf object.
-        """
         if not kem_db_dict:
-            # This case should ideally be handled by callers, but as a safeguard:
             logger.error("_kem_from_db_dict_to_proto received empty or None kem_db_dict")
             raise ValueError("Cannot convert empty DB dictionary to KEM proto.")
-
         kem_for_proto = {}
         kem_for_proto['id'] = kem_db_dict.get('id')
         kem_for_proto['content_type'] = kem_db_dict.get('content_type')
-        kem_for_proto['content'] = kem_db_dict.get('content') # Assumed bytes from DB
-
+        kem_for_proto['content'] = kem_db_dict.get('content')
         metadata_json_str = kem_db_dict.get('metadata', '{}')
         try:
             kem_for_proto['metadata'] = json.loads(metadata_json_str)
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse metadata JSON: {metadata_json_str} for KEM ID {kem_db_dict.get('id')}. Using empty metadata.")
             kem_for_proto['metadata'] = {}
-
         for ts_field_name_db, ts_field_name_proto in [('created_at', 'created_at'), ('updated_at', 'updated_at')]:
             ts_iso_str = kem_db_dict.get(ts_field_name_db)
             if ts_iso_str and isinstance(ts_iso_str, str):
                 ts_proto = Timestamp()
                 try:
-                    # Ensure 'Z' for UTC if naive, for FromJsonString
                     ts_parse_str = ts_iso_str
                     if 'T' in ts_iso_str and not ts_iso_str.endswith("Z") and '+' not in ts_iso_str and '-' not in ts_iso_str[10:]:
                         ts_parse_str = ts_iso_str + "Z"
                     ts_proto.FromJsonString(ts_parse_str)
                     kem_for_proto[ts_field_name_proto] = ts_proto
                 except Exception as e_ts:
-                    logger.error(f"Error parsing timestamp string '{ts_iso_str}' to proto for field '{ts_field_name_proto}' in KEM ID {kem_db_dict.get('id')}: {e}")
-                    # Fallback or error handling if necessary, e.g., remove the field or use a default
-            elif isinstance(ts_iso_str, Timestamp): # If it's already a Timestamp proto (e.g. from another KEM)
+                    logger.error(f"Error parsing timestamp string '{ts_iso_str}' to proto for field '{ts_field_name_proto}' in KEM ID {kem_db_dict.get('id')}: {e_ts}", exc_info=True)
+            elif isinstance(ts_iso_str, Timestamp):
                  kem_for_proto[ts_field_name_proto] = ts_iso_str
-
-
         if embeddings_list:
             kem_for_proto['embeddings'] = embeddings_list
-
-        # Use ParseDict for robustness, it handles missing fields gracefully if KEM proto changes
         final_kem_proto = kem_pb2.KEM()
         ParseDict(kem_for_proto, final_kem_proto, ignore_unknown_fields=True)
         return final_kem_proto
 
-    # --- Implementation of BasePersistentStorageRepository ABC methods ---
-
     async def store_kem(self, kem: kem_pb2.KEM) -> kem_pb2.KEM:
-        # This method now encapsulates the logic previously in GLM Servicer's StoreKEM
-        # including ID generation, timestamp management, and dual writes to SQLite & Qdrant.
+        if not self.sqlite_repo: raise BackendUnavailableError("SQLite repository not initialized")
 
-        kem_to_store = kem_pb2.KEM() # Create a copy to modify
-        kem_to_store.CopyFrom(kem)
-
+        kem_to_store = kem_pb2.KEM(); kem_to_store.CopyFrom(kem)
         kem_id = kem_to_store.id if kem_to_store.id else str(uuid.uuid4())
         kem_to_store.id = kem_id
         has_embeddings = bool(kem_to_store.embeddings)
-
         current_time_proto = Timestamp(); current_time_proto.GetCurrentTime()
 
-        # Preserve created_at if KEM exists, otherwise set to now or use provided
-        existing_created_at_str = await asyncio.to_thread(
-            self.sqlite_repo.get_kem_creation_timestamp, kem_id
-        )
+        existing_created_at_str = await self.sqlite_repo.get_kem_creation_timestamp(kem_id)
         final_created_at_proto = Timestamp()
         if existing_created_at_str:
             try:
@@ -237,7 +208,6 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         kem_to_store.created_at.CopyFrom(final_created_at_proto)
         kem_to_store.updated_at.CopyFrom(current_time_proto)
 
-        # 1. Store/Update Qdrant point if embeddings exist
         qdrant_op_done = False
         if self.qdrant_repo and has_embeddings:
             qdrant_payload = {"kem_id_ref": kem_id}
@@ -245,22 +215,18 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
                 for k, v_str in kem_to_store.metadata.items(): qdrant_payload[f"md_{k}"] = v_str
             if kem_to_store.HasField("created_at"): qdrant_payload["created_at_ts"] = kem_to_store.created_at.seconds
             if kem_to_store.HasField("updated_at"): qdrant_payload["updated_at_ts"] = kem_to_store.updated_at.seconds
-
             try:
                 point = PointStruct(id=kem_id, vector=list(kem_to_store.embeddings), payload=qdrant_payload)
-                await asyncio.to_thread(self.qdrant_repo.upsert_point, point)
+                await self.qdrant_repo.upsert_point(point) # Now await directly
                 qdrant_op_done = True
-            except Exception as e_qdrant:
+            except Exception as e_qdrant: # Catch specific Qdrant client errors if possible
                 logger.error(f"store_kem: Qdrant error for ID '{kem_id}': {e_qdrant}", exc_info=True)
-                if "connect" in str(e_qdrant).lower() or "unavailable" in str(e_qdrant).lower():
+                if "connect" in str(e_qdrant).lower() or "unavailable" in str(e_qdrant).lower(): # Basic check
                     raise BackendUnavailableError(f"Qdrant unavailable: {e_qdrant}") from e_qdrant
                 else:
                     raise StorageError(f"Qdrant processing error: {e_qdrant}") from e_qdrant
-
-        # 2. Store/Update SQLite record
         try:
-            await asyncio.to_thread(
-                self.sqlite_repo.store_or_replace_kem,
+            await self.sqlite_repo.store_or_replace_kem(
                 kem_id=kem_to_store.id,
                 content_type=kem_to_store.content_type,
                 content=kem_to_store.content,
@@ -268,313 +234,284 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
                 created_at_iso=kem_to_store.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
                 updated_at_iso=kem_to_store.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
             )
-        except sqlite3.Error as e_sqlite:
+        except aiosqlite.Error as e_sqlite:
             logger.error(f"store_kem: SQLite error for ID '{kem_id}': {e_sqlite}", exc_info=True)
             if qdrant_op_done and self.qdrant_repo:
-                logger.warning(f"store_kem: Attempting to roll back Qdrant upsert for KEM ID '{kem_id}' due to SQLite error.")
+                logger.warning(f"store_kem: Attempting to roll back Qdrant upsert for KEM ID '{kem_id}'.")
                 try:
-                    await asyncio.to_thread(self.qdrant_repo.delete_points_by_ids, [kem_id])
+                    await self.qdrant_repo.delete_points_by_ids([kem_id]) # Now await directly
                     logger.info(f"store_kem: Qdrant rollback successful for KEM ID '{kem_id}'.")
                 except Exception as e_qdrant_rollback:
                     logger.critical(f"store_kem: CRITICAL - Failed Qdrant rollback for KEM ID '{kem_id}': {e_qdrant_rollback}", exc_info=True)
-            if "unable to open" in str(e_sqlite) or "database is locked" in str(e_sqlite):
+            if "unable to open" in str(e_sqlite).lower() or "database is locked" in str(e_sqlite).lower():
                  raise BackendUnavailableError(f"SQLite unavailable or busy: {e_sqlite}") from e_sqlite
             raise StorageError(f"SQLite processing error: {e_sqlite}") from e_sqlite
         except Exception as e_other_sqlite:
-            logger.error(f"store_kem: Unexpected error during SQLite operation for ID '{kem_id}': {e_other_sqlite}", exc_info=True)
-            if qdrant_op_done and self.qdrant_repo:
-                logger.warning(f"store_kem: Attempting to roll back Qdrant upsert for KEM ID '{kem_id}' due to unexpected SQLite error.")
-                try:
-                    await asyncio.to_thread(self.qdrant_repo.delete_points_by_ids, [kem_id])
-                except Exception as e_q_rb_unexpected:
-                    logger.critical(f"store_kem: CRITICAL - Failed Qdrant rollback (unexpected SQLite err) for KEM ID '{kem_id}': {e_q_rb_unexpected}", exc_info=True)
+            logger.error(f"store_kem: Unexpected error during SQLite op for ID '{kem_id}': {e_other_sqlite}", exc_info=True)
+            if qdrant_op_done and self.qdrant_repo: # Rollback Qdrant if it succeeded
+                try: await self.qdrant_repo.delete_points_by_ids([kem_id])
+                except Exception as e_q_rb: logger.critical(f"store_kem: CRITICAL - Qdrant rollback failed: {e_q_rb}", exc_info=True)
             raise StorageError(f"Unexpected error during SQLite operation: {e_other_sqlite}") from e_other_sqlite
-
         return kem_to_store
 
     async def retrieve_kems(
-        self,
-        query: glm_service_pb2.KEMQuery,
-        page_size: int,
-        page_token: Optional[str]
+        self, query: glm_service_pb2.KEMQuery, page_size: int, page_token: Optional[str]
     ) -> Tuple[List[kem_pb2.KEM], Optional[str]]:
-        # Dispatch to external repository if data_source_name is specified and valid
+        if not self.sqlite_repo: raise BackendUnavailableError("SQLite repository not initialized")
+
         if query.data_source_name and query.data_source_name in self.external_repos:
+            # ... (external repo logic remains same, assuming external_repo.retrieve_mapped_kems is async) ...
             external_repo = self.external_repos[query.data_source_name]
             logger.info(f"Dispatching retrieve_kems query to external data source: '{query.data_source_name}'")
             try:
-                # External repo's retrieve_mapped_kems needs to be an async method.
-                # It is responsible for its own internal query translation, data fetching, mapping to KEMs, and pagination.
-                return await external_repo.retrieve_mapped_kems(
-                    internal_query=query, # Pass the full query
-                    page_size=page_size,
-                    page_token=page_token
-                )
+                return await external_repo.retrieve_mapped_kems(internal_query=query, page_size=page_size, page_token=page_token)
             except Exception as e_ext_retrieve:
                 logger.error(f"Error retrieving KEMs from external source '{query.data_source_name}': {e_ext_retrieve}", exc_info=True)
-                # Decide on error propagation: re-raise a specific error or return empty with logging?
-                # For now, re-raise as a StorageError or let specific exception propagate if it's informative.
-                if isinstance(e_ext_retrieve, (StorageError, BackendUnavailableError, InvalidQueryError)):
-                    raise
+                if isinstance(e_ext_retrieve, (StorageError, BackendUnavailableError, InvalidQueryError)): raise
                 raise StorageError(f"Failed to retrieve from external source '{query.data_source_name}': {e_ext_retrieve}") from e_ext_retrieve
-        elif query.data_source_name: # Specified but not found/configured
+        elif query.data_source_name:
             logger.warning(f"Requested external data source '{query.data_source_name}' not found or not configured.")
             raise InvalidQueryError(f"External data source '{query.data_source_name}' not available.")
 
-        # If not dispatched to external, proceed with native SQLite/Qdrant logic
-        # This method will primarily handle SQLite based filtering (IDs, metadata, timestamps).
-        # Vector search (embedding_query) or text_query would typically involve Qdrant
-        # and then potentially retrieving full KEMs from SQLite.
-        # For this implementation, we'll focus on filters applicable to SQLite.
-
-        sql_conditions: List[str] = []
-        sql_params: List[Any] = []
-
-        # 1. Handle ID filters
+        sql_conditions: List[str] = []; sql_params: List[Any] = []
         if query.ids:
-            placeholders = ','.join('?' for _ in query.ids)
-            sql_conditions.append(f"id IN ({placeholders})")
-            sql_params.extend(list(query.ids))
-
-        # 2. Handle metadata filters
-        # This uses json_extract, which benefits from JSON indexes if available (SQLite >= 3.38.0)
+            sql_conditions.append(f"id IN ({','.join('?' for _ in query.ids)})"); sql_params.extend(list(query.ids))
         if query.metadata_filters:
             for key, value in query.metadata_filters.items():
-                # Basic sanitization for key to prevent issues if keys could be non-alphanumeric,
-                # though json_extract path syntax is quite flexible.
-                # For now, assume keys are valid JSON path components (e.g. no dots if not intended for nesting).
-                # If keys could contain special characters like '.', they might need specific handling
-                # in the path string e.g. '$."key.with.dots"'. For simple keys, '$.key' is fine.
-                # Assuming simple keys for now.
-                sanitized_key = key # Add more robust sanitization if keys can be complex
-                sql_conditions.append(f"json_extract(metadata, '$.{sanitized_key}') = ?")
-                sql_params.append(value)
-
-        # 3. Handle timestamp filters
+                sql_conditions.append(f"json_extract(metadata, '$.{key}') = ?"); sql_params.append(value)
         if query.HasField("created_at_start"):
-            sql_conditions.append("created_at >= ?")
-            sql_params.append(query.created_at_start.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+            sql_conditions.append("created_at >= ?"); sql_params.append(query.created_at_start.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
         if query.HasField("created_at_end"):
-            sql_conditions.append("created_at <= ?")
-            sql_params.append(query.created_at_end.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+            sql_conditions.append("created_at <= ?"); sql_params.append(query.created_at_end.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
         if query.HasField("updated_at_start"):
-            sql_conditions.append("updated_at >= ?")
-            sql_params.append(query.updated_at_start.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+            sql_conditions.append("updated_at >= ?"); sql_params.append(query.updated_at_start.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
         if query.HasField("updated_at_end"):
-            sql_conditions.append("updated_at <= ?")
-            sql_params.append(query.updated_at_end.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
+            sql_conditions.append("updated_at <= ?"); sql_params.append(query.updated_at_end.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
 
-        # TODO: Handle text_query and embedding_query (likely involving Qdrant)
-        # If embedding_query is present, this method might first query Qdrant,
-        # get KEM IDs, and then use those IDs to query SQLite.
-        # This example primarily focuses on SQLite filtering.
-        # For now, if embedding_query or text_query is present and not handled,
-        # we might return empty or raise NotImplementedError for those specific parts.
-        if query.embedding_query or query.text_query:
-            logger.warning("retrieve_kems: embedding_query and text_query are not fully implemented in this version for SQLite-first path. Qdrant integration needed here.")
-            # Placeholder: If Qdrant is supposed to be the primary source for vector search:
-            if self.qdrant_repo and query.embedding_query:
-                try:
-                    qdrant_filter = None # Build Qdrant filter from metadata/timestamps if needed
-                    # This is a simplified Qdrant search. Real implementation would need to map
-                    # KEMQuery metadata/timestamps to Qdrant's filter language.
-                    # For now, let's assume if embedding_query is there, other filters apply to Qdrant.
-                    # This part needs significant expansion for proper Qdrant integration.
+        if self.qdrant_repo and query.embedding_query:
+            logger.info("retrieve_kems: Using Qdrant for embedding query.")
+            try:
+                q_filters_list = []
+                if query.metadata_filters:
+                    for k, v in query.metadata_filters.items():
+                        q_filters_list.append(qdrant_models.FieldCondition(key=f"md_{k}", match=qdrant_models.MatchValue(value=v)))
+                if query.HasField("created_at_start"): q_filters_list.append(qdrant_models.FieldCondition(key="created_at_ts", range=qdrant_models.Range(gte=query.created_at_start.seconds)))
+                if query.HasField("created_at_end"): q_filters_list.append(qdrant_models.FieldCondition(key="created_at_ts", range=qdrant_models.Range(lte=query.created_at_end.seconds)))
 
-                    # Construct Qdrant filter from KEMQuery (simplified example)
-                    q_filters = []
-                    if query.metadata_filters:
-                        for k, v in query.metadata_filters.items():
-                            q_filters.append(qdrant_models.FieldCondition(key=f"md_{k}", match=qdrant_models.MatchValue(value=v)))
-                    # Timestamp filters for Qdrant (assuming timestamps are stored as seconds in payload)
-                    if query.HasField("created_at_start"): q_filters.append(qdrant_models.FieldCondition(key="created_at_ts", range=qdrant_models.Range(gte=query.created_at_start.seconds)))
-                    if query.HasField("created_at_end"): q_filters.append(qdrant_models.FieldCondition(key="created_at_ts", range=qdrant_models.Range(lte=query.created_at_end.seconds)))
-                    # (Add updated_at similarly if needed)
+                qdrant_filter_model = qdrant_models.Filter(must=q_filters_list) if q_filters_list else None
+                qdrant_offset = int(page_token) if page_token and page_token.isdigit() else 0
 
-                    if q_filters:
-                        qdrant_filter = qdrant_models.Filter(must=q_filters)
+                scored_points = await self.qdrant_repo.search_points(
+                    query_vector=list(query.embedding_query),
+                    query_filter=qdrant_filter_model,
+                    limit=page_size,
+                    offset=qdrant_offset,
+                    with_vectors=True # Ensure vectors are returned
+                )
+                if not scored_points: return [], None
 
-                    # Pagination for Qdrant: Qdrant uses offset. page_token needs to be interpretable as offset.
-                    qdrant_offset = 0
-                    if page_token:
-                        try:
-                            qdrant_offset = int(page_token)
-                        except ValueError:
-                            logger.warning(f"Invalid page_token for Qdrant offset: {page_token}. Defaulting to 0.")
-                            qdrant_offset = 0
+                kem_ids_from_qdrant = [sp.id for sp in scored_points] # Ensure ID is string
+                qdrant_embeddings_map = {str(sp.id): list(sp.vector) for sp in scored_points if sp.vector} # Ensure ID is string for map key
 
-                    scored_points = await asyncio.to_thread(
-                        self.qdrant_repo.search_points,
-                        query_vector=list(query.embedding_query),
-                        query_filter=qdrant_filter,
-                        limit=page_size,
-                        offset=qdrant_offset
-                    )
-                    kem_ids_from_qdrant = [sp.id for sp in scored_points]
-                    if not kem_ids_from_qdrant:
-                        return [], None # No results from Qdrant
+                # Fetch these KEMs from SQLite
+                kems_from_db_dicts, _ = await self.sqlite_repo.retrieve_kems_from_db(
+                    sql_conditions=[f"id IN ({','.join('?' for _ in kem_ids_from_qdrant)})"],
+                    sql_params=kem_ids_from_qdrant,
+                    page_size=len(kem_ids_from_qdrant), # Fetch all found by Qdrant
+                    page_token=None, # No SQLite pagination here, Qdrant handled it
+                    order_by_clause="" # Order will be determined by Qdrant, or re-sort after
+                )
 
-                    # Replace existing ID filters if Qdrant results are primary
-                    sql_conditions = []
-                    sql_params = []
-                    id_placeholders = ','.join('?' for _ in kem_ids_from_qdrant)
-                    sql_conditions.append(f"id IN ({id_placeholders})")
-                    sql_params.extend(kem_ids_from_qdrant)
+                # Re-order based on Qdrant results and merge embeddings
+                ordered_kems_from_db_map = {str(db_dict['id']): db_dict for db_dict in kems_from_db_dicts}
+                kem_protos = []
+                for q_id in kem_ids_from_qdrant: # Iterate in Qdrant's order
+                    db_dict = ordered_kems_from_db_map.get(str(q_id))
+                    if db_dict:
+                        embeddings = qdrant_embeddings_map.get(str(q_id))
+                        kem_protos.append(self._kem_from_db_dict_to_proto(db_dict, embeddings_list=embeddings))
 
-                    # Determine next page token for Qdrant results
-                    next_qdrant_page_token = None
-                    if len(scored_points) == page_size:
-                        # Qdrant itself doesn't directly give a "next page token" like this,
-                        # it just returns results for the current offset+limit.
-                        # We infer there might be more if we received a full page.
-                        # The next token would be the next offset.
-                        potential_next_offset = qdrant_offset + page_size
-                        # To confirm, one could do a count or a query for offset=potential_next_offset, limit=1
-                        # For simplicity here, if we got a full page, we assume there could be more.
-                        next_qdrant_page_token = str(potential_next_offset)
+                next_page_token_str = str(qdrant_offset + len(scored_points)) if len(scored_points) == page_size else None
+                return kem_protos, next_page_token_str
 
+            except Exception as e_qdrant_search:
+                logger.error(f"Error during Qdrant vector search in retrieve_kems: {e_qdrant_search}", exc_info=True)
+                raise StorageError(f"Qdrant vector search failed: {e_qdrant_search}") from e_qdrant_search
+        else: # SQLite only path (no embedding query or Qdrant not available)
+            logger.info("retrieve_kems: Using SQLite for metadata/ID query.")
+            order_by_clause = "ORDER BY updated_at DESC, id DESC"
+            kems_db_dicts, next_page_token_str = await self.sqlite_repo.retrieve_kems_from_db(
+                sql_conditions, sql_params, page_size, page_token, order_by_clause
+            )
+            kem_protos = [self._kem_from_db_dict_to_proto(db_dict) for db_dict in kems_db_dicts]
+            return kem_protos, next_page_token_str
 
-                    # Now fetch these KEMs from SQLite
-                    # The order from Qdrant might be lost unless we re-order in Python after fetching.
-                    # Or, if SQLite query can preserve Qdrant's order (e.g. using CASE WHEN with IDs).
-                    # For now, default SQLite ordering will apply or keyset pagination's order.
-                    kems_from_db_dicts, sqlite_next_page_token = await asyncio.to_thread(
-                        self.sqlite_repo.retrieve_kems_from_db,
-                        sql_conditions,
-                        sql_params,
-                        page_size, # Fetch up to page_size, Qdrant might have returned fewer relevant IDs.
-                        0 # When fetching by specific IDs from Qdrant, usually no further SQLite pagination needed on these IDs.
-                          # Or, if Qdrant returns more IDs than page_size, this needs careful handling.
-                          # Let's assume for now Qdrant's limit is the primary driver here.
-                    )
-                    # If Qdrant was used, its next_page_token is authoritative for this path.
-                    final_next_page_token = next_qdrant_page_token
+    async def update_kem(self, kem_id: str, kem_update_data: kem_pb2.KEM) -> kem_pb2.KEM:
+        if not self.sqlite_repo: raise BackendUnavailableError("SQLite repository not initialized")
+        # This requires fetching, merging, then calling store_kem.
+        # store_kem already handles created_at/updated_at logic.
+        # For a true partial update, more granular SQL would be needed.
+        # For now, let's simulate by get-modify-store.
 
-                    # Convert dicts to protos, merging embeddings from Qdrant
-                    qdrant_embeddings_map = {sp.id: list(sp.vector) for sp in scored_points if sp.vector}
-                    kem_protos = []
-                    for db_dict in kems_from_db_dicts:
-                        kem_id = db_dict.get('id')
-                        embeddings_for_this_kem = qdrant_embeddings_map.get(kem_id)
-                        kem_protos.append(self._kem_from_db_dict_to_proto(db_dict, embeddings_list=embeddings_for_this_kem))
+        # TODO: This is NOT a true partial update. It's a get-then-full-replace.
+        # A real partial update would only modify specified fields in SQLite and Qdrant.
+        # This requires significant changes to sqlite_repo and qdrant_repo.
+        # For now, this placeholder will re-use store_kem, which is an upsert.
+        # The `kem_update_data` KEM object should have its fields set for desired updates.
+        # We need to merge it with the existing KEM.
 
-                    return kem_protos, final_next_page_token
+        # Fetch existing KEM data (content and metadata) from SQLite
+        existing_kem_dict = await self.sqlite_repo.get_kem_by_id(kem_id)
+        if not existing_kem_dict:
+            raise KemNotFoundError(f"KEM ID '{kem_id}' not found for update.")
 
-                except Exception as e_qdrant_search:
-                    logger.error(f"Error during Qdrant search in retrieve_kems: {e_qdrant_search}", exc_info=True)
-                    raise StorageError(f"Qdrant search failed: {e_qdrant_search}")
+        # Convert DB dict to KEM proto to easily merge with update_data
+        # If existing KEM had embeddings, they are not in SQLite dict.
+        # If update_data has new embeddings, they will be used. If it clears them, they will be cleared.
+        # If update_data doesn't specify embeddings, existing ones (if any in Qdrant) might remain
+        # unless store_kem explicitly clears them if not provided.
 
+        # Create a KEM proto from the existing data
+        # For simplicity, we'll assume for now that an update might replace all fields
+        # provided in kem_update_data, and use store_kem for its upsert logic.
+        # This means kem_update_data should be a "complete" KEM for the fields being changed.
+        # A true PATCH is more complex.
 
-        # Pagination: page_token is now passed directly to the SQLite repository,
-        # which handles keyset pagination based on this token.
+        # Let's assume kem_update_data contains the full new state for fields it wants to change,
+        # and store_kem will handle the replacement. We need to ensure its ID is set.
+        kem_to_store = kem_pb2.KEM()
+        kem_to_store.CopyFrom(kem_update_data) # Start with the update data
+        kem_to_store.id = kem_id # Ensure ID is the one being updated
 
-        # Default order by, can be made configurable or based on query.
-        # This MUST match the expectations of the keyset pagination logic in SqliteKemRepository.
-        order_by_clause = "ORDER BY updated_at DESC, id DESC" # Ensure stable order for pagination
+        # If content/content_type/metadata are not in kem_update_data, they won't be changed by store_kem
+        # if store_kem was a true patch. But it's an INSERT OR REPLACE.
+        # So, we must provide the *full* KEM state to store_kem.
 
-        kems_db_dicts, next_page_token_str = await asyncio.to_thread(
-            self.sqlite_repo.retrieve_kems_from_db,
-            sql_conditions,
-            sql_params,
-            page_size,
-            page_token, # Pass the original page_token for keyset pagination
-            order_by_clause
-        )
+        # This is a simplified approach: make kem_update_data the new KEM, just ensure ID.
+        # A proper update would fetch, merge, then store.
+        # For now, this will behave like an overwrite if `store_kem` is used.
+        # The current `store_kem` is an upsert, so it will replace.
 
-        # Convert dicts to KEM protos
-        # TODO: If Qdrant was involved, embeddings might need to be fetched/merged separately.
-        # For now, assuming embeddings are not part of this SQLite-focused retrieval path,
-        # or they are already in the SQLite content/metadata if stored there (unlikely for raw vectors).
-        # The KEM proto has an embeddings field, so if not populated here, it will be empty.
-        kem_protos = []
-        for db_dict in kems_db_dicts:
-            # If embeddings are needed and not in SQLite, this is where they'd be fetched from Qdrant
-            # using db_dict['id'] and merged into the KEM proto.
-            # For now, passing None for embeddings_list.
-            kem_protos.append(self._kem_from_db_dict_to_proto(db_dict, embeddings_list=None))
+        # To make it a bit more like an update:
+        # If a field is not set in kem_data_update, it should ideally retain its old value.
+        # ParseDict doesn't merge like proto MergeFrom.
+        # We need to construct the full KEM to be stored.
 
-        return kem_protos, next_page_token_str
+        # This is still not a true partial update, but store_kem will ensure timestamps are handled.
+        if not kem_update_data.HasField("content_type") and existing_kem_dict.get("content_type"):
+            kem_to_store.content_type = existing_kem_dict["content_type"]
+        if not kem_update_data.HasField("content") and existing_kem_dict.get("content") is not None: # content can be empty bytes
+            kem_to_store.content = existing_kem_dict["content"]
+
+        # Merge metadata
+        if kem_update_data.metadata:
+            # If update has metadata, it completely replaces old metadata (Protobuf map behavior)
+            # If we want a patch-like merge for metadata, it needs custom logic here.
+            # For now, direct assignment is fine as per KEM.metadata field.
+            pass # It's already in kem_to_store from CopyFrom
+        elif existing_kem_dict.get("metadata"):
+             # If update has no metadata, but existing did, keep existing.
+            try:
+                existing_meta_dict = json.loads(existing_kem_dict["metadata"])
+                for k, v in existing_meta_dict.items():
+                    kem_to_store.metadata[k] = str(v) # Ensure string values
+            except json.JSONDecodeError:
+                logger.warning(f"UpdateKEM: Could not parse existing metadata for {kem_id}")
 
 
-    async def update_kem(
-        self,
-        kem_id: str,
-        kem_update_data: kem_pb2.KEM,
-    ) -> kem_pb2.KEM:
-        raise NotImplementedError()
+        # Embeddings: if kem_update_data has embeddings, they are used.
+        # If kem_update_data.embeddings is empty, it implies clearing them.
+        # If kem_update_data does not specify embeddings field at all, store_kem will use what's there.
+        # This depends on how `HasField` works for `repeated` fields if they are empty.
+        # `bool(kem_to_store.embeddings)` in `store_kem` checks if list is non-empty.
+
+        logger.info(f"UpdateKEM: Proceeding to store updated KEM for ID '{kem_id}'.")
+        return await self.store_kem(kem_to_store) # Re-use store_kem for upsert logic
+
 
     async def delete_kem(self, kem_id: str) -> bool:
-        raise NotImplementedError()
+        if not self.sqlite_repo: raise BackendUnavailableError("SQLite repository not initialized")
+
+        # 1. Delete from Qdrant (if it exists and has embeddings)
+        # We don't know for sure if it had embeddings without a GET, but try delete anyway.
+        if self.qdrant_repo:
+            try:
+                await self.qdrant_repo.delete_points_by_ids([kem_id])
+                logger.info(f"DeleteKEM: Qdrant delete attempted for KEM ID '{kem_id}'.")
+            except Exception as e_q_del:
+                # Log error but proceed to delete from SQLite, as Qdrant might not have the point.
+                logger.warning(f"DeleteKEM: Error during Qdrant delete for KEM ID '{kem_id}': {e_q_del}. Proceeding with SQLite delete.", exc_info=True)
+
+        # 2. Delete from SQLite
+        try:
+            deleted_from_sqlite = await self.sqlite_repo.delete_kem_from_db(kem_id)
+            if deleted_from_sqlite:
+                logger.info(f"DeleteKEM: Successfully deleted KEM ID '{kem_id}' from SQLite.")
+            else:
+                logger.info(f"DeleteKEM: KEM ID '{kem_id}' not found in SQLite (or already deleted).")
+            return deleted_from_sqlite # True if deleted from SQLite, even if Qdrant part had issues or no point
+        except Exception as e_sql_del:
+            logger.error(f"DeleteKEM: Error deleting KEM ID '{kem_id}' from SQLite: {e_sql_del}", exc_info=True)
+            raise StorageError(f"SQLite delete error for KEM ID '{kem_id}'") from e_sql_del
+
 
     async def batch_store_kems(
-        self,
-        kems: List[kem_pb2.KEM]
+        self, kems: List[kem_pb2.KEM]
     ) -> Tuple[List[kem_pb2.KEM], List[str]]:
-        raise NotImplementedError()
+        if not self.sqlite_repo: raise BackendUnavailableError("SQLite repository not initialized")
+
+        successful_kems: List[kem_pb2.KEM] = []
+        failed_kem_references: List[str] = []
+
+        # For simplicity, process one by one. True batch with transactionality is more complex.
+        for kem_orig in kems:
+            kem_id_ref = kem_orig.id or "new_kem_in_batch"
+            try:
+                stored_kem = await self.store_kem(kem_orig) # Reuses single store_kem logic
+                successful_kems.append(stored_kem)
+            except Exception as e_single_store:
+                logger.error(f"BatchStoreKEMs: Failed to store KEM (ref: {kem_id_ref}): {e_single_store}", exc_info=False)
+                failed_kem_references.append(kem_id_ref)
+
+        return successful_kems, failed_kem_references
 
     async def check_health(self) -> Tuple[bool, str]:
-        # This needs to run the checks for SQLite and Qdrant (if configured)
-        # For now, a placeholder. The actual logic from main.py's _check_sqlite_health/_check_qdrant_health
-        # will be adapted here.
-        # Since this is an async method, the checks should ideally be async too if possible,
-        # or run in an executor. For now, let's assume they can be called.
-
-        # Simulating the logic that was in main.py's check_overall_health
-        # Note: sqlite_repo methods are sync, qdrant_repo methods are sync.
-        # This needs to be made truly async if the underlying repo calls become async.
-        # For now, to match the ABC, we wrap sync calls if needed.
-
-        # This is a simplified version for now. SqliteKemRepository methods are not async.
-        # Qdrant client calls are sync.
-        # To make this truly async, SqliteKemRepository and QdrantKemRepository would need async methods.
-        # For this step, we'll assume sync execution within this async method for simplicity of refactoring.
-
-        # Proper async implementation would involve:
-        # loop = asyncio.get_event_loop()
-        # sqlite_healthy = await loop.run_in_executor(None, self.sqlite_repo._check_sqlite_health_internal_logic)
-        # qdrant_healthy = await loop.run_in_executor(None, self.qdrant_repo._check_qdrant_health_internal_logic)
+        if not self.sqlite_repo : # Qdrant repo can be None
+            return False, "Repositories not initialized."
 
         all_ok = True
         msg_parts = []
 
-        # 1. Check native SQLite health (using asyncio.to_thread for sync calls)
+        # 1. Check SQLite health
         try:
-            def sqlite_health_check_sync():
-                conn = self.sqlite_repo._get_sqlite_conn()
-                cursor = conn.cursor()
-                sqlite_query = getattr(self.config, "HEALTH_CHECK_SQLITE_QUERY", "SELECT 1")
-                cursor.execute(sqlite_query)
-                cursor.fetchone()
-            await asyncio.to_thread(sqlite_health_check_sync)
+            await self.sqlite_repo.internal_sqlite_health_check()
             msg_parts.append("NativeSQLite:OK")
         except Exception as e_sqlite_check:
-            logger.warning(f"DefaultGLMRepository Health Check: Native SQLite check failed: {e_sqlite_check}")
+            logger.warning(f"DefaultGLMRepository Health Check: Native SQLite check failed: {e_sqlite_check}", exc_info=True)
             all_ok = False
             msg_parts.append(f"NativeSQLite:FAIL ({type(e_sqlite_check).__name__}: {e_sqlite_check})")
 
-        # 2. Check native Qdrant health (if configured, using asyncio.to_thread for sync calls)
-        if self.qdrant_repo and self.qdrant_repo.client:
+        # 2. Check Qdrant health (if configured and initialized)
+        if self.qdrant_repo: # If Qdrant was configured and successfully initialized
             try:
-                await asyncio.to_thread(self.qdrant_repo.client.get_collections) # Simple connectivity test
+                await self.qdrant_repo.get_collection_info() # Uses async client method
                 msg_parts.append("NativeQdrant:OK")
             except Exception as e_qdrant_check:
-                logger.warning(f"DefaultGLMRepository Health Check: Native Qdrant check failed: {e_qdrant_check}")
+                logger.warning(f"DefaultGLMRepository Health Check: Native Qdrant check failed: {e_qdrant_check}", exc_info=True)
                 all_ok = False
                 msg_parts.append(f"NativeQdrant:FAIL ({type(e_qdrant_check).__name__}: {e_qdrant_check})")
-        elif not self.config.QDRANT_HOST:
+        elif self.config.QDRANT_HOST: # Configured but self.qdrant_repo is None (init failed)
+             logger.warning("DefaultGLMRepository Health Check: Native Qdrant configured but client not available (init failed?).")
+             all_ok = False
+             msg_parts.append("NativeQdrant:FAIL (client not initialized or init failed)")
+        else: # Not configured
             msg_parts.append("NativeQdrant:N/A (not configured)")
-        else: # Configured but Qdrant client not initialized (e.g. init failed during __init__)
-            logger.warning("DefaultGLMRepository Health Check: Native Qdrant configured but client not available (init failed?).")
-            all_ok = False
-            msg_parts.append("NativeQdrant:FAIL (client not initialized)")
 
-        # 3. Check health of external repositories (assuming their check_health() is already async)
+        # 3. Check health of external repositories
         if self.external_repos:
             for name, repo in self.external_repos.items():
                 try:
-                    # Need to run async health check method
-                    # If check_health itself is defined as async in BaseExternalRepository
-                    ext_healthy, ext_msg = await repo.check_health()
+                    ext_healthy, ext_msg = await repo.check_health() # Assuming these are async
                     if ext_healthy:
                         msg_parts.append(f"ExternalRepo({name}):OK ({ext_msg})")
                     else:
@@ -583,16 +520,13 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
                 except Exception as e_ext_health:
                     logger.error(f"Error during health check for external repo '{name}': {e_ext_health}", exc_info=True)
                     all_ok = False
-                    msg_parts.append(f"ExternalRepo({name}):FAIL (Exception: {e_ext_health})")
+                    msg_parts.append(f"ExternalRepo({name}):FAIL (Exception)")
         else:
             msg_parts.append("ExternalRepos:N/A (none configured)")
 
         return all_ok, "; ".join(msg_parts)
 
-# Need to import os for db_path
-import os
-```
-
-**Note:** The `async def` methods in `DefaultGLMRepository` are calling synchronous repository methods. This is a temporary state during refactoring. A full async implementation would require the underlying `SqliteKemRepository` and `QdrantKemRepository` to also have async methods and use async database drivers (e.g., `aioqdrant`, `aiosqlite`). For now, I'm using them as placeholders for the interface. The `asyncio.run()` in the servicer for calling these is also a temporary bridge.
-
-I've started with `__init__`, helper methods, `store_kem`, and a placeholder for `check_health`. I will now continue implementing the other abstract methods.
+import os # For db_path in __init__
+from qdrant_client import AsyncQdrantClient # Ensure AsyncQdrantClient is imported
+import aiosqlite # For aiosqlite.Error type hint in store_kem
+from qdrant_client.http.models import ScoredPoint # For type hint in retrieve_kems

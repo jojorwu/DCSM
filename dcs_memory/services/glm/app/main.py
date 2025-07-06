@@ -1,51 +1,35 @@
 import grpc
-import grpc.aio as grpc_aio # Import for async server
-import asyncio # Import asyncio
+import grpc.aio as grpc_aio
+import asyncio
 import time
 import sys
 import os
 import uuid
 import json
-import sqlite3
-from qdrant_client import QdrantClient, models
-from qdrant_client.http.models import PointStruct
-from google.protobuf.timestamp_pb2 import Timestamp
-from google.protobuf.json_format import ParseDict
-from typing import List, Optional # Added for type hints
+# import sqlite3 # No longer directly needed here, aiosqlite used in repo
+from qdrant_client import QdrantClient
+from typing import List, Optional
 import logging
 
 from .config import GLMConfig
-from .repositories.base import StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError # For specific exception handling
-# from .repositories import SqliteKemRepository, QdrantKemRepository # Will be used by DefaultGLMRepository
-from .repositories.base import BasePersistentStorageRepository #, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
-# Placeholder for the default implementation, will be created in a later step
-# from .repositories.default_impl import DefaultGLMRepository
+from .repositories.base import StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
+from .repositories.base import BasePersistentStorageRepository
+from .repositories.default_impl import DefaultGLMRepository # Import DefaultGLMRepository directly
 
 current_script_path = os.path.abspath(__file__)
 app_dir = os.path.dirname(current_script_path)
 
 config = GLMConfig()
 
-from pythonjsonlogger import jsonlogger # Import for JSON logging
+from pythonjsonlogger import jsonlogger
 
 # Centralized logging setup
 def setup_logging(log_config: GLMConfig):
     handlers_list = []
-
-    # Determine formatter based on output mode
     if log_config.LOG_OUTPUT_MODE in ["json_stdout", "json_file"]:
-        # For JSON, LOG_FORMAT can define the fields. A common practice:
-        # Example: "(asctime) (levelname) (name) (module) (funcName) (lineno) (message)"
-        # These will become keys in the JSON log.
-        # If LOG_FORMAT is the default text one, JsonFormatter will still work but might produce less structured JSON.
-        # It's better if LOG_FORMAT is tailored for JSON keys when using JsonFormatter.
-        # For simplicity, we can use a default JSON format string or make LOG_FORMAT more flexible.
-        # Let's assume LOG_FORMAT is suitable or use a generic set of fields for JSON.
-        # The `python-json-logger` adds default fields like 'asctime', 'levelname', 'message'.
-        # The format string for JsonFormatter specifies *additional* fields from the LogRecord.
-        json_fmt_str = getattr(log_config, 'LOG_JSON_FORMAT', log_config.LOG_FORMAT) # Could add LOG_JSON_FORMAT to config
+        json_fmt_str = getattr(log_config, 'LOG_JSON_FORMAT', log_config.LOG_FORMAT)
         formatter = jsonlogger.JsonFormatter(fmt=json_fmt_str, datefmt=log_config.LOG_DATE_FORMAT)
-    else: # For "stdout", "file"
+    else:
         formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
 
     if log_config.LOG_OUTPUT_MODE in ["stdout", "json_stdout"]:
@@ -55,59 +39,48 @@ def setup_logging(log_config: GLMConfig):
 
     if log_config.LOG_OUTPUT_MODE in ["file", "json_file"]:
         if log_config.LOG_FILE_PATH:
-            # TODO: Ensure directory for LOG_FILE_PATH exists or handle creation/permissions.
             try:
                 file_handler = logging.FileHandler(log_config.LOG_FILE_PATH)
                 file_handler.setFormatter(formatter)
                 handlers_list.append(file_handler)
             except Exception as e:
-                # Fallback to stdout if file handler fails
                 print(f"Error setting up file logger at {log_config.LOG_FILE_PATH}: {e}. Falling back to stdout.", file=sys.stderr)
-                if not any(isinstance(h, logging.StreamHandler) for h in handlers_list): # Avoid duplicate stdout
+                if not any(isinstance(h, logging.StreamHandler) for h in handlers_list):
                     stream_handler_fallback = logging.StreamHandler(sys.stdout)
                     stream_handler_fallback.setFormatter(formatter)
                     handlers_list.append(stream_handler_fallback)
         else:
             print(f"LOG_OUTPUT_MODE is '{log_config.LOG_OUTPUT_MODE}' but LOG_FILE_PATH is not set. Defaulting to stdout if no other handler.", file=sys.stderr)
-            if not handlers_list: # If no handlers configured yet (e.g. only file mode was chosen but path was missing)
+            if not handlers_list:
                 stream_handler_default = logging.StreamHandler(sys.stdout)
                 stream_handler_default.setFormatter(formatter)
                 handlers_list.append(stream_handler_default)
 
-    if not handlers_list: # Ultimate fallback if somehow no handlers were added
+    if not handlers_list:
         print("Warning: No logging handlers configured. Defaulting to basic stdout.", file=sys.stderr)
         logging.basicConfig(level=log_config.get_log_level_int())
         return
 
     logging.basicConfig(
         level=log_config.get_log_level_int(),
-        # format and datefmt in basicConfig are not used when handlers are specified,
-        # as handlers have their own formatters.
         handlers=handlers_list,
-        force=True # Override any existing basicConfig
+        force=True
     )
-    # Ensure all loggers obtained via getLogger propagate to the handlers set by basicConfig.
-    # The level set on basicConfig (root logger) will be the effective level unless child loggers override it.
-
 setup_logging(config)
-logger = logging.getLogger(__name__) # Get a logger specific to this module
+logger = logging.getLogger(__name__)
 
 from generated_grpc import kem_pb2
 from generated_grpc import glm_service_pb2, glm_service_pb2_grpc
-from generated_grpc import kps_service_pb2, kps_service_pb2_grpc # For KPS Client
+from generated_grpc import kps_service_pb2, kps_service_pb2_grpc
 from google.protobuf import empty_pb2
-from grpc_health.v1 import health_pb2, health_pb2_grpc, health_async # For HealthCheckResponse.ServingStatus enum and async HealthServicer
-# import grpc # For KPS client channel - grpc.aio will be used for KPS client if it's async
+from grpc_health.v1 import health_pb2, health_pb2_grpc, health_async
+
 
 class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemoryServicer):
     def __init__(self):
         logger.info("Initializing GlobalLongTermMemoryServicerImpl...")
         self.config: GLMConfig = config
-        # KPS client initialization will need to be async if KPS is async, or run in executor
-        # For now, assuming KPS client setup might remain synchronous if it's a simple client
-        # or this service doesn't heavily depend on it at init time.
-        # If KPS client needs to be async, its channel should be grpc_aio.Channel.
-        self.kps_client_stub: Optional[kps_service_pb2_grpc.KnowledgeProcessingServiceStub] = None # Keep type for now
+        self.kps_client_stub: Optional[kps_service_pb2_grpc.KnowledgeProcessingServiceStub] = None
 
         self.storage_repository: BasePersistentStorageRepository
         backend_type = self.config.GLM_STORAGE_BACKEND_TYPE
@@ -115,11 +88,11 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
         if backend_type == "default_sqlite_qdrant":
             try:
-                from .repositories.default_impl import DefaultGLMRepository
+                # DefaultGLMRepository __init__ is sync. Async setup is in _ensure_repository_initialized
                 self.storage_repository = DefaultGLMRepository(self.config, app_dir)
-                logger.info("DefaultGLMRepository (SQLite+Qdrant) initialized successfully.")
-            except ImportError:
-                logger.critical("DefaultGLMRepository not found. Ensure it's available for 'default_sqlite_qdrant' backend type.")
+                logger.info("DefaultGLMRepository (SQLite+Qdrant) synchronously initialized.")
+            except ImportError: # Should not happen if DefaultGLMRepository is in the same dir
+                logger.critical("DefaultGLMRepository not found during dynamic import.")
                 raise RuntimeError("DefaultGLMRepository not found")
             except Exception as e_repo_init:
                 logger.critical(f"CRITICAL ERROR initializing DefaultGLMRepository: {e_repo_init}", exc_info=True)
@@ -129,10 +102,8 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             raise ValueError(f"Unsupported GLM_STORAGE_BACKEND_TYPE: {backend_type}")
 
         logger.info("GLM servicer initialized with unified storage repository.")
-        self._init_kps_client() # KPS client init might need to be async if KPS is fully async
+        self._init_kps_client()
 
-    # KPS client initialization might need to be async if KPS is an async service
-    # For now, keeping it sync as it's a client, not a server part of GLM.
     def _init_kps_client(self):
         kps_host = self.config.KPS_SERVICE_HOST
         kps_port = self.config.KPS_SERVICE_PORT
@@ -140,10 +111,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             kps_address = f"{kps_host}:{kps_port}"
             logger.info(f"Attempting to connect to KPS service at {kps_address}...")
             try:
-                # If KPS is also async, this channel should be grpc_aio.insecure_channel or secure_channel
-                # For now, assuming KPS client can be sync, or this part is simplified.
-                # This might block if KPS is slow to respond during GLM init.
-                channel = grpc.insecure_channel(kps_address) # Standard sync channel
+                channel = grpc.insecure_channel(kps_address)
                 self.kps_client_stub = kps_service_pb2_grpc.KnowledgeProcessingServiceStub(channel)
                 logger.info(f"KPS client stub initialized for address {kps_address}.")
             except Exception as e:
@@ -153,15 +121,36 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             logger.warning("KPS_SERVICE_HOST or KPS_SERVICE_PORT not configured. KPS client will not be available.")
             self.kps_client_stub = None
 
+    async def _ensure_repository_initialized(self):
+        """Ensures any async initialization for repositories is done."""
+        if hasattr(self.storage_repository, 'ensure_initialized') and \
+           callable(self.storage_repository.ensure_initialized): # type: ignore
+            try:
+                await self.storage_repository.ensure_initialized() # type: ignore
+                logger.info("GLM Storage Repository async initialization ensured.")
+            except Exception as e_init_repo:
+                logger.critical(f"CRITICAL: Failed to perform async initialization of storage repository: {e_init_repo}", exc_info=True)
+                # This is a critical failure, the service should probably not start.
+                # Depending on desired behavior, could raise an error here to stop `serve()`.
+                # For now, logging critical and it might lead to NOT_SERVING in health checks.
+                raise BackendUnavailableError(f"Async repository initialization failed: {e_init_repo}") from e_init_repo
+
+
     async def check_overall_health(self) -> health_pb2.HealthCheckResponse.ServingStatus:
         try:
             if not hasattr(self, 'storage_repository') or self.storage_repository is None:
                  logger.error("GLM Health Check: Storage repository not initialized.")
                  return health_pb2.HealthCheckResponse.NOT_SERVING
 
-            is_healthy, message = await self.storage_repository.check_health() # Now awaited
+            # Ensure repo is initialized before checking health if it has such a method
+            if hasattr(self.storage_repository, '_initialized') and not self.storage_repository._initialized: # type: ignore
+                 logger.warning("GLM Health Check: Storage repository not yet async initialized. Reporting NOT_SERVING.")
+                 return health_pb2.HealthCheckResponse.NOT_SERVING
+
+
+            is_healthy, message = await self.storage_repository.check_health()
             if is_healthy:
-                logger.info(f"GLM Health Check: Backend status: HEALTHY. Message: {message}")
+                # logger.info(f"GLM Health Check: Backend status: HEALTHY. Message: {message}") # Too verbose for regular checks
                 return health_pb2.HealthCheckResponse.SERVING
             else:
                 logger.warning(f"GLM Health Check: Backend status: UNHEALTHY. Message: {message}")
@@ -169,57 +158,6 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         except Exception as e_health:
             logger.error(f"GLM Health Check: Error during health check: {e_health}", exc_info=True)
             return health_pb2.HealthCheckResponse.NOT_SERVING
-
-    def _kem_dict_to_proto(self, kem_data: dict) -> kem_pb2.KEM:
-        kem_data_copy = kem_data.copy()
-        if 'content' in kem_data_copy and isinstance(kem_data_copy['content'], str):
-             kem_data_copy['content'] = kem_data_copy['content'].encode('utf-8')
-        return ParseDict(kem_data_copy, kem_pb2.KEM(), ignore_unknown_fields=True)
-
-    # This helper is mostly for internal use, not directly an RPC method.
-    # If it were called from an async RPC method and did significant work, it might also need to be async.
-    # For now, it's primarily data transformation.
-    def _kem_from_db_dict(self, kem_db_dict: typing.Dict[str, typing.Any], embeddings_map: typing.Optional[typing.Dict[str, typing.List[float]]] = None) -> kem_pb2.KEM:
-        if not kem_db_dict:
-            logger.error("_kem_from_db_dict received empty or None kem_db_dict")
-            return kem_pb2.KEM()
-
-        kem_dict_for_proto = kem_db_dict.copy()
-        metadata_str = kem_dict_for_proto.get('metadata', '{}')
-        try:
-            kem_dict_for_proto['metadata'] = json.loads(metadata_str)
-        except json.JSONDecodeError:
-            logger.warning(f"Failed to parse metadata JSON: {metadata_str} for KEM ID {kem_db_dict.get('id')}. Using empty metadata.", exc_info=True)
-            kem_dict_for_proto['metadata'] = {}
-
-        for ts_field_name in ['created_at', 'updated_at']:
-            ts_str = kem_dict_for_proto.get(ts_field_name)
-            if ts_str and isinstance(ts_str, str):
-                ts_proto = Timestamp()
-                if not ts_str.endswith("Z") and '+' not in ts_str and '-' not in ts_str[10:]:
-                    ts_str_for_parse = ts_str + "Z"
-                else:
-                    ts_str_for_parse = ts_str
-                try:
-                    ts_proto.FromJsonString(ts_str_for_parse)
-                    kem_dict_for_proto[ts_field_name] = ts_proto
-                except Exception as e_ts_parse:
-                     logger.warning(f"Failed to parse timestamp string '{ts_str}' (tried as '{ts_str_for_parse}') for field '{ts_field_name}' in KEM ID {kem_db_dict.get('id')}: {e_ts_parse}", exc_info=True)
-                     if ts_field_name in kem_dict_for_proto: del kem_dict_for_proto[ts_field_name]
-            elif isinstance(ts_str, Timestamp):
-                 pass # Already a Timestamp object
-            else: # Not a string or Timestamp, remove if exists
-                 if ts_field_name in kem_dict_for_proto: del kem_dict_for_proto[ts_field_name]
-
-
-        if embeddings_map and kem_dict_for_proto.get('id') in embeddings_map:
-            kem_dict_for_proto['embeddings'] = embeddings_map[kem_dict_for_proto['id']]
-        else:
-            # Ensure 'embeddings' field exists if it's expected by ParseDict for KEM
-            # If KEM proto has 'repeated float embeddings', it defaults to empty list if not provided.
-            kem_dict_for_proto.setdefault('embeddings', [])
-
-        return self._kem_dict_to_proto(kem_dict_for_proto)
 
     async def StoreKEM(self, request: glm_service_pb2.StoreKEMRequest, context: grpc_aio.ServicerContext) -> glm_service_pb2.StoreKEMResponse:
         start_time = time.monotonic()
@@ -230,10 +168,8 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             msg = f"Embedding dimension ({len(kem.embeddings)}) does not match configured DEFAULT_VECTOR_SIZE ({self.config.DEFAULT_VECTOR_SIZE})."
             logger.warning(f"StoreKEM: {msg} KEM_ID='{kem.id}'")
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
-            return glm_service_pb2.StoreKEMResponse() # Should be unreachable due to abort
-
         try:
-            stored_kem_proto = await self.storage_repository.store_kem(kem) # Now awaited
+            stored_kem_proto = await self.storage_repository.store_kem(kem)
             duration = time.monotonic() - start_time
             logger.info(f"StoreKEM: Finished. KEM_ID='{stored_kem_proto.id}'. Duration: {duration:.4f}s.")
             return glm_service_pb2.StoreKEMResponse(kem=stored_kem_proto)
@@ -252,7 +188,8 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         except Exception as e:
             logger.error(f"StoreKEM: Unexpected error for KEM ID '{kem.id}': {e}", exc_info=True)
             await context.abort(grpc.StatusCode.INTERNAL, f"An unexpected error occurred: {e}")
-        return glm_service_pb2.StoreKEMResponse() # Should be unreachable
+        return glm_service_pb2.StoreKEMResponse()
+
 
     async def RetrieveKEMs(self, request: glm_service_pb2.RetrieveKEMsRequest, context: grpc_aio.ServicerContext) -> glm_service_pb2.RetrieveKEMsResponse:
         start_time = time.monotonic()
@@ -266,15 +203,13 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             msg = f"Invalid embedding dimension ({len(query.embedding_query)}) for vector search. Expected {self.config.DEFAULT_VECTOR_SIZE}."
             logger.warning(f"RetrieveKEMs: {msg}")
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
-            return glm_service_pb2.RetrieveKEMsResponse()
-
         try:
-            kems_protos, next_page_token_str = await self.storage_repository.retrieve_kems(query, page_size, page_token) # Now awaited
+            kems_protos, next_page_token_str = await self.storage_repository.retrieve_kems(query, page_size, page_token)
             duration = time.monotonic() - start_time
             logger.info(f"RetrieveKEMs: Finished. Found {len(kems_protos)} KEMs. NextToken: '{next_page_token_str}'. Duration: {duration:.4f}s.")
             return glm_service_pb2.RetrieveKEMsResponse(kems=kems_protos, next_page_token=next_page_token_str or "")
         except KemNotFoundError as e:
-            logger.warning(f"RetrieveKEMs: KemNotFoundError during query processing: {e}", exc_info=True)
+            logger.warning(f"RetrieveKEMs: KemNotFoundError during query processing: {e}", exc_info=False)
             await context.abort(grpc.StatusCode.NOT_FOUND, str(e))
         except BackendUnavailableError as e:
             logger.error(f"RetrieveKEMs: Backend unavailable: {e}", exc_info=True)
@@ -297,18 +232,14 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
         if not kem_id:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID is required for update.")
-            return kem_pb2.KEM()
-
         logger.info(f"UpdateKEM: Called for KEM_ID='{kem_id}'.")
 
         if kem_data_update.embeddings and len(kem_data_update.embeddings) != self.config.DEFAULT_VECTOR_SIZE:
             msg = f"Invalid embedding dimension ({len(kem_data_update.embeddings)}) for update. Expected {self.config.DEFAULT_VECTOR_SIZE}."
             logger.warning(f"UpdateKEM: {msg} KEM_ID='{kem_id}'")
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, msg)
-            return kem_pb2.KEM()
-
         try:
-            updated_kem_proto = await self.storage_repository.update_kem(kem_id, kem_data_update) # Now awaited
+            updated_kem_proto = await self.storage_repository.update_kem(kem_id, kem_data_update)
             duration = time.monotonic() - start_time
             logger.info(f"UpdateKEM: Finished. KEM_ID='{updated_kem_proto.id}'. Duration: {duration:.4f}s.")
             return updated_kem_proto
@@ -333,13 +264,10 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         kem_id = request.kem_id
         if not kem_id:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "KEM ID is required for deletion.")
-            return empty_pb2.Empty()
-
         logger.info(f"DeleteKEM: Called for KEM_ID='{kem_id}'.")
         start_time = time.monotonic()
-
         try:
-            deleted = await self.storage_repository.delete_kem(kem_id) # Now awaited
+            deleted = await self.storage_repository.delete_kem(kem_id)
             duration = time.monotonic() - start_time
             if deleted:
                 logger.info(f"DeleteKEM: Finished. KEM_ID='{kem_id}' deleted. Duration: {duration:.4f}s.")
@@ -383,7 +311,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 overall_error_message="All KEMs failed pre-validation."
             )
         try:
-            successful_kems_protos, repo_failed_refs = await self.storage_repository.batch_store_kems(validated_kems_for_repo) # Now awaited
+            successful_kems_protos, repo_failed_refs = await self.storage_repository.batch_store_kems(validated_kems_for_repo)
             all_failed_refs = list(set(initial_failed_refs + repo_failed_refs))
             resp = glm_service_pb2.BatchStoreKEMsResponse(
                 successfully_stored_kems=successful_kems_protos,
@@ -404,9 +332,9 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             logger.error(f"BatchStoreKEMs: Unexpected error: {e}", exc_info=True)
             await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error during batch store: {e}")
 
-        all_original_refs = [k.id if k.id else f"req_idx_{i}" for i, k in enumerate(request.kems)]
+        all_original_refs = [k_obj.id if k_obj.id else f"req_idx_{i}" for i, k_obj in enumerate(request.kems)]
         return glm_service_pb2.BatchStoreKEMsResponse(
-            failed_kem_references=list(set(initial_failed_refs + all_original_refs)), # Ensure all are marked failed
+            failed_kem_references=list(set(initial_failed_refs + all_original_refs)),
             overall_error_message="Batch store failed due to an unexpected error after initial processing."
         )
 
@@ -420,20 +348,17 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
         if not data_source_name:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "data_source_name is required.")
-            return glm_service_pb2.IndexExternalDataSourceResponse()
-
-        if not self.kps_client_stub: # KPS client is sync for now
+        if not self.kps_client_stub:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "KPS client not available.")
-            return glm_service_pb2.IndexExternalDataSourceResponse()
 
         external_repo = self.storage_repository.external_repos.get(data_source_name)
         if not external_repo:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"External data source '{data_source_name}' not configured.")
-            return glm_service_pb2.IndexExternalDataSourceResponse()
 
         logger.info(f"IndexExternalDataSource: Starting data fetch for source '{data_source_name}'.")
         current_page_token: Optional[str] = None; has_more_pages = True
-        kps_batch_size = 50
+
+        kps_process_timeout = getattr(self.config, "KPS_PROCESS_RAW_DATA_TIMEOUT_S", 30.0)
 
         try:
             while has_more_pages:
@@ -441,7 +366,6 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                 next_page_token_from_connector: Optional[str] = None
                 dummy_query_for_connector = glm_service_pb2.KEMQuery()
                 try:
-                    # Assuming external_repo.retrieve_mapped_kems is async
                     kems_from_external_source, next_page_token_from_connector = await external_repo.retrieve_mapped_kems(
                         internal_query=dummy_query_for_connector,
                         page_size=page_size_for_fetch,
@@ -453,36 +377,33 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
                     raise StorageError(f"Failed to fetch from external source '{data_source_name}': {e_fetch}") from e_fetch
 
                 if not kems_from_external_source: has_more_pages = False; break
-                # Process each KEM individually using KPS's ProcessRawData
+
                 for kem_ext in kems_from_external_source:
                     if not kem_ext.id:
-                        logger.warning(f"IndexExternalDataSource: Skipping KEM from external source '{data_source_name}' due to missing ID.")
+                        logger.warning(f"IndexExternalDataSource: Skipping KEM from source '{data_source_name}' due to missing ID.")
                         items_failed_total += 1
                         continue
 
-                    # Use kem_ext.id as the data_id for KPS ProcessRawData.
-                    # KPS itself should handle idempotency based on this data_id if configured.
                     kps_data_id = kem_ext.id
-
-                    # Ensure metadata is a Python dict for the KPS request
                     kps_initial_metadata = dict(kem_ext.metadata) if kem_ext.metadata else {}
+
+                    raw_content_bytes = kem_ext.content
+                    if isinstance(raw_content_bytes, str):
+                        logger.warning(f"IndexExternalDataSource: KEM content for '{kps_data_id}' was string, encoding to UTF-8 for KPS.")
+                        raw_content_bytes = raw_content_bytes.encode('utf-8')
 
                     kps_request = kps_service_pb2.ProcessRawDataRequest(
                         data_id=kps_data_id,
                         content_type=kem_ext.content_type,
-                        raw_content=kem_ext.content, # kem_ext.content should be bytes
+                        raw_content=raw_content_bytes,
                         initial_metadata=kps_initial_metadata
                     )
 
                     try:
                         logger.debug(f"IndexExternalDataSource: Calling KPS.ProcessRawData for data_id '{kps_data_id}' from source '{data_source_name}'.")
-                        # TODO: Make KPS call timeout configurable via GLMConfig if not already covered by a global KPS client timeout
-                        kps_process_timeout = getattr(self.config, "KPS_PROCESS_RAW_DATA_TIMEOUT_S", 30.0)
-
                         kps_response: kps_service_pb2.ProcessRawDataResponse = await asyncio.to_thread(
                             self.kps_client_stub.ProcessRawData, kps_request, timeout=kps_process_timeout
                         )
-
                         if kps_response.success:
                             items_processed_total += 1
                             logger.info(f"IndexExternalDataSource: Successfully processed data_id '{kps_data_id}' via KPS. KEM_ID: {kps_response.kem_id}")
@@ -492,40 +413,34 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
                     except grpc.RpcError as e_kps_rpc:
                         items_failed_total += 1
-                        logger.error(f"IndexExternalDataSource: gRPC error calling KPS.ProcessRawData for data_id '{kps_data_id}' (source '{data_source_name}'): {e_kps_rpc.code()} - {e_kps_rpc.details()}", exc_info=True)
+                        logger.error(f"IndexExternalDataSource: gRPC error from KPS.ProcessRawData for data_id '{kps_data_id}': {e_kps_rpc.code()} - {e_kps_rpc.details()}", exc_info=True)
                         if e_kps_rpc.code() in [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.INTERNAL]:
-                            logger.error(f"IndexExternalDataSource: Aborting indexing for '{data_source_name}' due to critical KPS error for data_id '{kps_data_id}'.")
-                            await context.abort(e_kps_rpc.code(), f"Failed to index data source '{data_source_name}': KPS service error ({e_kps_rpc.code()}) processing item '{kps_data_id}'.")
-                            return glm_service_pb2.IndexExternalDataSourceResponse() # Unreachable
-                        # For other errors (e.g., INVALID_ARGUMENT from KPS for a specific item), we log, count as failed, and continue.
+                            logger.error(f"IndexExternalDataSource: Aborting for '{data_source_name}' due to critical KPS error for item '{kps_data_id}'.")
+                            await context.abort(e_kps_rpc.code(), f"KPS error processing item '{kps_data_id}' from '{data_source_name}': {e_kps_rpc.code()}.")
                     except Exception as e_kps_call:
                         items_failed_total += 1
-                        logger.error(f"IndexExternalDataSource: Unexpected error calling KPS.ProcessRawData for data_id '{kps_data_id}' (source '{data_source_name}'): {e_kps_call}", exc_info=True)
-                        # Consider this critical enough to abort if it's not an RpcError already handled
-                        logger.error(f"IndexExternalDataSource: Aborting indexing for '{data_source_name}' due to unexpected KPS call error for data_id '{kps_data_id}'.")
-                        await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error during KPS communication for data_id '{kps_data_id}' from source '{data_source_name}'.")
-                        return glm_service_pb2.IndexExternalDataSourceResponse() # Unreachable
+                        logger.error(f"IndexExternalDataSource: Unexpected error calling KPS.ProcessRawData for data_id '{kps_data_id}': {e_kps_call}", exc_info=True)
+                        await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected KPS call error for item '{kps_data_id}' from '{data_source_name}'.")
 
                 current_page_token = next_page_token_from_connector
                 if not current_page_token: has_more_pages = False
 
             duration = time.monotonic() - start_time
-            status_msg = f"Completed indexing for '{data_source_name}'. Items submitted to KPS: {items_processed_total}, Items failed before/during KPS submission: {items_failed_total}. Duration: {duration:.2f}s."
+            status_msg = f"Completed indexing for '{data_source_name}'. Items submitted to KPS: {items_processed_total}, Items failed: {items_failed_total}. Duration: {duration:.2f}s."
             logger.info(f"IndexExternalDataSource: {status_msg}")
             return glm_service_pb2.IndexExternalDataSourceResponse(status_message=status_msg, items_processed=items_processed_total, items_failed=items_failed_total)
 
-        except StorageError as e_storage_ext: # Errors from fetching from external source
+        except StorageError as e_storage_ext:
             logger.error(f"IndexExternalDataSource: StorageError fetching from '{data_source_name}': {e_storage_ext}", exc_info=True)
             await context.abort(grpc.StatusCode.INTERNAL, f"Storage error accessing external source '{data_source_name}': {e_storage_ext}")
-        except grpc.RpcError: # To catch aborts from KPS call exceptions
-            raise # Re-raise to let gRPC framework handle it
-        except Exception as e_main_idx: # Other unexpected errors in the main loop
-            logger.error(f"IndexExternalDataSource: Unexpected error during indexing of '{data_source_name}': {e_main_idx}", exc_info=True)
-            await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error indexing data source '{data_source_name}': {e_main_idx}")
+        except grpc.RpcError:
+            raise
+        except Exception as e_main_idx:
+            logger.error(f"IndexExternalDataSource: Unexpected error for '{data_source_name}': {e_main_idx}", exc_info=True)
+            await context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error indexing '{data_source_name}': {e_main_idx}")
 
-        # Fallback, should ideally be unreachable if all paths abort or return correctly.
         return glm_service_pb2.IndexExternalDataSourceResponse(
-            status_message=f"Indexing for '{data_source_name}' concluded with {items_processed_total} processed, {items_failed_total} failed due to an issue.",
+            status_message=f"Indexing for '{data_source_name}' concluded: Processed {items_processed_total}, Failed {items_failed_total}.",
             items_processed=items_processed_total, items_failed=items_failed_total
         )
 
@@ -533,56 +448,48 @@ async def serve():
     logger.info(f"GLM Config: Qdrant={config.QDRANT_HOST}:{config.QDRANT_PORT} ('{config.QDRANT_COLLECTION}'), "
                 f"SQLite='{os.path.join(app_dir, config.DB_FILENAME)}', gRPC={config.GRPC_LISTEN_ADDRESS}, LogLvl={config.LOG_LEVEL}")
 
-    if config.QDRANT_HOST: # Pre-flight check only if Qdrant is configured
+    if config.QDRANT_HOST:
         try:
-            client_test = QdrantClient(
-                host=config.QDRANT_HOST,
-                port=config.QDRANT_PORT,
-                timeout=config.QDRANT_PREFLIGHT_CHECK_TIMEOUT_S # Use configured timeout
-            )
+            client_test = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT, timeout=config.QDRANT_PREFLIGHT_CHECK_TIMEOUT_S)
             client_test.get_collections()
-            logger.info(f"Qdrant pre-flight check OK: {config.QDRANT_HOST}:{config.QDRANT_PORT} (timeout: {config.QDRANT_PREFLIGHT_CHECK_TIMEOUT_S}s).")
+            logger.info(f"Qdrant pre-flight check OK: {config.QDRANT_HOST}:{config.QDRANT_PORT}.")
         except Exception as e_preflight:
-            logger.critical(f"CRITICAL: Qdrant unavailable at {config.QDRANT_HOST}:{config.QDRANT_PORT}. {e_preflight}. Server NOT STARTED if Qdrant is essential.")
+            logger.critical(f"CRITICAL: Qdrant unavailable at {config.QDRANT_HOST}:{config.QDRANT_PORT}. {e_preflight}. Server NOT STARTED.")
             return
 
-    server = grpc_aio.server() # Use async server
+    server = grpc_aio.server()
+    servicer_instance = None # Define before try block
     try:
         servicer_instance = GlobalLongTermMemoryServicerImpl()
+        await servicer_instance._ensure_repository_initialized() # Ensure async init for repo is done
+
     except Exception as e_servicer_init:
-        logger.critical(f"CRITICAL: Error initializing ServicerImpl: {e_servicer_init}", exc_info=True)
+        logger.critical(f"CRITICAL: Error initializing ServicerImpl or its repository: {e_servicer_init}", exc_info=True)
         return
 
     glm_service_pb2_grpc.add_GlobalLongTermMemoryServicer_to_server(servicer_instance, server)
 
-    # Use async HealthServicer
     class GLMHealthServicer(health_async.HealthServicer):
         def __init__(self, glm_service_instance: GlobalLongTermMemoryServicerImpl):
             super().__init__()
             self._glm_service = glm_service_instance
-            # Schedule initial status check if needed, or let first Check call do it.
-            # For simplicity, first Check call will set the status.
-            # Or, can do: asyncio.create_task(self._set_initial_status())
-            # async def _set_initial_status(self):
-            #    initial_status = await self._glm_service.check_overall_health()
-            #    self.set("", initial_status)
-            #    logger.info(f"GLM Initial Health Status set to: {health_pb2.HealthCheckResponse.ServingStatus.Name(initial_status)}")
-
+            # asyncio.create_task(self._set_initial_status()) # Optional: set initial status
+        # async def _set_initial_status(self):
+        #    initial_status = await self._glm_service.check_overall_health()
+        #    self.set("", initial_status) # Sets overall status
 
         async def Check(self, request: health_pb2.HealthCheckRequest, context: grpc_aio.ServicerContext) -> health_pb2.HealthCheckResponse:
             current_status = await self._glm_service.check_overall_health()
-            self.set(request.service, current_status) # Update status for Watch
-            # The super().Check will use the status that was just set.
-            return await super().Check(request, context) # Await super call for async health servicer
+            self.set(request.service, current_status)
+            return await super().Check(request, context)
 
-    # Initial status can be set here or by the first Check call.
-    # To set it eagerly:
-    # initial_health_status = await servicer_instance.check_overall_health() # Requires serve() to be async to await this
-    glm_health_servicer = GLMHealthServicer(servicer_instance)
-    # logger.info(f"GLM Initial Health Status (before first check) set to: {health_pb2.HealthCheckResponse.ServingStatus.Name(initial_health_status)}")
-    # glm_health_servicer.set("", initial_health_status) # Eagerly set initial status
+    if servicer_instance: # Ensure servicer_instance was created
+        glm_health_servicer = GLMHealthServicer(servicer_instance)
+        health_pb2_grpc.add_HealthServicer_to_server(glm_health_servicer, server)
+    else: # Should not happen if init error handling is correct (raises or returns)
+        logger.critical("CRITICAL: Servicer instance not available for HealthServicer. Server NOT STARTED.")
+        return
 
-    health_pb2_grpc.add_HealthServicer_to_server(glm_health_servicer, server)
 
     if config.GRPC_SERVER_CERT_PATH and config.GRPC_SERVER_KEY_PATH:
         try:
@@ -601,24 +508,34 @@ async def serve():
         server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
         logger.info(f"Starting GLM server INSECURELY (async) on {config.GRPC_LISTEN_ADDRESS}.")
 
-    await server.start() # await server start
+    await server.start()
     logger.info(f"GLM server (async) started and listening on {config.GRPC_LISTEN_ADDRESS}.")
 
     try:
-        await server.wait_for_termination() # await termination
+        await server.wait_for_termination()
     except KeyboardInterrupt:
         logger.info("GLM server stopping via KeyboardInterrupt...")
-    except asyncio.CancelledError: # Handle task cancellation
+    except asyncio.CancelledError:
         logger.info("GLM server task cancelled.")
     finally:
         logger.info("GLM server stopping...")
-        await server.stop(grace=config.GRPC_SERVER_SHUTDOWN_GRACE_S) # await stop
+        if servicer_instance and hasattr(servicer_instance.storage_repository, 'close_connections'):
+            try:
+                # If storage_repository has an async close method for its clients (e.g. Qdrant async client)
+                await servicer_instance.storage_repository.close_connections() # type: ignore
+                logger.info("GLM Storage Repository connections closed.")
+            except Exception as e_close_repo:
+                logger.error(f"Error closing storage repository connections: {e_close_repo}", exc_info=True)
+
+        await server.stop(grace=config.GRPC_SERVER_SHUTDOWN_GRACE_S)
         logger.info("GLM server stopped.")
 
 if __name__ == '__main__':
     try:
-        asyncio.run(serve()) # Run the async serve function
+        asyncio.run(serve())
     except KeyboardInterrupt:
         logger.info("GLM main process interrupted by user.")
     except Exception as e_main_run:
         logger.critical(f"GLM main unhandled exception: {e_main_run}", exc_info=True)
+
+[end of dcs_memory/services/glm/app/main.py]
