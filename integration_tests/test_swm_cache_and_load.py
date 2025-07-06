@@ -14,9 +14,9 @@ from integration_tests.kps_client_simple import process_data_via_kps
 from dcs_memory.services.swm.generated_grpc import swm_service_pb2
 from dcs_memory.services.swm.generated_grpc import swm_service_pb2_grpc
 # Импорты для KEMQuery (используется в SWM и GLM)
-# from dcs_memory.common.grpc_protos.glm_service_pb2 import KEMQuery # Используем напрямую из общего proto
-# Используем из temp_generated_grpc_code, если PYTHONPATH настроен на корень проекта
-from temp_generated_grpc_code.glm_service_pb2 import KEMQuery
+# from dcs_memory.common.grpc_protos.glm_service_pb2 import KEMQuery
+# Using AgentSDK's generated code as a consistent source for shared proto messages in tests
+from dcsm_agent_sdk_python.generated_grpc_code.glm_service_pb2 import KEMQuery
 
 KPS_SERVICE_URL = os.getenv("KPS_SERVICE_URL", "localhost:50052")
 SWM_SERVICE_URL = os.getenv("SWM_SERVICE_URL", "localhost:50053")
@@ -85,15 +85,20 @@ class TestSWMCacheAndLoad(unittest.TestCase):
             elif kem_id_in_glm in load_response.loaded_kem_ids:
                  print("КЕП успешно загружена в SWM по запросу LoadKEMsFromGLM.")
 
+            # 5. Проверяем, что КЕП теперь есть в SWM (с retry)
+            print(f"\nШаг 4: Повторная проверка наличия КЕП ID '{kem_id_in_glm}' в SWM кэше (с retry)...")
+            kems_from_swm_after_load = []
+            max_retries_swm_query = 5
+            retry_delay_swm_query = 0.2 # seconds
+            for attempt in range(max_retries_swm_query):
+                kems_from_swm_after_load = self._query_swm(swm_stub, kem_id_in_glm)
+                if kems_from_swm_after_load and kems_from_swm_after_load[0].id == kem_id_in_glm:
+                    break
+                print(f"Attempt {attempt + 1}/{max_retries_swm_query}: KEM {kem_id_in_glm} not found in SWM, retrying in {retry_delay_swm_query}s...")
+                time.sleep(retry_delay_swm_query)
 
-            time.sleep(0.5) # Пауза, чтобы SWM обработал загрузку
-
-            # 5. Проверяем, что КЕП теперь есть в SWM
-            print(f"\nШаг 4: Повторная проверка наличия КЕП ID '{kem_id_in_glm}' в SWM кэше...")
-            kems_from_swm_after_load = self._query_swm(swm_stub, kem_id_in_glm)
-
-            self.assertGreaterEqual(len(kems_from_swm_after_load), 1, f"КЕП ID '{kem_id_in_glm}' не найдена в SWM после LoadKEMsFromGLM.")
-            if kems_from_swm_after_load:
+            self.assertGreaterEqual(len(kems_from_swm_after_load), 1, f"КЕП ID '{kem_id_in_glm}' не найдена в SWM после LoadKEMsFromGLM и {max_retries_swm_query} попыток.")
+            if kems_from_swm_after_load: # Should be true if assertGreaterEqual passed
                 retrieved_kem_swm = kems_from_swm_after_load[0]
                 self.assertEqual(retrieved_kem_swm.id, kem_id_in_glm)
                 self.assertEqual(retrieved_kem_swm.content.decode('utf-8'), test_content)

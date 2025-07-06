@@ -54,11 +54,8 @@ class TestFullCycleKemCreationRetrieval(unittest.TestCase):
         kem_id_from_kps = kps_response.kem_id
         print(f"KPS успешно обработал данные. Получен KEM ID: {kem_id_from_kps}")
 
-        # Даем небольшую паузу, чтобы GLM точно успел обработать (особенно если есть очередь или асинхронность)
-        time.sleep(2) # 2 секунды должно быть достаточно для локального docker-compose
-
-        # 2. Получение КЕП через AgentSDK (напрямую из GLM)
-        print(f"\nШаг 2: Получение КЕП ID '{kem_id_from_kps}' через AgentSDK из GLM...")
+        # Шаг 2: Получение КЕП через AgentSDK (напрямую из GLM) с использованием retry_loop
+        print(f"\nШаг 2: Получение КЕП ID '{kem_id_from_kps}' через AgentSDK из GLM (с retry)...")
         sdk = None
         retrieved_kem = None
         from dcsm_agent_sdk_python.config import DCSMClientSDKConfig # Import config
@@ -75,15 +72,24 @@ class TestFullCycleKemCreationRetrieval(unittest.TestCase):
                 connect_on_init=True # For integration test, connect eagerly
             )
             sdk = AgentSDK(config=sdk_config)
-            # Using force_remote=True is good to bypass LPA for this test
-            retrieved_kem = sdk.get_kem(kem_id_from_kps, force_remote=True)
+
+            # Retry loop for get_kem
+            max_retries = 5
+            retry_delay = 0.5 # seconds
+            for attempt in range(max_retries):
+                retrieved_kem = sdk.get_kem(kem_id_from_kps, force_remote=True)
+                if retrieved_kem:
+                    break
+                print(f"Attempt {attempt + 1}/{max_retries}: KEM {kem_id_from_kps} not found yet, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+
         except Exception as e:
             self.fail(f"AgentSDK не смог подключиться или получить КЕП: {e}")
         finally:
             if sdk:
                 sdk.close()
 
-        self.assertIsNotNone(retrieved_kem, f"КЕП ID '{kem_id_from_kps}' не найдена в GLM через SDK.")
+        self.assertIsNotNone(retrieved_kem, f"КЕП ID '{kem_id_from_kps}' не найдена в GLM через SDK после {max_retries} попыток.")
         print(f"AgentSDK успешно получил КЕП: ID='{retrieved_kem.get('id')}'")
 
         # 3. Проверка полей полученной КЕП

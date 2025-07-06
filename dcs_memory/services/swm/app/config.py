@@ -82,16 +82,17 @@ class SWMConfig(BaseServiceConfig):
     )
 
     # Redis Cache Configuration for SWM
-    SWM_REDIS_HOST: str = Field(default="localhost", description="Hostname for the Redis server used by SWM cache.")
+    SWM_REDIS_HOST: str = Field(default="localhost", description="Hostname for the Redis server used by SWM.")
     SWM_REDIS_PORT: int = Field(default=6379, description="Port for the Redis server.")
-    SWM_REDIS_DB: int = Field(default=0, description="Redis database number for SWM cache.")
+    SWM_REDIS_DB: int = Field(default=0, description="Redis database number for all SWM data (cache, locks, counters, DLQ).")
     SWM_REDIS_PASSWORD: Optional[str] = Field(default=None, description="Password for Redis server (if any).")
     SWM_REDIS_RECONNECT_DELAY_S: float = Field(
         default=5.0,
         description="Delay in seconds before SWM eviction listener attempts to reconnect to Redis PubSub after a connection error."
     )
-    # SWM_CACHE_MAX_SIZE might be removed as Redis maxmemory handles this.
-    # INDEXED_METADATA_KEYS is still needed for RedisKemCache to know what to index.
+    # Note: REDIS_DB_PUBSUB, REDIS_DB_CACHE_INDEX, REDIS_DB_LOCKS_COUNTERS were removed as SWM uses a single DB.
+    # SWM_CACHE_MAX_SIZE is informational; actual eviction is by Redis maxmemory policy.
+    # INDEXED_METADATA_KEYS is used by RedisKemCache for secondary indexing setup.
 
 if __name__ == '__main__':
     print("--- Тестирование SWMConfig ---")
