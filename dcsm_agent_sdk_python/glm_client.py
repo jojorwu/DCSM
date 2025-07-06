@@ -110,8 +110,10 @@ class GLMClient:
     @retry_grpc_call
     def retrieve_kems(self, text_query: str = None, embedding_query: list[float] = None,
                       metadata_filters: dict = None, ids_filter: list[str] = None,
-                      page_size: int = 10, page_token: str = None) -> tuple[list[dict] | None, str | None]:
+                      page_size: int = 10, page_token: str = None,
+                      timeout: Optional[float] = None) -> tuple[list[dict] | None, str | None]:
         self._ensure_connected()
+        actual_timeout = timeout if timeout is not None else self.retrieve_kems_timeout_s
         query_proto = glm_service_pb2.KEMQuery()
         if text_query:
             query_proto.text_query = text_query
@@ -123,23 +125,25 @@ class GLMClient:
         if ids_filter:
             query_proto.ids.extend(ids_filter)
         request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, page_size=page_size, page_token=page_token if page_token else "")
-        response = self.stub.RetrieveKEMs(request, timeout=self.retrieve_kems_timeout_s) # type: ignore
+        response = self.stub.RetrieveKEMs(request, timeout=actual_timeout) # type: ignore
         kems_as_dicts = [kem_proto_to_dict(kem) for kem in response.kems]
         return kems_as_dicts, response.next_page_token
 
     @retry_grpc_call
-    def update_kem(self, kem_id: str, kem_data_update: dict) -> dict | None:
+    def update_kem(self, kem_id: str, kem_data_update: dict, timeout: Optional[float] = None) -> dict | None:
         self._ensure_connected()
+        actual_timeout = timeout if timeout is not None else self.update_kem_timeout_s
         kem_proto_update = kem_dict_to_proto(kem_data_update)
         request = glm_service_pb2.UpdateKEMRequest(kem_id=kem_id, kem_data_update=kem_proto_update)
-        response_kem_proto = self.stub.UpdateKEM(request, timeout=10) # type: ignore
+        response_kem_proto = self.stub.UpdateKEM(request, timeout=actual_timeout) # type: ignore
         return kem_proto_to_dict(response_kem_proto)
 
     @retry_grpc_call
-    def delete_kem(self, kem_id: str) -> bool:
+    def delete_kem(self, kem_id: str, timeout: Optional[float] = None) -> bool:
         self._ensure_connected()
+        actual_timeout = timeout if timeout is not None else self.delete_kem_timeout_s
         request = glm_service_pb2.DeleteKEMRequest(kem_id=kem_id)
-        self.stub.DeleteKEM(request, timeout=10) # type: ignore
+        self.stub.DeleteKEM(request, timeout=actual_timeout) # type: ignore
         return True
 
     def close(self):
