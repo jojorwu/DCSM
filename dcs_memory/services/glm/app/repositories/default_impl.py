@@ -450,13 +450,14 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
                     # If Qdrant was used, its next_page_token is authoritative for this path.
                     final_next_page_token = next_qdrant_page_token
 
-                    # Convert dicts to protos
-                    # Note: embeddings are not directly retrieved from SQLite in this path.
-                    # Qdrant search results (scored_points) might contain embeddings if requested.
-                    # We might need to merge Qdrant embeddings with SQLite data.
-                    # For now, _kem_from_db_dict_to_proto doesn't combine with Qdrant embeddings.
-                    # This requires more sophisticated merging if KEM proto should have Qdrant's latest embeddings.
-                    kem_protos = [self._kem_from_db_dict_to_proto(db_dict) for db_dict in kems_from_db_dicts]
+                    # Convert dicts to protos, merging embeddings from Qdrant
+                    qdrant_embeddings_map = {sp.id: list(sp.vector) for sp in scored_points if sp.vector}
+                    kem_protos = []
+                    for db_dict in kems_from_db_dicts:
+                        kem_id = db_dict.get('id')
+                        embeddings_for_this_kem = qdrant_embeddings_map.get(kem_id)
+                        kem_protos.append(self._kem_from_db_dict_to_proto(db_dict, embeddings_list=embeddings_for_this_kem))
+
                     return kem_protos, final_next_page_token
 
                 except Exception as e_qdrant_search:

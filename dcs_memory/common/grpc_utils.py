@@ -107,10 +107,10 @@ def retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                 except Exception as e_generic: # Catch other potential exceptions (e.g., network issues before gRPC layer)
                     logger.error(
                         f"A non-gRPC error occurred during call to {func.__name__} (attempt {attempt}/{max_attempts}): {e_generic}",
-                        exc_info=True
+                        exc_info=True # Changed from False to True
                     )
                     if attempt == max_attempts:
-                        raise # Re-raise if this is the last attempt
+                        raise
 
                     # For non-gRPC errors, apply similar delay logic before retrying
                     jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
@@ -190,7 +190,7 @@ def async_retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                     # However, we explicitly catch pybreaker.CircuitBreakerError above.
                     logger.error(
                         f"A non-gRPC error occurred during async call to {async_func.__name__} (attempt {attempt}/{max_attempts}): {e_generic}",
-                        exc_info=True
+                        exc_info=True # Ensure this is True for unexpected errors
                     )
                     if attempt == max_attempts:
                         raise

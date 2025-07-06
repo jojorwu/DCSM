@@ -182,7 +182,13 @@ class BaseServiceConfig(BaseSettings):
     )
 
     def get_log_level_int(self) -> int:
-        return getattr(logging, self.LOG_LEVEL.upper(), logging.INFO)
+        level_str = self.LOG_LEVEL.upper()
+        level_int = getattr(logging, level_str, None)
+        if level_int is None:
+            # Using standard logging here as service logger might not be fully configured yet when this is called.
+            logging.warning(f"Unrecognized LOG_LEVEL '{self.LOG_LEVEL}'. Defaulting to INFO.")
+            return logging.INFO
+        return level_int
 
 
 # Configuration for GLM service

@@ -45,8 +45,16 @@ class DCSMClientSDKConfig(BaseSettings):
     swm_counter_rpc_timeout_s: float = Field(default=5.0, description="Default timeout for SWM Counter RPCs.")
     swm_query_swm_page_size_default: int = Field(default=50, description="Default page size for SWM QuerySWM when loading into LPA.")
 
-
     kps_process_raw_data_timeout_s: float = Field(default=30.0, description="Default timeout for KPS ProcessRawData RPC.")
+
+    # SWM Event Handler Resilience Configuration
+    swm_event_handler_enabled: bool = Field(default=True, description="Master switch to enable/disable the SWM event handler's auto-reconnect feature.")
+    swm_event_max_retries: int = Field(default=5, alias="DCSM_SDK_SWM_EVENT_MAX_RETRIES", description="Maximum number of consecutive retries for SWM event subscription before giving up. -1 for infinite.")
+    swm_event_initial_retry_delay_s: float = Field(default=2.0, alias="DCSM_SDK_SWM_EVENT_INITIAL_RETRY_DELAY_S", description="Initial delay in seconds before the first SWM event re-subscription attempt.")
+    swm_event_max_retry_delay_s: float = Field(default=60.0, alias="DCSM_SDK_SWM_EVENT_MAX_RETRY_DELAY_S", description="Maximum delay in seconds between SWM event re-subscription attempts.")
+    swm_event_backoff_factor: float = Field(default=2.0, alias="DCSM_SDK_SWM_EVENT_BACKOFF_FACTOR", description="Factor by which the retry delay increases for SWM event re-subscription.")
+    swm_event_jitter_fraction: float = Field(default=0.2, alias="DCSM_SDK_SWM_EVENT_JITTER_FRACTION", description="Fraction of current delay to use as random jitter for SWM event re-subscription.")
+    swm_event_stream_normal_termination_reconnect_delay_s: float = Field(default=1.0, alias="DCSM_SDK_SWM_EVENT_STREAM_NORMAL_TERMINATION_RECONNECT_DELAY_S", description="Delay before reconnecting if stream terminates normally but unexpectedly from server.")
 
     model_config = SettingsConfigDict(
         env_prefix='DCSM_SDK_',

@@ -127,7 +127,11 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     f"does not match KPS_DEFAULT_VECTOR_SIZE ({self.config.DEFAULT_VECTOR_SIZE}) from config. "
                     f"This may lead to issues when storing in GLM if GLM's vector DB is configured differently."
                 )
-            self._model_loaded_successfully = True
+                # If dimensions mismatch, consider the model not successfully loaded for KPS's main purpose.
+                self._model_loaded_successfully = False
+                logger.error("KPS Critical: Embedding model vector dimension mismatch. KPS will not be healthy for text processing.")
+            else:
+                self._model_loaded_successfully = True
         except Exception as e:
             logger.error(f"Error loading sentence-transformer model '{self.config.EMBEDDING_MODEL_NAME}': {e}", exc_info=True)
             self.embedding_model = None
