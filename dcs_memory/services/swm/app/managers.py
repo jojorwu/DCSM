@@ -92,7 +92,7 @@ class SubscriptionManager:
 
         async with self.subscribers_lock:
             if subscriber_id in self.subscribers:
-                logger.warning(f"SubscriptionManager: Subscriber ID '{subscriber_id}' already exists. Removing old index entries before re-registering.")
+                logger.info(f"SubscriptionManager: Subscriber ID '{subscriber_id}' already exists. Removing old index entries before re-registering.")
                 # Use original_topics from the existing SubscriberInfoInternal for correct removal
                 self._remove_subscriber_from_indexes_internal(subscriber_id, self.subscribers[subscriber_id].original_topics)
 
@@ -232,6 +232,19 @@ class LockInfoInternalSWM: # Renamed to avoid conflict with GLM's potential Lock
     acquired_at_unix_ms: int
     lease_duration_ms: int
     lease_expires_at_unix_ms: int
+
+@dataclass
+class RenewLockStatus:
+    SUCCESS: str = "SUCCESS"
+    NOT_HELD: str = "NOT_HELD" # Lock not held or lock_id mismatch
+    ERROR: str = "ERROR"
+
+@dataclass
+class RenewLockResult:
+    status: str # From RenewLockStatus
+    new_lease_expires_at_unix_ms: Optional[int] = None
+    message: Optional[str] = None
+
 
 # Lua script for safe lock release
 RELEASE_LOCK_LUA_SCRIPT = """
@@ -465,6 +478,38 @@ class DistributedLockManager:
             )
         else:
             return swm_service_pb2.LockInfo(resource_id=resource_id, is_locked=False)
+
+    async def renew_lock(self, resource_id: str, current_lock_id: str, new_lease_duration_ms: int) -> RenewLockResult:
+        if not self.redis:
+            logger.error("DistributedLockManager: Redis client not available for renew_lock.")
+            return RenewLockResult(status=RenewLockStatus.ERROR, message="Redis unavailable.")
+        if not resource_id or not current_lock_id:
+            logger.warning("DistributedLockManager: renew_lock called with empty resource_id or current_lock_id.")
+            return RenewLockResult(status=RenewLockStatus.ERROR, message="Resource ID and current lock ID are required.")
+        if new_lease_duration_ms <= 0:
+            logger.warning(f"DistributedLockManager: renew_lock called with non-positive new_lease_duration_ms ({new_lease_duration_ms}). Using default from config.")
+            new_lease_duration_ms = getattr(self.config, "REDIS_LOCK_DEFAULT_LEASE_MS", 30000)
+
+
+        lock_key = f"{self.config.REDIS_LOCK_KEY_PREFIX}{resource_id}"
+
+        try:
+            if self._renew_script_sha:
+                result = await self.redis.evalsha(self._renew_script_sha, keys=[lock_key], args=[current_lock_id, new_lease_duration_ms])
+            else: # Fallback to EVAL if SHA not loaded
+                logger.warning("DistributedLockManager: Renew script SHA not available, using EVAL (less efficient).")
+                result = await self.redis.eval(RENEW_LOCK_LUA_SCRIPT, keys=[lock_key], args=[current_lock_id, new_lease_duration_ms])
+
+            if result == 1:
+                new_expires_at_unix_ms = int(time.time() * 1000) + new_lease_duration_ms
+                logger.info(f"LockManager: Lock for '{resource_id}' (lock_id: {current_lock_id}) renewed. New lease: {new_lease_duration_ms}ms. Expires at: {new_expires_at_unix_ms}")
+                return RenewLockResult(status=RenewLockStatus.SUCCESS, new_lease_expires_at_unix_ms=new_expires_at_unix_ms)
+            else: # result == 0, meaning lock not held by current_lock_id or key does not exist
+                logger.warning(f"LockManager: Failed to renew lock for '{resource_id}' (lock_id: {current_lock_id}). Lock not held or lock ID mismatch.")
+                return RenewLockResult(status=RenewLockStatus.NOT_HELD, message="Lock not held or lock ID mismatch.")
+        except Exception as e:
+            logger.error(f"DistributedLockManager: Error renewing lock for '{resource_id}': {e}", exc_info=True)
+            return RenewLockResult(status=RenewLockStatus.ERROR, message=f"Error during lock renewal: {e}")
 
 
 class DistributedCounterManager:
