@@ -2,48 +2,62 @@ import grpc
 import logging
 import random
 import time # For sleep in retry decorator, though decorator itself is now in grpc_utils
-from typing import Optional, List, Tuple, Generator # Added Generator
-import typing # Ensure typing is imported for older Python versions if needed by dataclasses
+from typing import Optional, List, Tuple, Generator
+import typing
 
 from .generated_grpc_code import kem_pb2
 from .generated_grpc_code import glm_service_pb2 # For KEMQuery type hint
 from .generated_grpc_code import swm_service_pb2
 from .generated_grpc_code import swm_service_pb2_grpc
-# from google.protobuf.json_format import MessageToDict, ParseDict # Replaced by utils
 from .proto_utils import kem_dict_to_proto, kem_proto_to_dict
 
-from dcs_memory.common.grpc_utils import retry_grpc_call, DEFAULT_MAX_ATTEMPTS, DEFAULT_INITIAL_DELAY_S, DEFAULT_BACKOFF_FACTOR, DEFAULT_JITTER_FRACTION # RETRYABLE_ERROR_CODES is also there
+from dcs_memory.common.grpc_utils import retry_grpc_call, DEFAULT_MAX_ATTEMPTS, DEFAULT_INITIAL_DELAY_S, DEFAULT_BACKOFF_FACTOR, DEFAULT_JITTER_FRACTION
 
 logger = logging.getLogger(__name__)
 
 class SWMClient:
     def __init__(self,
-                 server_address: str = 'localhost:50052', # Corrected default SWM port
+                 server_address: str = 'localhost:50052',
                  retry_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                  retry_initial_delay_s: float = DEFAULT_INITIAL_DELAY_S,
                  retry_backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
                  retry_jitter_fraction: float = DEFAULT_JITTER_FRACTION,
-                 tls_enabled: bool = False, # Added
-                 tls_ca_cert_path: Optional[str] = None, # Added
-                 tls_client_cert_path: Optional[str] = None, # Added
-                 tls_client_key_path: Optional[str] = None, # Added
-                 tls_server_override_authority: Optional[str] = None): # Added
+                 tls_enabled: bool = False,
+                 tls_ca_cert_path: Optional[str] = None,
+                 tls_client_cert_path: Optional[str] = None,
+                 tls_client_key_path: Optional[str] = None,
+                 tls_server_override_authority: Optional[str] = None,
+                 # Timeouts from config
+                 publish_kem_timeout_s: float = 10.0,
+                 query_swm_timeout_s: float = 10.0,
+                 load_kems_timeout_s: float = 20.0,
+                 lock_rpc_timeout_s: float = 5.0,
+                 counter_rpc_timeout_s: float = 5.0):
         self.server_address = server_address
         self.channel: Optional[grpc.Channel] = None
         self.stub: Optional[swm_service_pb2_grpc.SharedWorkingMemoryServiceStub] = None
 
+        # Retry policy
         self.retry_max_attempts = retry_max_attempts
         self.retry_initial_delay_s = retry_initial_delay_s
         self.retry_backoff_factor = retry_backoff_factor
         self.retry_jitter_fraction = retry_jitter_fraction
 
+        # TLS settings
         self.tls_enabled = tls_enabled
         self.tls_ca_cert_path = tls_ca_cert_path
         self.tls_client_cert_path = tls_client_cert_path
         self.tls_client_key_path = tls_client_key_path
         self.tls_server_override_authority = tls_server_override_authority
 
-    def _reset_connection_state(self): # Helper
+        # RPC Timeouts
+        self.publish_kem_timeout_s = publish_kem_timeout_s
+        self.query_swm_timeout_s = query_swm_timeout_s
+        self.load_kems_timeout_s = load_kems_timeout_s
+        self.lock_rpc_timeout_s = lock_rpc_timeout_s
+        self.counter_rpc_timeout_s = counter_rpc_timeout_s
+
+    def _reset_connection_state(self):
         self.channel = None
         self.stub = None
 
@@ -90,64 +104,65 @@ class SWMClient:
     def _ensure_connected(self):
         if not self.stub:
             self.connect()
-        if not self.stub: # If still no stub after connect(), an error occurred
+        if not self.stub:
             raise ConnectionError(f"SWMClient: Failed to establish connection with SWM service at {self.server_address}")
 
-    # _kem_dict_to_proto and _kem_proto_to_dict are now imported from proto_utils
-
     @retry_grpc_call
-    def publish_kem_to_swm(self, kem_data: dict, persist_to_glm_if_new_or_updated: bool = False, timeout: int = 10) -> Optional[dict]:
+    def publish_kem_to_swm(self, kem_data: dict, persist_to_glm_if_new_or_updated: bool = False, timeout: Optional[float] = None) -> Optional[dict]:
         self._ensure_connected()
+        actual_timeout = timeout if timeout is not None else self.publish_kem_timeout_s
         kem_proto = kem_dict_to_proto(kem_data)
         request = swm_service_pb2.PublishKEMToSWMRequest(
             kem_to_publish=kem_proto,
             persist_to_glm_if_new_or_updated=persist_to_glm_if_new_or_updated
         )
-        logger.debug(f"SWMClient: PublishKEMToSWM request: {request}")
-        response: swm_service_pb2.PublishKEMToSWMResponse = self.stub.PublishKEMToSWM(request, timeout=timeout) # type: ignore
+        logger.debug(f"SWMClient: PublishKEMToSWM request: {request} with timeout: {actual_timeout}s")
+        response: swm_service_pb2.PublishKEMToSWMResponse = self.stub.PublishKEMToSWM(request, timeout=actual_timeout) # type: ignore
 
         if response and response.published_to_swm:
-            logger.info(f"SWMClient: KEM ID '{response.kem_id}' published to SWM. Status: {response.status_message}")
+            logger.info(f"SWMClient: KEM ID '{response.kem_id_swm}' published to SWM. Status: {response.status_message}")
             return {
-                "kem_id": response.kem_id,
+                "kem_id": response.kem_id_swm,
                 "published_to_swm": response.published_to_swm,
-                "persistence_triggered_to_glm": response.persistence_triggered_to_glm,
+                "queued_for_glm_persistence": response.queued_for_glm_persistence,
                 "status_message": response.status_message
             }
         elif response:
-            logger.warning(f"SWMClient: Failed to publish KEM to SWM. kem_id='{response.kem_id}', msg='{response.status_message}'")
-            return { # Return failure status
-                "kem_id": response.kem_id,
+            logger.warning(f"SWMClient: Failed to publish KEM to SWM. kem_id='{response.kem_id_swm}', msg='{response.status_message}'")
+            return {
+                "kem_id": response.kem_id_swm,
                 "published_to_swm": False,
-                "persistence_triggered_to_glm": response.persistence_triggered_to_glm,
+                "queued_for_glm_persistence": response.queued_for_glm_persistence,
                 "status_message": response.status_message
             }
-        return None # Should not happen if server behaves, implies RPC error handled by decorator
+        return None
 
     @retry_grpc_call
     def query_swm(self, kem_query: glm_service_pb2.KEMQuery,
-                  page_size: int = 0, page_token: str = "", timeout: int = 10) -> Tuple[Optional[List[dict]], Optional[str]]:
+                  page_size: int = 0, page_token: str = "", timeout: Optional[float] = None) -> Tuple[Optional[List[dict]], Optional[str]]:
         self._ensure_connected()
+        actual_timeout = timeout if timeout is not None else self.query_swm_timeout_s
         request = swm_service_pb2.QuerySWMRequest(
             query=kem_query,
-            page_size=page_size, # Server uses its default if 0
+            page_size=page_size,
             page_token=page_token
         )
-        logger.debug(f"SWMClient: QuerySWM request: {request}")
-        response: swm_service_pb2.QuerySWMResponse = self.stub.QuerySWM(request, timeout=timeout) # type: ignore
+        logger.debug(f"SWMClient: QuerySWM request: {request} with timeout: {actual_timeout}s")
+        response: swm_service_pb2.QuerySWMResponse = self.stub.QuerySWM(request, timeout=actual_timeout) # type: ignore
 
         if response:
             kems_as_dicts = [kem_proto_to_dict(kem) for kem in response.kems]
             logger.info(f"SWMClient: QuerySWM returned {len(kems_as_dicts)} KEMs. Next page token: '{response.next_page_token}'.")
             return kems_as_dicts, response.next_page_token
-        return None, None # Should be handled by retry decorator for RpcError
+        return None, None
 
     @retry_grpc_call
-    def load_kems_from_glm(self, query_for_glm: glm_service_pb2.KEMQuery, timeout: int = 20) -> Optional[dict]:
+    def load_kems_from_glm(self, query_for_glm: glm_service_pb2.KEMQuery, timeout: Optional[float] = None) -> Optional[dict]:
         self._ensure_connected()
+        actual_timeout = timeout if timeout is not None else self.load_kems_timeout_s
         request = swm_service_pb2.LoadKEMsFromGLMRequest(query_for_glm=query_for_glm)
-        logger.debug(f"SWMClient: LoadKEMsFromGLM request: {request}")
-        response: swm_service_pb2.LoadKEMsFromGLMResponse = self.stub.LoadKEMsFromGLM(request, timeout=timeout) # type: ignore
+        logger.debug(f"SWMClient: LoadKEMsFromGLM request: {request} with timeout: {actual_timeout}s")
+        response: swm_service_pb2.LoadKEMsFromGLMResponse = self.stub.LoadKEMsFromGLM(request, timeout=actual_timeout) # type: ignore
 
         if response:
             logger.info(f"SWMClient: LoadKEMsFromGLM response: Queried GLM: {response.kems_queried_in_glm_count}, Loaded to SWM: {response.kems_loaded_to_swm_count}, IDs: {list(response.loaded_kem_ids)}. Msg: {response.status_message}")
@@ -196,14 +211,14 @@ class SWMClient:
             logger.error(f"SWMClient: Unexpected error initiating SWM event subscription: {e_init}", exc_info=True)
             return None
 
-    # --- Lock methods ---
     @retry_grpc_call
-    def acquire_lock(self, resource_id: str, agent_id: str, timeout_ms: int = 0, lease_duration_ms: int = 0, rpc_timeout: int = 5) -> Optional[swm_service_pb2.AcquireLockResponse]:
+    def acquire_lock(self, resource_id: str, agent_id: str, timeout_ms: int = 0, lease_duration_ms: int = 0, rpc_timeout: Optional[float] = None) -> Optional[swm_service_pb2.AcquireLockResponse]:
         self._ensure_connected()
+        actual_timeout = rpc_timeout if rpc_timeout is not None else self.lock_rpc_timeout_s
         request = swm_service_pb2.AcquireLockRequest(resource_id=resource_id, agent_id=agent_id, timeout_ms=timeout_ms, lease_duration_ms=lease_duration_ms)
-        logger.debug(f"SWMClient: AcquireLock request: {request}")
+        logger.debug(f"SWMClient: AcquireLock request: {request} with timeout: {actual_timeout}s")
         try:
-            response = self.stub.AcquireLock(request, timeout=rpc_timeout) # type: ignore
+            response = self.stub.AcquireLock(request, timeout=actual_timeout) # type: ignore
             logger.info(f"SWMClient: AcquireLock for resource '{resource_id}' by agent '{agent_id}' status: {swm_service_pb2.LockStatusValue.Name(response.status)}. Lock ID: {response.lock_id}")
             return response
         except grpc.RpcError as e:
@@ -214,12 +229,13 @@ class SWMClient:
             return swm_service_pb2.AcquireLockResponse(resource_id=resource_id, agent_id=agent_id, status=swm_service_pb2.LockStatusValue.ERROR, message=f"Unexpected SDK error: {e_acq}")
 
     @retry_grpc_call
-    def release_lock(self, resource_id: str, agent_id: str, lock_id: Optional[str] = None, rpc_timeout: int = 5) -> Optional[swm_service_pb2.ReleaseLockResponse]:
+    def release_lock(self, resource_id: str, agent_id: str, lock_id: Optional[str] = None, rpc_timeout: Optional[float] = None) -> Optional[swm_service_pb2.ReleaseLockResponse]:
         self._ensure_connected()
+        actual_timeout = rpc_timeout if rpc_timeout is not None else self.lock_rpc_timeout_s
         request = swm_service_pb2.ReleaseLockRequest(resource_id=resource_id, agent_id=agent_id, lock_id=lock_id if lock_id else "")
-        logger.debug(f"SWMClient: ReleaseLock request: {request}")
+        logger.debug(f"SWMClient: ReleaseLock request: {request} with timeout: {actual_timeout}s")
         try:
-            response = self.stub.ReleaseLock(request, timeout=rpc_timeout) # type: ignore
+            response = self.stub.ReleaseLock(request, timeout=actual_timeout) # type: ignore
             logger.info(f"SWMClient: ReleaseLock for resource '{resource_id}' by agent '{agent_id}' status: {swm_service_pb2.ReleaseStatusValue.Name(response.status)}.")
             return response
         except grpc.RpcError as e:
@@ -230,12 +246,13 @@ class SWMClient:
             return swm_service_pb2.ReleaseLockResponse(resource_id=resource_id, status=swm_service_pb2.ReleaseStatusValue.ERROR_RELEASING, message=f"Unexpected SDK error: {e_rel}")
 
     @retry_grpc_call
-    def get_lock_info(self, resource_id: str, rpc_timeout: int = 5) -> Optional[swm_service_pb2.LockInfo]:
+    def get_lock_info(self, resource_id: str, rpc_timeout: Optional[float] = None) -> Optional[swm_service_pb2.LockInfo]:
         self._ensure_connected()
+        actual_timeout = rpc_timeout if rpc_timeout is not None else self.lock_rpc_timeout_s
         request = swm_service_pb2.GetLockInfoRequest(resource_id=resource_id)
-        logger.debug(f"SWMClient: GetLockInfo request for resource '{resource_id}'")
+        logger.debug(f"SWMClient: GetLockInfo request for resource '{resource_id}' with timeout: {actual_timeout}s")
         try:
-            response = self.stub.GetLockInfo(request, timeout=rpc_timeout) # type: ignore
+            response = self.stub.GetLockInfo(request, timeout=actual_timeout) # type: ignore
             logger.info(f"SWMClient: GetLockInfo for resource '{resource_id}': is_locked={response.is_locked}, holder='{response.current_holder_agent_id}'.")
             return response
         except grpc.RpcError as e:
@@ -245,14 +262,14 @@ class SWMClient:
             logger.error(f"SWMClient: Unexpected error on GetLockInfo for resource '{resource_id}': {e_info}", exc_info=True)
             return None
 
-    # --- Distributed Counter methods ---
     @retry_grpc_call
-    def increment_counter(self, counter_id: str, increment_by: int = 1, rpc_timeout: int = 5) -> Optional[swm_service_pb2.CounterValueResponse]:
+    def increment_counter(self, counter_id: str, increment_by: int = 1, rpc_timeout: Optional[float] = None) -> Optional[swm_service_pb2.CounterValueResponse]:
         self._ensure_connected()
+        actual_timeout = rpc_timeout if rpc_timeout is not None else self.counter_rpc_timeout_s
         request = swm_service_pb2.IncrementCounterRequest(counter_id=counter_id, increment_by=increment_by)
-        logger.debug(f"SWMClient: IncrementCounter request: {request}")
+        logger.debug(f"SWMClient: IncrementCounter request: {request} with timeout: {actual_timeout}s")
         try:
-            response = self.stub.IncrementCounter(request, timeout=rpc_timeout) # type: ignore
+            response = self.stub.IncrementCounter(request, timeout=actual_timeout) # type: ignore
             logger.info(f"SWMClient: IncrementCounter for counter_id '{counter_id}' new value: {response.current_value}")
             return response
         except grpc.RpcError as e:
@@ -263,12 +280,13 @@ class SWMClient:
             return swm_service_pb2.CounterValueResponse(counter_id=counter_id, current_value=0, status_message=f"Unexpected SDK error: {e_inc}")
 
     @retry_grpc_call
-    def get_counter(self, counter_id: str, rpc_timeout: int = 5) -> Optional[swm_service_pb2.CounterValueResponse]:
+    def get_counter(self, counter_id: str, rpc_timeout: Optional[float] = None) -> Optional[swm_service_pb2.CounterValueResponse]:
         self._ensure_connected()
+        actual_timeout = rpc_timeout if rpc_timeout is not None else self.counter_rpc_timeout_s
         request = swm_service_pb2.DistributedCounterRequest(counter_id=counter_id)
-        logger.debug(f"SWMClient: GetCounter request for counter_id '{counter_id}'")
+        logger.debug(f"SWMClient: GetCounter request for counter_id '{counter_id}' with timeout: {actual_timeout}s")
         try:
-            response = self.stub.GetCounter(request, timeout=rpc_timeout) # type: ignore
+            response = self.stub.GetCounter(request, timeout=actual_timeout) # type: ignore
             logger.info(f"SWMClient: GetCounter for counter_id '{counter_id}' value: {response.current_value}")
             return response
         except grpc.RpcError as e:
@@ -302,20 +320,25 @@ if __name__ == '__main__':
         "embeddings": [i*0.01 for i in range(384)]
     }
     try:
-        with SWMClient(server_address='localhost:50053') as client:
+        # Example: Pass specific timeouts, or rely on defaults from config if SWMClient is init'd via AgentSDK with a populated DCSMClientSDKConfig
+        # For direct SWMClient usage like this, it uses its __init__ defaults unless overridden here.
+        with SWMClient(server_address='localhost:50053', publish_kem_timeout_s=12.0) as client: # Example override
             logger.info("\n--- Publishing KEM to SWM ---")
-            publish_result = client.publish_kem_to_swm(example_kem_data, persist_to_glm_if_new_or_updated=True)
+            publish_result = client.publish_kem_to_swm(example_kem_data, persist_to_glm_if_new_or_updated=True) # Uses client.publish_kem_timeout_s (12.0s)
+            # publish_result = client.publish_kem_to_swm(example_kem_data, persist_to_glm_if_new_or_updated=True, timeout=8.0) # Explicit override to 8.0s
+
             if publish_result and publish_result.get("published_to_swm"):
-                logger.info(f"KEM published: ID='{publish_result.get('kem_id')}', GLM Status: {publish_result.get('persistence_triggered_to_glm')}")
+                logger.info(f"KEM published: ID='{publish_result.get('kem_id')}', GLM Status: {publish_result.get('queued_for_glm_persistence')}")
                 published_kem_id = publish_result.get('kem_id')
                 if published_kem_id:
                     logger.info(f"\n--- Querying KEM ID '{published_kem_id}' from SWM ---")
                     query_by_id = glm_service_pb2.KEMQuery()
                     query_by_id.ids.extend([published_kem_id])
-                    kems_tuple_id, _ = client.query_swm(kem_query=query_by_id, page_size=1)
+                    kems_tuple_id, _ = client.query_swm(kem_query=query_by_id, page_size=1) # Uses client.query_swm_timeout_s
                     if kems_tuple_id and kems_tuple_id[0]: logger.info(f"Found KEM: {kems_tuple_id[0]}")
                     else: logger.warning(f"KEM ID '{published_kem_id}' not found in SWM after publishing.")
             else: logger.error(f"Failed to publish KEM. Result: {publish_result}")
+
             logger.info("\n--- Querying KEMs from SWM by metadata {'source': 'swm_client_example'} ---")
             query_by_meta = glm_service_pb2.KEMQuery()
             query_by_meta.metadata_filters["source"] = "swm_client_example"
@@ -324,12 +347,14 @@ if __name__ == '__main__':
                 logger.info(f"Found {len(kems_tuple_meta)} KEMs by metadata:")
                 for k_dict in kems_tuple_meta: logger.info(f"  ID: {k_dict.get('id')}, Content: {k_dict.get('content', '')[:30]}...")
             else: logger.info("No KEMs found by metadata.")
+
             logger.info("\n--- Requesting to load KEMs from GLM to SWM (by metadata {'topic': 'AI'}) ---")
             load_query = glm_service_pb2.KEMQuery()
-            load_query.metadata_filters["topic"] = "AI"
-            load_result = client.load_kems_from_glm(query_for_glm=load_query)
+            load_query.metadata_filters["topic"] = "AI" # Example filter
+            load_result = client.load_kems_from_glm(query_for_glm=load_query) # Uses client.load_kems_timeout_s
             if load_result: logger.info(f"Result of loading from GLM: {load_result}")
             else: logger.error("Failed to execute request to load from GLM.")
+
     except ConnectionError as e: logger.error(f"CONNECTION ERROR: {e}")
     except grpc.RpcError as e: logger.error(f"gRPC ERROR: code={e.code()}, details={e.details()}")
     except Exception as e: logger.error(f"UNEXPECTED ERROR: {e}", exc_info=True)

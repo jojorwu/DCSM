@@ -101,7 +101,7 @@ class GLMClient:
         self._ensure_connected()
         proto_kems = [kem_dict_to_proto(data) for data in kems_data]
         request = glm_service_pb2.BatchStoreKEMsRequest(kems=proto_kems)
-        response = self.stub.BatchStoreKEMs(request, timeout=20) # type: ignore
+        response = self.stub.BatchStoreKEMs(request, timeout=self.batch_store_kems_timeout_s) # type: ignore
         successfully_stored_kems_as_dicts = [kem_proto_to_dict(k) for k in response.successfully_stored_kems]
         return successfully_stored_kems_as_dicts, list(response.failed_kem_references), response.overall_error_message
 
@@ -121,7 +121,7 @@ class GLMClient:
         if ids_filter:
             query_proto.ids.extend(ids_filter)
         request = glm_service_pb2.RetrieveKEMsRequest(query=query_proto, page_size=page_size, page_token=page_token if page_token else "")
-        response = self.stub.RetrieveKEMs(request, timeout=10) # type: ignore
+        response = self.stub.RetrieveKEMs(request, timeout=self.retrieve_kems_timeout_s) # type: ignore
         kems_as_dicts = [kem_proto_to_dict(kem) for kem in response.kems]
         return kems_as_dicts, response.next_page_token
 

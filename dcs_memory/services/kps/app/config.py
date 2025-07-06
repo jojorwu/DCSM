@@ -33,6 +33,7 @@ class KPSConfig(BaseServiceConfig):
     KPS_IDEMPOTENCY_CHECK_ENABLED: bool = Field(default=True, description="Enable idempotency checks for ProcessRawData based on data_id.")
     KPS_IDEMPOTENCY_METADATA_KEY: str = Field(default="source_data_id", description="Metadata key used to store/check data_id for idempotency.")
     KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S: float = Field(default=5.0, description="Timeout in seconds for the GLM query during idempotency check.")
+    KPS_IDEMPOTENCY_FAIL_CLOSED: bool = Field(default=False, description="If True, KPS will abort processing if the idempotency check cannot be reliably performed due to GLM unavailability.")
 
     # KPS Health Check Settings
     HEALTH_CHECK_GLM_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for KPS health checking GLM.")

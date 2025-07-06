@@ -458,8 +458,6 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             retrieve_request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1)
 
             try:
-                # timeout_check = getattr(self.config, "KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S", self.config.GLM_STORE_KEM_TIMEOUT_S)
-                # Directly use the new config field after adding it to KPSConfig
                 timeout_check = self.config.KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S
                 response = self._glm_retrieve_kems_with_retry(retrieve_request, timeout=timeout_check)
                 if response and response.kems:
@@ -467,19 +465,25 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     logger.info(f"KPS: Idempotency check positive. Data_id '{request.data_id}' already processed as KEM ID '{existing_kem_id}'.")
                     return kps_service_pb2.ProcessRawDataResponse(
                         kem_id=existing_kem_id,
-                        success=True, # Still success, but indicates pre-existence
+                        success=True,
                         status_message=f"Data already processed (KEM ID: {existing_kem_id})."
                     )
             except pybreaker.CircuitBreakerError as e_cb:
-                 logger.warning(f"KPS: Idempotency check skipped due to GLM circuit breaker open: {e_cb}. Proceeding with processing (StoreKEM will likely also fail if CB remains open).")
-                 # Fail-open for idempotency check if CB is open for GLM.
+                logger.warning(f"KPS: Idempotency check failed due to GLM circuit breaker open: {e_cb}.")
+                if self.config.KPS_IDEMPOTENCY_FAIL_CLOSED:
+                    context.abort(grpc.StatusCode.UNAVAILABLE, "Idempotency check failed: GLM circuit breaker open.")
+                # else: proceed with processing (fail-open)
             except grpc.RpcError as e_rpc:
-                # If GLM is UNAVAILABLE or DEADLINE_EXCEEDED during check, log and proceed (fail-open for check).
-                # Other GLM errors during check might indicate issues but we still proceed.
-                logger.warning(f"KPS: Idempotency check GLM query failed (Code: {e_rpc.code()}): {e_rpc.details()}. Proceeding with processing.", exc_info=False) # Log less verbosely
+                logger.warning(f"KPS: Idempotency check GLM query failed (Code: {e_rpc.code()}): {e_rpc.details()}.")
+                if self.config.KPS_IDEMPOTENCY_FAIL_CLOSED and \
+                   e_rpc.code() in [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED]:
+                    context.abort(e_rpc.code(), f"Idempotency check failed: GLM RPC error ({e_rpc.code()}).")
+                # else: proceed with processing (fail-open for other RPC errors or if fail_closed is False)
             except Exception as e_generic:
-                logger.warning(f"KPS: Idempotency check failed with unexpected error: {e_generic}. Proceeding with processing.", exc_info=False)
-
+                logger.warning(f"KPS: Idempotency check failed with unexpected error: {e_generic}.")
+                if self.config.KPS_IDEMPOTENCY_FAIL_CLOSED:
+                    context.abort(grpc.StatusCode.INTERNAL, f"Idempotency check failed: Unexpected error ({e_generic}).")
+                # else: proceed with processing (fail-open)
 
         try:
             content_to_embed = ""
