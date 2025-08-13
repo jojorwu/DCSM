@@ -5,7 +5,7 @@ import logging
 from typing import List, Tuple, Optional, Dict, Any
 import base64
 
-from qdrant_client import QdrantClient, models as qdrant_models
+from qdrant_client import models as qdrant_models, AsyncQdrantClient
 from qdrant_client.http.models import PointStruct
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.protobuf.json_format import ParseDict
@@ -20,7 +20,6 @@ import os
 logger = logging.getLogger(__name__)
 
 def get_external_repository_connector(config: ExternalDataSourceConfig, glm_config: GLMConfig) -> Optional[BaseExternalRepository]:
-    # This remains synchronous as it's part of the setup logic.
     if config.type == "postgresql":
         from .postgres_connector import PostgresExternalRepository
         try:
@@ -39,26 +38,24 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         self.external_repos: Dict[str, BaseExternalRepository] = {}
 
     async def initialize(self):
-        """Asynchronously initializes the repository and its dependencies."""
         await self.sqlite_repo.initialize()
         logger.info("DefaultGLMRepository: SqliteKemRepository initialized.")
 
         if self.config.QDRANT_HOST:
             try:
-                qdrant_client = await asyncio.to_thread(
-                    QdrantClient,
+                qdrant_client = AsyncQdrantClient(
                     host=self.config.QDRANT_HOST,
                     port=self.config.QDRANT_PORT,
                     timeout=self.config.QDRANT_CLIENT_TIMEOUT_S
                 )
-                await asyncio.to_thread(qdrant_client.get_collections)
+                await qdrant_client.get_collections()
                 self.qdrant_repo = QdrantKemRepository(
                     qdrant_client=qdrant_client,
                     collection_name=self.config.QDRANT_COLLECTION,
                     default_vector_size=self.config.DEFAULT_VECTOR_SIZE,
                     default_distance_metric=self.config.QDRANT_DEFAULT_DISTANCE_METRIC
                 )
-                await asyncio.to_thread(self.qdrant_repo.ensure_collection)
+                await self.qdrant_repo.ensure_collection()
                 logger.info("DefaultGLMRepository: QdrantKemRepository initialized.")
             except Exception as e:
                 logger.error(f"Qdrant client/repository initialization failed: {e}", exc_info=True)
@@ -128,7 +125,7 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
                 qdrant_payload["updated_at_ts"] = kem_to_store.updated_at.seconds
             try:
                 point = PointStruct(id=kem_id, vector=list(kem_to_store.embeddings), payload=qdrant_payload)
-                await asyncio.to_thread(self.qdrant_repo.upsert_point, point)
+                await self.qdrant_repo.upsert_point(point)
                 qdrant_op_done = True
             except Exception as e_qdrant:
                 raise StorageError(f"Qdrant processing error: {e_qdrant}") from e_qdrant
@@ -144,7 +141,7 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         except Exception as e_sqlite:
             if qdrant_op_done and self.qdrant_repo:
                 try:
-                    await asyncio.to_thread(self.qdrant_repo.delete_points_by_ids, [kem_id])
+                    await self.qdrant_repo.delete_points_by_ids([kem_id])
                 except Exception as e_qdrant_rollback:
                     logger.critical(f"CRITICAL - Failed Qdrant rollback for KEM ID '{kem_id}': {e_qdrant_rollback}")
             raise StorageError(f"SQLite processing error: {e_sqlite}") from e_sqlite
@@ -186,7 +183,7 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
             return False
         if self.qdrant_repo:
             try:
-                await asyncio.to_thread(self.qdrant_repo.delete_points_by_ids, [kem_id])
+                await self.qdrant_repo.delete_points_by_ids([kem_id])
             except Exception as e_qdrant:
                 logger.error(f"Failed to delete KEM '{kem_id}' from Qdrant: {e_qdrant}", exc_info=True)
         return True
@@ -223,7 +220,7 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
             sqlite_batch_data = [{"id": k.id, "content_type": k.content_type, "content": k.content, "metadata_json": json.dumps(dict(k.metadata)), "created_at_iso": k.created_at.ToDatetime().isoformat(timespec='microseconds').replace('+00:00', ''), "updated_at_iso": k.updated_at.ToDatetime().isoformat(timespec='microseconds').replace('+00:00', '')} for k in processed_kems]
             await self.sqlite_repo.batch_store_or_replace_kems(sqlite_batch_data)
             if self.qdrant_repo and qdrant_points:
-                await asyncio.to_thread(self.qdrant_repo.upsert_points_batch, qdrant_points)
+                await self.qdrant_repo.upsert_points_batch(qdrant_points)
             return processed_kems, []
         except Exception as e:
             logger.error(f"batch_store_kems: An error occurred: {e}", exc_info=True)

@@ -1,7 +1,7 @@
 import aiosqlite
 import logging
 from typing import List, Dict, Optional, Any, Tuple
-from qdrant_client import QdrantClient, models
+from qdrant_client import QdrantClient, models, AsyncQdrantClient
 from qdrant_client.http.models import PointStruct
 
 from dcs_memory.services.glm.app.config import GLMConfig
@@ -199,10 +199,8 @@ class SqliteKemRepository:
             logger.error(f"Repository: SQLite error during batch store/replace: {e_batch}", exc_info=True)
             raise
 
-# The QdrantKemRepository remains synchronous as the qdrant-client library is synchronous.
-# It will be called using asyncio.to_thread from the DefaultGLMRepository.
 class QdrantKemRepository:
-    def __init__(self, qdrant_client: QdrantClient, collection_name: str, default_vector_size: int, default_distance_metric: str):
+    def __init__(self, qdrant_client: AsyncQdrantClient, collection_name: str, default_vector_size: int, default_distance_metric: str):
         self.client = qdrant_client
         self.collection_name = collection_name
         self.default_vector_size = default_vector_size
@@ -219,15 +217,15 @@ class QdrantKemRepository:
             logger.warning(f"Unsupported Qdrant distance metric '{self.default_distance_metric_str}'. Defaulting to COSINE.")
             return models.Distance.COSINE
 
-    def ensure_collection(self):
+    async def ensure_collection(self):
         logger.info(f"Repository: Ensuring Qdrant collection '{self.collection_name}' exists.")
         try:
-            self.client.get_collection(collection_name=self.collection_name)
+            await self.client.get_collection(collection_name=self.collection_name)
         except Exception as e:
             is_not_found_error = ("not found" in str(e).lower() or "404" in str(e).lower() or (hasattr(e, 'status_code') and e.status_code == 404))
             if is_not_found_error:
                 distance_metric = self._get_qdrant_distance_metric()
-                self.client.recreate_collection(
+                await self.client.recreate_collection(
                     collection_name=self.collection_name,
                     vectors_config=models.VectorParams(size=self.default_vector_size, distance=distance_metric)
                 )
@@ -235,25 +233,24 @@ class QdrantKemRepository:
                 logger.error(f"Repository: Error checking/creating Qdrant collection '{self.collection_name}': {e}", exc_info=True)
                 raise
 
-    def upsert_point(self, point: models.PointStruct):
-        self.client.upsert(collection_name=self.collection_name, points=[point], wait=True)
+    async def upsert_point(self, point: models.PointStruct):
+        await self.client.upsert(collection_name=self.collection_name, points=[point], wait=True)
 
-    def upsert_points_batch(self, points: List[models.PointStruct]):
+    async def upsert_points_batch(self, points: List[models.PointStruct]):
         if not points:
             return
-        self.client.upsert(collection_name=self.collection_name, points=points, wait=True)
+        await self.client.upsert(collection_name=self.collection_name, points=points, wait=True)
 
-    def delete_points_by_ids(self, kem_ids: List[str]):
+    async def delete_points_by_ids(self, kem_ids: List[str]):
         if not kem_ids:
             return
-        self.client.delete_points(
+        await self.client.delete(
             collection_name=self.collection_name,
             points_selector=models.PointIdsList(points=kem_ids),
-            wait=True
         )
 
-    def search_points(self, query_vector: List[float], query_filter: Optional[models.Filter], limit: int, offset: int = 0, with_vectors: bool = False) -> List[models.ScoredPoint]:
-        return self.client.search(
+    async def search_points(self, query_vector: List[float], query_filter: Optional[models.Filter], limit: int, offset: int = 0, with_vectors: bool = False) -> List[models.ScoredPoint]:
+        return await self.client.search(
             collection_name=self.collection_name,
             query_vector=query_vector,
             query_filter=query_filter,
@@ -263,10 +260,10 @@ class QdrantKemRepository:
             with_vectors=with_vectors
         )
 
-    def retrieve_points_by_ids(self, kem_ids: List[str], with_vectors: bool = False) -> List[models.PointStruct]:
+    async def retrieve_points_by_ids(self, kem_ids: List[str], with_vectors: bool = False) -> List[models.PointStruct]:
         if not kem_ids:
             return []
-        return self.client.retrieve(
+        return await self.client.retrieve(
             collection_name=self.collection_name,
             ids=kem_ids,
             with_payload=True,
