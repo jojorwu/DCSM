@@ -212,6 +212,9 @@ class GLMConfig(BaseServiceConfig):
     # Let's add it for explicit control if desired, though the implementation might just use main client.
     HEALTH_CHECK_QDRANT_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for Qdrant health check operation.")
 
+    # Address for KPS, used by IndexExternalDataSource
+    KPS_SERVICE_ADDRESS: Optional[str] = Field(default=None, description="Address of the KPS service GLM connects to for indexing.")
+
 
     # GRPC_SERVER_MAX_WORKERS can be inherited from Base or overridden here if GLM needs specific value
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited or overridden

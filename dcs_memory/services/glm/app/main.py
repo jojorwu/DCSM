@@ -26,7 +26,6 @@ from pythonjsonlogger import jsonlogger
 config = GLMConfig()
 
 def setup_logging(log_config: GLMConfig):
-    # This function should be implemented properly, but is omitted for brevity in this example.
     logging.basicConfig(level=log_config.get_log_level_int(), format=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
 
 setup_logging(config)
@@ -100,15 +99,63 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
             await context.abort(grpc.StatusCode.INTERNAL, f"An unexpected error occurred: {e}")
 
     async def IndexExternalDataSource(self, request: glm_service_pb2.IndexExternalDataSourceRequest, context: grpc.aio.ServicerContext) -> glm_service_pb2.IndexExternalDataSourceResponse:
-        # This is a placeholder implementation. A real implementation would be more complex.
-        logger.info(f"IndexExternalDataSource called for: {request.data_source_name}")
+        data_source_name = request.data_source_name
+        logger.info(f"IndexExternalDataSource called for: {data_source_name}")
+
         if not self.kps_client_stub:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "KPS client not available.")
 
+        external_repo = self.storage_repository.external_repos.get(data_source_name)
+        if not external_repo:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"External data source '{data_source_name}' not found.")
+
+        items_processed_total = 0
+        items_failed_total = 0
+        page_token = None
+        has_more = True
+        kps_batch_size = 50
+
+        while has_more:
+            try:
+                kems, next_page_token = await external_repo.retrieve_mapped_kems(
+                    internal_query=glm_service_pb2.KEMQuery(),
+                    page_size=kps_batch_size,
+                    page_token=page_token
+                )
+                if not kems:
+                    has_more = False
+                    continue
+
+                kps_payloads = []
+                for kem in kems:
+                    try:
+                        content_str = kem.content.decode('utf-8')
+                        kps_payloads.append(kps_service_pb2.MemoryContent(kem_uri=f"kem:external:{data_source_name}:{kem.id}", content=content_str))
+                    except UnicodeDecodeError:
+                        items_failed_total += 1
+
+                if kps_payloads:
+                    kps_request = kps_service_pb2.BatchAddMemoriesRequest(memories=kps_payloads)
+                    kps_response = await self.kps_client_stub.BatchAddMemories(kps_request, timeout=30)
+
+                    processed_count = len(kps_payloads) - len(kps_response.failed_kem_references)
+                    items_processed_total += processed_count
+                    items_failed_total += len(kps_response.failed_kem_references)
+
+                page_token = next_page_token
+                if not page_token:
+                    has_more = False
+
+            except Exception as e:
+                logger.error(f"Error during external source indexing for '{data_source_name}': {e}", exc_info=True)
+                await context.abort(grpc.StatusCode.INTERNAL, f"Error indexing source '{data_source_name}': {e}")
+
+        status_msg = f"Completed indexing for '{data_source_name}'. Processed: {items_processed_total}, Failed: {items_failed_total}."
+        logger.info(status_msg)
         return glm_service_pb2.IndexExternalDataSourceResponse(
-            status_message=f"Indexing for '{request.data_source_name}' is not fully implemented.",
-            items_processed=0,
-            items_failed=0
+            status_message=status_msg,
+            items_processed=items_processed_total,
+            items_failed=items_failed_total
         )
 
 async def serve():
