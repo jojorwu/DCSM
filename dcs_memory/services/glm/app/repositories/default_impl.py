@@ -13,7 +13,8 @@ from google.protobuf.json_format import ParseDict
 from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
 from dcs_memory.services.glm.app.config import GLMConfig, ExternalDataSourceConfig
 from dcs_memory.services.glm.app.repositories.base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
-from dcs_memory.services.glm.app.sqlite_repo import SqliteKemRepository, QdrantKemRepository
+from dcs_memory.services.glm.app.sqlite_repository import SqliteKemRepository
+from dcs_memory.services.glm.app.qdrant_repository import QdrantKemRepository
 from dcs_memory.services.glm.app.repositories.external_base import BaseExternalRepository
 import os
 

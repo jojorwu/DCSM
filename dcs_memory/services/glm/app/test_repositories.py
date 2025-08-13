@@ -4,7 +4,7 @@ import asyncio
 import uuid
 import logging
 from dcs_memory.services.glm.app.repositories.default_impl import DefaultGLMRepository, KemNotFoundError
-from dcs_memory.services.glm.app.sqlite_repo import SqliteKemRepository
+from dcs_memory.services.glm.app.sqlite_repository import SqliteKemRepository
 from dcs_memory.services.glm.app.config import GLMConfig
 from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
 
