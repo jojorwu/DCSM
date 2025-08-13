@@ -36,9 +36,9 @@ async def in_memory_repo() -> DefaultGLMRepository:
     )
     # The app_dir is not used when DB_FILENAME is an in-memory URI
     repo = DefaultGLMRepository(config=config, app_dir="/tmp")
+    await repo.initialize()
     yield repo
-    # The connection is held by the repo, and will be closed when the repo is garbage collected.
-    # For in-memory DBs, this effectively drops the database.
+    await repo.sqlite_repo.close()
 
 async def test_fts_search_finds_kem_by_content(in_memory_repo: DefaultGLMRepository):
     """
@@ -141,9 +141,9 @@ async def test_batch_store_kems_stores_multiple_kems(in_memory_repo: DefaultGLMR
     assert {k.id for k in successful_kems} == {k.id for k in kems_to_store}
 
     # Verify one of the KEMs was actually stored
-    retrieved_kem_dict = await asyncio.to_thread(repo.sqlite_repo.get_full_kem_by_id, kem2.id)
+    retrieved_kem_dict = await repo.sqlite_repo.get_full_kem_by_id(kem2.id)
     assert retrieved_kem_dict is not None
-    retrieved_kem = repo._kem_from_db_dict_to_proto(retrieved_kem_dict)
+    retrieved_kem = repo._kem_from_db_dict_to_proto(dict(retrieved_kem_dict))
     assert retrieved_kem.content == kem2.content
 
 async def test_fts_search_finds_kem_by_metadata(in_memory_repo: DefaultGLMRepository):
