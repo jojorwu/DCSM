@@ -319,14 +319,6 @@ class SWMConfig(BaseServiceConfig):
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited from BaseServiceConfig for SWM (async server)
 
 
-    @field_validator("SWM_INDEXED_METADATA_KEYS", mode="before")
-    @classmethod
-    def _parse_comma_separated_list(cls, value: Union[str, List[str]]) -> List[str]:
-        if isinstance(value, str):
-            return [key.strip() for key in value.split(',') if key.strip()]
-        elif isinstance(value, list):
-            return [str(key).strip() for key in value if str(key).strip()]
-        return []
 
 # Note: The __main__ block below is for quick testing of this config.py file directly.
 # For it to work correctly with the new YAML loading, you'd need a sample 'config.yml'

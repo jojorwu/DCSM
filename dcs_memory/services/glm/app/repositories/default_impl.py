@@ -8,15 +8,15 @@ from typing import List, Tuple, Optional, Dict, Any
 from qdrant_client import QdrantClient, models as qdrant_models # Alias to avoid conflict
 from qdrant_client.http.models import PointStruct # Keep this direct import
 
+import base64
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.protobuf.json_format import ParseDict
 
-from generated_grpc import kem_pb2, glm_service_pb2
-from ..config import GLMConfig, ExternalDataSourceConfig # Relative import for config within the same app
-from .base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
-from . import SqliteKemRepository
-from . import QdrantKemRepository
-from .external_base import BaseExternalRepository # Import the new ABC
+from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
+from dcs_memory.services.glm.app.config import GLMConfig, ExternalDataSourceConfig
+from dcs_memory.services.glm.app.repositories.base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
+from dcs_memory.services.glm.app.sqlite_repo import SqliteKemRepository, QdrantKemRepository
+from dcs_memory.services.glm.app.repositories.external_base import BaseExternalRepository
 
 logger = logging.getLogger(__name__)
 
@@ -155,18 +155,24 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
                                    embeddings_list: Optional[List[float]] = None) -> kem_pb2.KEM:
         """
         Converts a dictionary (typically from SQLite row) and an optional embeddings list
-        into a KEM protobuf object.
+        into a KEM protobuf object. This function prepares a JSON-like dictionary
+        that is compatible with protobuf's ParseDict utility.
         """
         if not kem_db_dict:
-            # This case should ideally be handled by callers, but as a safeguard:
             logger.error("_kem_from_db_dict_to_proto received empty or None kem_db_dict")
             raise ValueError("Cannot convert empty DB dictionary to KEM proto.")
 
-        kem_for_proto = {}
-        kem_for_proto['id'] = kem_db_dict.get('id')
-        kem_for_proto['content_type'] = kem_db_dict.get('content_type')
-        kem_for_proto['content'] = kem_db_dict.get('content') # Assumed bytes from DB
+        kem_for_proto = {
+            'id': kem_db_dict.get('id'),
+            'content_type': kem_db_dict.get('content_type')
+        }
 
+        # content (bytes) must be base64 encoded for ParseDict
+        content_bytes = kem_db_dict.get('content')
+        if content_bytes is not None:
+            kem_for_proto['content'] = base64.b64encode(content_bytes).decode('ascii')
+
+        # metadata is a JSON string from DB, needs to be parsed into a dict for ParseDict
         metadata_json_str = kem_db_dict.get('metadata', '{}')
         try:
             kem_for_proto['metadata'] = json.loads(metadata_json_str)
@@ -174,28 +180,20 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
             logger.warning(f"Failed to parse metadata JSON: {metadata_json_str} for KEM ID {kem_db_dict.get('id')}. Using empty metadata.")
             kem_for_proto['metadata'] = {}
 
-        for ts_field_name_db, ts_field_name_proto in [('created_at', 'created_at'), ('updated_at', 'updated_at')]:
-            ts_iso_str = kem_db_dict.get(ts_field_name_db)
+        # Timestamps are ISO strings from DB. ParseDict can handle them directly.
+        for ts_field_name in ['created_at', 'updated_at']:
+            ts_iso_str = kem_db_dict.get(ts_field_name)
             if ts_iso_str and isinstance(ts_iso_str, str):
-                ts_proto = Timestamp()
-                try:
-                    # Ensure 'Z' for UTC if naive, for FromJsonString
-                    ts_parse_str = ts_iso_str
-                    if 'T' in ts_iso_str and not ts_iso_str.endswith("Z") and '+' not in ts_iso_str and '-' not in ts_iso_str[10:]:
-                        ts_parse_str = ts_iso_str + "Z"
-                    ts_proto.FromJsonString(ts_parse_str)
-                    kem_for_proto[ts_field_name_proto] = ts_proto
-                except Exception as e_ts:
-                    logger.error(f"Error parsing timestamp string '{ts_iso_str}' to proto for field '{ts_field_name_proto}' in KEM ID {kem_db_dict.get('id')}: {e}")
-                    # Fallback or error handling if necessary, e.g., remove the field or use a default
-            elif isinstance(ts_iso_str, Timestamp): # If it's already a Timestamp proto (e.g. from another KEM)
-                 kem_for_proto[ts_field_name_proto] = ts_iso_str
-
+                # Ensure the timestamp string is in the format ParseDict expects (RFC 3339)
+                ts_parse_str = ts_iso_str
+                if 'T' in ts_iso_str and not ts_iso_str.endswith("Z") and '+' not in ts_iso_str and '-' not in ts_iso_str[10:]:
+                    ts_parse_str = ts_iso_str + "Z"
+                kem_for_proto[ts_field_name] = ts_parse_str
 
         if embeddings_list:
             kem_for_proto['embeddings'] = embeddings_list
 
-        # Use ParseDict for robustness, it handles missing fields gracefully if KEM proto changes
+        # Use ParseDict for robust conversion from a dictionary to a protobuf message
         final_kem_proto = kem_pb2.KEM()
         ParseDict(kem_for_proto, final_kem_proto, ignore_unknown_fields=True)
         return final_kem_proto
@@ -330,11 +328,7 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         sql_conditions: List[str] = []
         sql_params: List[Any] = []
 
-        # 1. Handle ID filters
-        if query.ids:
-            placeholders = ','.join('?' for _ in query.ids)
-            sql_conditions.append(f"id IN ({placeholders})")
-            sql_params.extend(list(query.ids))
+        # ID filters are handled below, in conjunction with search results.
 
         # 2. Handle metadata filters
         # This uses json_extract, which benefits from JSON indexes if available (SQLite >= 3.38.0)
@@ -364,23 +358,46 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
             sql_conditions.append("updated_at <= ?")
             sql_params.append(query.updated_at_end.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''))
 
-        # TODO: Handle text_query and embedding_query (likely involving Qdrant)
-        # If embedding_query is present, this method might first query Qdrant,
-        # get KEM IDs, and then use those IDs to query SQLite.
-        # This example primarily focuses on SQLite filtering.
-        # For now, if embedding_query or text_query is present and not handled,
-        # we might return empty or raise NotImplementedError for those specific parts.
-        if query.embedding_query or query.text_query:
-            logger.warning("retrieve_kems: embedding_query and text_query are not fully implemented in this version for SQLite-first path. Qdrant integration needed here.")
-            # Placeholder: If Qdrant is supposed to be the primary source for vector search:
-            if self.qdrant_repo and query.embedding_query:
-                try:
-                    qdrant_filter = None # Build Qdrant filter from metadata/timestamps if needed
-                    # This is a simplified Qdrant search. Real implementation would need to map
-                    # KEMQuery metadata/timestamps to Qdrant's filter language.
-                    # For now, let's assume if embedding_query is there, other filters apply to Qdrant.
-                    # This part needs significant expansion for proper Qdrant integration.
+        # --- Search Logic ---
+        # Determine the primary set of IDs to filter on.
+        # Text search (FTS) is performed first. If user also provided a list of IDs,
+        # the result is the intersection of the FTS results and the provided ID list.
+        kem_id_subset = None
+        if query.text_query:
+            logger.info(f"Performing FTS search for: '{query.text_query}'")
+            kem_id_subset = await asyncio.to_thread(
+                self.sqlite_repo.search_kems_by_text, query.text_query
+            )
+            if not kem_id_subset:
+                return [], None # Text search returned no results, so the final result is empty.
 
+            if query.ids:
+                # Intersect with the user-provided list of IDs if present
+                kem_id_subset = list(set(kem_id_subset) & set(query.ids))
+                if not kem_id_subset:
+                    return [], None # Intersection is empty, so no results.
+
+        elif query.ids:
+            # No text search, but a list of IDs was provided.
+            kem_id_subset = list(query.ids)
+
+        # If we have a definitive subset of IDs, add it as a primary filter condition.
+        if kem_id_subset is not None:
+            placeholders = ",".join("?" for _ in kem_id_subset)
+            sql_conditions.append(f"id IN ({placeholders})")
+            sql_params.extend(kem_id_subset)
+
+
+        # --- Vector Search (if requested) ---
+        # If embedding_query is present, it takes precedence and talks to Qdrant.
+        # It will use other filters (metadata, etc.) to pre-filter in Qdrant if possible.
+        # Its results (a list of IDs) will overwrite any previous ID-based filters.
+        if query.embedding_query:
+            if not self.qdrant_repo:
+                logger.warning("Received embedding_query, but Qdrant repository is not available. Cannot perform vector search.")
+            else:
+                logger.info("Performing vector search via Qdrant. This may override any FTS/ID-list filters.")
+                try:
                     # Construct Qdrant filter from KEMQuery (simplified example)
                     q_filters = []
                     if query.metadata_filters:
@@ -589,8 +606,3 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
 
 # Need to import os for db_path
 import os
-```
-
-**Note:** The `async def` methods in `DefaultGLMRepository` are calling synchronous repository methods. This is a temporary state during refactoring. A full async implementation would require the underlying `SqliteKemRepository` and `QdrantKemRepository` to also have async methods and use async database drivers (e.g., `aioqdrant`, `aiosqlite`). For now, I'm using them as placeholders for the interface. The `asyncio.run()` in the servicer for calling these is also a temporary bridge.
-
-I've started with `__init__`, helper methods, `store_kem`, and a placeholder for `check_health`. I will now continue implementing the other abstract methods.

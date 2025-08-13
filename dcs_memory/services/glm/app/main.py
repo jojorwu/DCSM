@@ -13,12 +13,9 @@ from google.protobuf.json_format import ParseDict
 from typing import List, Optional # Added for type hints
 import logging
 
-from .config import GLMConfig
-from .repositories.base import StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError # For specific exception handling
-# from .repositories import SqliteKemRepository, QdrantKemRepository # Will be used by DefaultGLMRepository
-from .repositories.base import BasePersistentStorageRepository #, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
-# Placeholder for the default implementation, will be created in a later step
-# from .repositories.default_impl import DefaultGLMRepository
+from dcs_memory.services.glm.app.config import GLMConfig
+from dcs_memory.services.glm.app.repositories.base import StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
+from dcs_memory.services.glm.app.repositories.base import BasePersistentStorageRepository
 
 current_script_path = os.path.abspath(__file__)
 app_dir = os.path.dirname(current_script_path)
@@ -91,9 +88,9 @@ def setup_logging(log_config: GLMConfig):
 setup_logging(config)
 logger = logging.getLogger(__name__) # Get a logger specific to this module
 
-from generated_grpc import kem_pb2
-from generated_grpc import glm_service_pb2, glm_service_pb2_grpc
-from generated_grpc import kps_service_pb2, kps_service_pb2_grpc # For KPS Client
+from dcs_memory.services.glm.generated_grpc import kem_pb2
+from dcs_memory.services.glm.generated_grpc import glm_service_pb2, glm_service_pb2_grpc
+from dcs_memory.services.glm.generated_grpc import kps_service_pb2, kps_service_pb2_grpc
 from google.protobuf import empty_pb2
 from grpc_health.v1 import health_pb2 # For HealthCheckResponse.ServingStatus enum
 import grpc # For KPS client channel
@@ -119,7 +116,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
 
         if backend_type == "default_sqlite_qdrant":
             try:
-                from .repositories.default_impl import DefaultGLMRepository
+                from dcs_memory.services.glm.app.repositories.default_impl import DefaultGLMRepository
                 self.storage_repository = DefaultGLMRepository(self.config, app_dir)
                 logger.info("DefaultGLMRepository (SQLite+Qdrant) initialized successfully.")
             except ImportError:

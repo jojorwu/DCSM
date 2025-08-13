@@ -3,3 +3,7 @@ grpcio-tools
 protobuf
 qdrant-client
 asyncpg # For PostgreSQL external connector
+PyYAML
+pydantic-settings
+pytest
+pytest-asyncio

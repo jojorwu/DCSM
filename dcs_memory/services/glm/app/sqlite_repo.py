@@ -101,6 +101,55 @@ class SqliteKemRepository:
                     logger.info("Repository: JSON indexes (meta_type, meta_source_system) creation attempted.")
                 except sqlite3.Error as e_json_idx:
                     logger.warning(f"Repository: Could not create one or more JSON indexes. This might be due to an older SQLite version (< 3.38.0) or other SQL error: {e_json_idx}. Metadata queries might be slower.", exc_info=True)
+
+                # FTS5 virtual table for full-text search on content and metadata.
+                # This requires the FTS5 extension to be enabled in SQLite.
+                logger.info("Repository: Attempting to create FTS5 virtual table and triggers...")
+                try:
+                    # Create the FTS5 table. We store kem_id (unindexed) to map back to the main table.
+                    # 'tokenize' uses porter stemmer and unicode61 for better multilingual support.
+                    cursor.execute('''
+                    CREATE VIRTUAL TABLE IF NOT EXISTS kems_fts USING fts5(
+                        kem_id,
+                        search_text,
+                        tokenize = 'porter unicode61'
+                    )
+                    ''')
+
+                    # Triggers to keep the FTS table in sync with the main 'kems' table.
+                    # We concatenate content (as text) and metadata for indexing.
+                    # AFTER INSERT trigger
+                    cursor.execute('''
+                    CREATE TRIGGER IF NOT EXISTS kems_ai_fts AFTER INSERT ON kems
+                    BEGIN
+                        INSERT INTO kems_fts (kem_id, search_text) VALUES (
+                            NEW.id,
+                            CAST(NEW.content AS TEXT) || ' ' || NEW.metadata
+                        );
+                    END;
+                    ''')
+                    # AFTER DELETE trigger
+                    cursor.execute('''
+                    CREATE TRIGGER IF NOT EXISTS kems_ad_fts AFTER DELETE ON kems
+                    BEGIN
+                        DELETE FROM kems_fts WHERE kem_id = OLD.id;
+                    END;
+                    ''')
+                    # AFTER UPDATE trigger
+                    cursor.execute('''
+                    CREATE TRIGGER IF NOT EXISTS kems_au_fts AFTER UPDATE ON kems
+                    BEGIN
+                        DELETE FROM kems_fts WHERE kem_id = OLD.id;
+                        INSERT INTO kems_fts (kem_id, search_text) VALUES (
+                            NEW.id,
+                            CAST(NEW.content AS TEXT) || ' ' || NEW.metadata
+                        );
+                    END;
+                    ''')
+                    logger.info("Repository: FTS5 virtual table 'kems_fts' and triggers created successfully.")
+                except sqlite3.Error as e_fts:
+                    logger.warning(f"Repository: Could not create FTS5 virtual table or triggers. Full-text search will be unavailable. Error: {e_fts}", exc_info=True)
+
                 conn.commit()
             logger.info("Repository: 'kems' table and indexes in SQLite successfully initialized via Repository.")
         except Exception as e:
@@ -187,6 +236,24 @@ class SqliteKemRepository:
             conn.commit()
             logger.debug(f"Repository: Attempted delete for KEM ID '{kem_id}'. Rows affected: {cursor.rowcount}")
             return cursor.rowcount > 0
+
+    def search_kems_by_text(self, text_query: str) -> List[str]:
+        """
+        Performs a full-text search on the kems_fts table.
+        Returns a list of KEM IDs that match the query.
+        """
+        query = "SELECT kem_id FROM kems_fts WHERE search_text MATCH ? ORDER BY rank"
+        with self._get_sqlite_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                # FTS5 query syntax is passed as the parameter.
+                cursor.execute(query, (text_query,))
+                rows = cursor.fetchall()
+                return [row[0] for row in rows]
+            except sqlite3.Error as e_fts_search:
+                logger.error(f"FTS search failed: {e_fts_search}. This may happen if the FTS5 extension is not available or the query is invalid.", exc_info=True)
+                # Return empty list to prevent crashing if FTS is not supported or query is malformed.
+                return []
 
     def retrieve_kems_from_db(self,
                               sql_conditions: List[str],
