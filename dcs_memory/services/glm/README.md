@@ -1,100 +1,112 @@
-# GLM (Global Long-Term Memory) Service - (dcs_memory/services/glm)
+# GLM (Global Long-Term Memory) Service
 
-Это реализация gRPC сервиса для Глобальной Долгосрочной Памяти (GLM) в рамках проекта Динамической Контекстуализированной Общей Памяти (ДКОП).
-Сервис предоставляет API для сохранения, извлечения, обновления и удаления Контекстуализированных Единиц Памяти (КЕП).
+This document describes the gRPC service for the Global Long-Term Memory (GLM) component of the Dynamic Contextualized Shared Memory (DCSM) project. The service provides an API for storing, retrieving, updating, and deleting Contextualized Memory Units (KEMs).
 
-Данный сервис использует централизованные определения `.proto` файлов, расположенные в `dcs_memory/common/grpc_protos/`.
+This service uses centralized `.proto` definitions located in `dcs_memory/common/grpc_protos/`.
 
-## Архитектура Хранения
+## Storage Architecture
 
-*   **Векторная база данных:** Qdrant (используется для хранения эмбеддингов КЕП и выполнения поиска по сходству).
-*   **База данных метаданных:** SQLite (используется для хранения самих КЕП: ID, тип контента, контент, метаданные в формате JSON, временные метки). Файл базы данных по умолчанию создается как `app/glm_metadata.sqlite3` внутри директории сервиса.
+The GLM service uses a dual-backend storage architecture to handle both structured metadata and high-dimensional vector data efficiently.
 
-## Предварительные требования
+*   **Vector Database: Qdrant**
+    -   Used for storing KEM embeddings and performing high-speed similarity searches.
+
+*   **Metadata and Content Database: SQLite**
+    -   Used for storing the KEMs themselves, including their ID, content type, main content, metadata (as a JSON string), and timestamps.
+    -   The database file is created by default as `app/glm_metadata.sqlite3` within the service's directory.
+    -   The SQLite backend is fully asynchronous, using `aiosqlite` for non-blocking I/O operations.
+    -   It supports full-text search (FTS5) on the content and metadata of KEMs.
+
+## Prerequisites
 
 *   Python 3.8+
 *   Pip
-*   Docker (для локального запуска Qdrant, если не используется облачная версия)
+*   Docker (for running Qdrant locally if not using a cloud version)
 
-## Настройка и Запуск
+## Setup and Running
 
-1.  **Клонируйте репозиторий** (если вы еще этого не сделали).
+1.  **Clone the repository** (if you haven't already).
 
-2.  **Настройте Qdrant:**
-    Для локальной разработки рекомендуется запустить Qdrant с помощью Docker:
+2.  **Set up Qdrant:**
+    For local development, it is recommended to run Qdrant using Docker:
     ```bash
     docker pull qdrant/qdrant
     docker run -p 6333:6333 -p 6334:6334 \
         -v $(pwd)/qdrant_storage:/qdrant/storage:z \
         qdrant/qdrant
     ```
-    Это запустит Qdrant и будет хранить его данные в директории `qdrant_storage` в вашем текущем каталоге.
-    Сервис GLM попытается подключиться к Qdrant по адресу, указанному в переменных окружения (см. ниже).
+    This will start Qdrant and persist its data in the `qdrant_storage` directory in your current working directory. The GLM service will attempt to connect to Qdrant at the address specified in the configuration.
 
-3.  **Перейдите в директорию сервиса:**
+3.  **Navigate to the service directory:**
     ```bash
     cd dcs_memory/services/glm
     ```
 
-4.  **Создайте и активируйте виртуальное окружение (рекомендуется):**
+4.  **Create and activate a virtual environment (recommended):**
     ```bash
     python3 -m venv venv
     source venv/bin/activate
     ```
 
-5.  **Установите зависимости Python:**
+5.  **Install Python dependencies:**
     ```bash
     pip install -r requirements.txt
     ```
-    (Включает `qdrant-client`, `grpcio`, и т.д.)
+    (This includes `qdrant-client`, `grpcio`, `aiosqlite`, etc.)
 
-6.  **Сгенерируйте gRPC код (если вы изменяли `.proto` файлы):**
-    Этот сервис использует `.proto` файлы из центральной директории (`../../common/grpc_protos/`). Скрипт `generate_grpc_code.sh` в текущей директории (`dcs_memory/services/glm/`) отвечает за генерацию Python кода в локальную директорию `generated_grpc/`.
+6.  **Generate gRPC code (if you modify `.proto` files):**
+    This service uses `.proto` files from the central `../../common/grpc_protos/` directory. The `generate_grpc_code.sh` script in the current directory generates the Python code into the local `generated_grpc/` directory.
     ```bash
     ./generate_grpc_code.sh
     ```
-    *Убедитесь, что скрипт имеет права на выполнение (`chmod +x generate_grpc_code.sh`).*
+    *Ensure the script is executable (`chmod +x generate_grpc_code.sh`).*
 
-7.  **Настройте переменные окружения (опционально):**
-    Сервис можно сконфигурировать с помощью следующих переменных окружения:
-    *   `SQLITE_DB_FILENAME`: Имя файла SQLite базы данных (по умолчанию: `glm_metadata.sqlite3` внутри директории `app/`).
-    *   `QDRANT_HOST`: Хост Qdrant (по умолчанию: `localhost`).
-    *   `QDRANT_PORT`: Порт Qdrant (по умолчанию: `6333`).
-    *   `QDRANT_COLLECTION`: Имя коллекции в Qdrant (по умолчанию: `glm_kems_demo_collection`).
-    *   `DEFAULT_VECTOR_SIZE`: Размерность векторов для Qdrant (по умолчанию: `25`). **Важно:** это значение должно соответствовать размерности эмбеддингов, которые вы будете сохранять.
-    *   `DEFAULT_PAGE_SIZE`: Размер страницы по умолчанию для `RetrieveKEMs` (по умолчанию: `10`).
-    *   `GRPC_LISTEN_ADDRESS`: Адрес, на котором gRPC сервер будет слушать (по умолчанию: `[::]:50051`).
+7.  **Configure Environment Variables (optional):**
+    The service is configured via the central `config.yml` file, but can be overridden by environment variables. For the GLM service, these variables should be prefixed with `GLM_`.
+    *   `GLM_SQLITE_DB_FILENAME`: The filename for the SQLite database (default: `glm_metadata.sqlite3` inside the `app/` directory).
+    *   `GLM_QDRANT_HOST`: The Qdrant host (default: `localhost`).
+    *   `GLM_QDRANT_PORT`: The Qdrant gRPC port (default: `6333`).
+    *   `GLM_QDRANT_COLLECTION`: The collection name in Qdrant (default: `glm_kems_demo_collection`).
+    *   `GLM_DEFAULT_VECTOR_SIZE`: The dimension of vectors for Qdrant (default: `25`). **Important:** This value must match the dimension of the embeddings you will be storing.
+    *   `GLM_DEFAULT_PAGE_SIZE`: The default page size for `RetrieveKEMs` (default: `10`).
+    *   `GLM_GRPC_LISTEN_ADDRESS`: The address for the gRPC server to listen on (default: `[::]:50051`).
+    *   `GLM_KPS_SERVICE_ADDRESS`: The address of the KPS service, used for the `IndexExternalDataSource` RPC.
 
-8.  **Запустите gRPC сервер:**
-    Из директории `dcs_memory/services/glm/`:
+8.  **Run the gRPC Server:**
+    From the `dcs_memory/services/glm/` directory:
     ```bash
     python -m app.main
     ```
-    Сервер попытается подключиться к Qdrant и инициализировать SQLite. Логи будут выводиться в консоль.
+    The server will attempt to connect to Qdrant and initialize the SQLite database. Logs will be output to the console.
 
 ## API (gRPC)
 
-Сервис реализует gRPC интерфейс, определенный в `glm_service.proto` (находится в `dcs_memory/common/grpc_protos/`).
+The service implements the gRPC interface defined in `glm_service.proto` (located in `dcs_memory/common/grpc_protos/`).
 
-Основные методы:
+Key Methods:
 *   **`StoreKEM(StoreKEMRequest) returns (StoreKEMResponse)`**:
-    *   Сохраняет одну КЕП. Если `id` в `KEM` не указан, сервер его генерирует.
-    *   Возвращает полный сохраненный объект `KEM`, включая серверный `id` и временные метки `created_at`, `updated_at`.
+    *   Stores a single KEM. If the `id` in the `KEM` is not specified, the server generates one.
+    *   Returns the complete stored `KEM` object, including the server-generated `id` and timestamps.
 *   **`RetrieveKEMs(RetrieveKEMsRequest) returns (RetrieveKEMsResponse)`**:
-    *   Извлекает КЕП по различным критериям, указанным в `KEMQuery` (часть запроса).
-    *   Поддерживает фильтрацию по списку ID, векторный поиск (по `embedding_query`), фильтры по метаданным и диапазонам дат (`created_at`, `updated_at`).
-    *   Поддерживает пагинацию через `page_size` и `page_token`.
-    *   Возвращает список КЕП и `next_page_token` для следующей страницы.
+    *   Retrieves KEMs based on various criteria specified in the `KEMQuery`.
+    *   Supports filtering by a list of IDs, vector search (via `embedding_query`), full-text search (via `text_query`), metadata filters, and date ranges.
+    *   Supports pagination via `page_size` and `page_token`.
+    *   Returns a list of KEMs and a `next_page_token`.
 *   **`UpdateKEM(UpdateKEMRequest) returns (KEM)`**:
-    *   Обновляет существующую КЕП по `kem_id`. Поля для обновления передаются в `kem_data_update`.
-    *   Обновляет `updated_at`. `created_at` не меняется.
-    *   Возвращает полный обновленный объект `KEM`.
+    *   Updates an existing KEM identified by `kem_id`. The fields to be updated are passed in `kem_data_update`.
+    *   The `updated_at` timestamp is automatically updated. `created_at` is preserved.
+    *   Returns the full, updated `KEM` object.
 *   **`DeleteKEM(DeleteKEMRequest) returns (google.protobuf.Empty)`**:
-    *   Удаляет КЕП по `kem_id` из всех хранилищ (SQLite и Qdrant).
+    *   Deletes a KEM by `kem_id` from all storage backends (SQLite and Qdrant).
+*   **`BatchStoreKEMs(BatchStoreKEMsRequest) returns (BatchStoreKEMsResponse)`**:
+    *   Efficiently stores a batch of KEMs in a single transaction.
+*   **`IndexExternalDataSource(IndexExternalDataSourceRequest) returns (IndexExternalDataSourceResponse)`**:
+    *   Triggers the indexing of a configured external data source by fetching its data and sending it to the KPS for processing.
 
-Обратитесь к файлам `kem.proto` и `glm_service.proto` для детального описания всех сообщений и полей.
+Please refer to the `kem.proto` and `glm_service.proto` files for detailed descriptions of all messages and fields.
 
-## Тестирование
+## Testing
 
-Директория `tests/` предназначена для модульных и интеграционных тестов (пока не реализованы).
-Для ручного тестирования можно использовать gRPC-клиент, такой как `grpcurl` или Python-клиент (например, из `dcsm_agent_sdk_python`).
+The `app/` directory contains a `test_repositories.py` file with unit and integration tests for the repository layer. These tests use an in-memory SQLite database and can be run with `pytest`.
+
+For manual testing of the gRPC service, you can use a gRPC client such as `grpcurl` or a Python client (e.g., from the `dcsm_agent_sdk_python` package).
