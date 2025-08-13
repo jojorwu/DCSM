@@ -260,8 +260,8 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
                 content_type=kem_to_store.content_type,
                 content=kem_to_store.content,
                 metadata_json=json.dumps(dict(kem_to_store.metadata)), # Protobuf map to dict then to JSON string
-                created_at_iso=kem_to_store.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
-                updated_at_iso=kem_to_store.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', '')
+                created_at_iso=kem_to_store.created_at.ToDatetime().isoformat(timespec='microseconds').replace('+00:00', ''),
+                updated_at_iso=kem_to_store.updated_at.ToDatetime().isoformat(timespec='microseconds').replace('+00:00', '')
             )
         except sqlite3.Error as e_sqlite: # Catch specific sqlite3.Error
             logger.error(f"store_kem: SQLite error for ID '{kem_id}': {e_sqlite}", exc_info=True)
@@ -517,16 +517,137 @@ class DefaultGLMRepository(BasePersistentStorageRepository):
         kem_id: str,
         kem_update_data: kem_pb2.KEM,
     ) -> kem_pb2.KEM:
-        raise NotImplementedError()
+        # 1. Fetch the existing KEM data from SQLite.
+        # Use a synchronous, thread-safe call to the SQLite repository.
+        existing_kem_dict = await asyncio.to_thread(
+            self.sqlite_repo.get_full_kem_by_id, kem_id
+        )
+        if not existing_kem_dict:
+            raise KemNotFoundError(f"KEM with id '{kem_id}' not found.")
+
+        # 2. Convert the database dictionary to a KEM protobuf object.
+        # We don't need embeddings for this, as they are not stored in SQLite.
+        existing_kem_proto = self._kem_from_db_dict_to_proto(existing_kem_dict)
+
+        # 3. Merge the fields from the update request into the existing KEM proto.
+        # MergeFrom intelligently overwrites fields present in kem_update_data.
+        existing_kem_proto.MergeFrom(kem_update_data)
+
+        # 4. Use the existing store_kem method to save the updated KEM.
+        # store_kem handles ID preservation, timestamp updates, and dual-writes
+        # to SQLite and Qdrant, ensuring consistency.
+        updated_kem = await self.store_kem(existing_kem_proto)
+
+        return updated_kem
 
     async def delete_kem(self, kem_id: str) -> bool:
-        raise NotImplementedError()
+        # 1. Delete from SQLite first. This is our source of truth.
+        was_deleted = await asyncio.to_thread(
+            self.sqlite_repo.delete_kem_by_id, kem_id
+        )
+
+        if not was_deleted:
+            # KEM was not in SQLite, so nothing to do in Qdrant either.
+            logger.info(f"delete_kem: KEM with id '{kem_id}' not found in SQLite. No action taken.")
+            return False
+
+        # 2. If deletion from SQLite was successful, delete from Qdrant.
+        if self.qdrant_repo:
+            try:
+                # This method is synchronous in the client, so no need for to_thread
+                # if the method itself doesn't block for long I/O.
+                # However, for consistency with other async calls, we can use it.
+                await asyncio.to_thread(self.qdrant_repo.delete_points_by_ids, [kem_id])
+                logger.info(f"delete_kem: Successfully deleted KEM '{kem_id}' from Qdrant.")
+            except Exception as e_qdrant:
+                # Log the error but don't re-raise, as the primary data in SQLite
+                # has already been deleted. This maintains data integrity in our
+                # source of truth, at the cost of a potential orphan in Qdrant.
+                logger.error(f"delete_kem: Failed to delete KEM '{kem_id}' from Qdrant after deleting from SQLite: {e_qdrant}", exc_info=True)
+                # We still return True because the KEM was successfully deleted from the primary store.
+
+        return True
 
     async def batch_store_kems(
         self,
         kems: List[kem_pb2.KEM]
     ) -> Tuple[List[kem_pb2.KEM], List[str]]:
-        raise NotImplementedError()
+        if not kems:
+            return [], []
+
+        processed_kems = []
+        qdrant_points = []
+        failed_references = []
+
+        # First, prepare all KEMs and points
+        # This includes generating IDs and timestamps.
+        # We can fetch all existing creation timestamps in one batch.
+        kem_ids_to_check = [kem.id for kem in kems if kem.id]
+        existing_timestamps = await asyncio.to_thread(
+            self.sqlite_repo.get_kems_creation_timestamps, kem_ids_to_check
+        )
+
+        for kem in kems:
+            kem_to_store = kem_pb2.KEM()
+            kem_to_store.CopyFrom(kem)
+
+            kem_id = kem_to_store.id if kem_to_store.id else str(uuid.uuid4())
+            kem_to_store.id = kem_id
+
+            current_time_proto = Timestamp()
+            current_time_proto.GetCurrentTime()
+
+            # Preserve created_at if it exists
+            final_created_at_proto = Timestamp()
+            existing_ts_str = existing_timestamps.get(kem_id)
+            if existing_ts_str:
+                try:
+                    final_created_at_proto.FromJsonString(existing_ts_str + "Z")
+                except Exception:
+                    final_created_at_proto.CopyFrom(current_time_proto)
+            else:
+                final_created_at_proto.CopyFrom(current_time_proto)
+
+            kem_to_store.created_at.CopyFrom(final_created_at_proto)
+            kem_to_store.updated_at.CopyFrom(current_time_proto)
+
+            processed_kems.append(kem_to_store)
+
+            # Prepare Qdrant point if embeddings exist
+            if self.qdrant_repo and kem_to_store.embeddings:
+                qdrant_payload = {"kem_id_ref": kem_id}
+                # ... (add other metadata to payload if needed) ...
+                point = PointStruct(id=kem_id, vector=list(kem_to_store.embeddings), payload=qdrant_payload)
+                qdrant_points.append(point)
+
+        # Now, perform batch operations
+        try:
+            # 1. Batch store to SQLite
+            sqlite_batch_data = [
+                {
+                    "id": k.id,
+                    "content_type": k.content_type,
+                    "content": k.content,
+                    "metadata_json": json.dumps(dict(k.metadata)),
+                    "created_at_iso": k.created_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
+                    "updated_at_iso": k.updated_at.ToDatetime().isoformat(timespec='seconds').replace('+00:00', ''),
+                } for k in processed_kems
+            ]
+            await asyncio.to_thread(self.sqlite_repo.batch_store_or_replace_kems, sqlite_batch_data)
+
+            # 2. Batch store to Qdrant
+            if self.qdrant_repo and qdrant_points:
+                await asyncio.to_thread(self.qdrant_repo.upsert_points_batch, qdrant_points)
+
+            # If both succeed, all KEMs were successful
+            return processed_kems, []
+
+        except Exception as e:
+            logger.error(f"batch_store_kems: An error occurred during batch processing: {e}", exc_info=True)
+            # If any part of the batch fails, we treat the whole batch as failed for simplicity.
+            # A more granular implementation could try to identify which KEMs failed.
+            failed_references = [kem.id for kem in kems]
+            return [], failed_references
 
     async def check_health(self) -> Tuple[bool, str]:
         # This needs to run the checks for SQLite and Qdrant (if configured)

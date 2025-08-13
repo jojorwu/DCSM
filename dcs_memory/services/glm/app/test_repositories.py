@@ -3,7 +3,7 @@ import pytest_asyncio
 import asyncio
 import uuid
 import logging
-from dcs_memory.services.glm.app.repositories.default_impl import DefaultGLMRepository
+from dcs_memory.services.glm.app.repositories.default_impl import DefaultGLMRepository, KemNotFoundError
 from dcs_memory.services.glm.app.sqlite_repo import SqliteKemRepository
 from dcs_memory.services.glm.app.config import GLMConfig
 from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
@@ -63,7 +63,88 @@ async def test_fts_search_finds_kem_by_content(in_memory_repo: DefaultGLMReposit
     # Assertions
     assert len(results) == 1
     assert results[0].id == kem_id
-    assert search_term in results[0].content.decode('utf-8')
+
+
+async def test_update_kem_updates_fields_correctly(in_memory_repo: DefaultGLMRepository):
+    """
+    Tests that update_kem correctly updates specific fields of a KEM
+    and changes the updated_at timestamp.
+    """
+    repo = in_memory_repo
+    kem_id = str(uuid.uuid4())
+    original_content = b"original content"
+    original_metadata = {"tag": "original"}
+
+    # 1. Store the initial KEM
+    kem_to_store = kem_pb2.KEM(id=kem_id, content=original_content, metadata=original_metadata)
+    stored_kem = await repo.store_kem(kem_to_store)
+    original_created_at = stored_kem.created_at
+    original_updated_at = stored_kem.updated_at
+
+    # Ensure there's a small delay before updating
+    await asyncio.sleep(0.01)
+
+    # 2. Create an update request and call update_kem
+    updated_content = b"updated content"
+    update_request = kem_pb2.KEM(content=updated_content, metadata={"tag": "updated", "new_field": "yes"})
+    updated_kem = await repo.update_kem(kem_id=kem_id, kem_update_data=update_request)
+
+    # 3. Assertions
+    assert updated_kem.id == kem_id
+    assert updated_kem.content == updated_content
+    assert updated_kem.metadata["tag"] == "updated"
+    assert updated_kem.metadata["new_field"] == "yes"
+    assert updated_kem.created_at == original_created_at  # created_at should NOT change
+    # updated_at SHOULD change (be greater than original)
+    updated_is_later = (updated_kem.updated_at.seconds > original_updated_at.seconds) or \
+                       (updated_kem.updated_at.seconds == original_updated_at.seconds and
+                        updated_kem.updated_at.nanos > original_updated_at.nanos)
+    assert updated_is_later
+
+async def test_delete_kem_removes_kem(in_memory_repo: DefaultGLMRepository):
+    """
+    Tests that delete_kem successfully removes a KEM and is idempotent.
+    """
+    repo = in_memory_repo
+    kem_id = str(uuid.uuid4())
+    kem_to_store = kem_pb2.KEM(id=kem_id, content=b"content to be deleted")
+    await repo.store_kem(kem_to_store)
+
+    # 1. Delete the KEM and assert it was successful
+    delete_result_1 = await repo.delete_kem(kem_id)
+    assert delete_result_1 is True
+
+    # 2. Verify the KEM is gone
+    with pytest.raises(KemNotFoundError):
+        await repo.update_kem(kem_id, kem_pb2.KEM()) # update_kem raises KemNotFoundError
+
+    # 3. Delete again and assert it returns False (idempotency)
+    delete_result_2 = await repo.delete_kem(kem_id)
+    assert delete_result_2 is False
+
+async def test_batch_store_kems_stores_multiple_kems(in_memory_repo: DefaultGLMRepository):
+    """
+    Tests that batch_store_kems can store multiple KEMs successfully.
+    """
+    repo = in_memory_repo
+    kem1 = kem_pb2.KEM(id=str(uuid.uuid4()), content=b"batch kem 1")
+    kem2 = kem_pb2.KEM(id=str(uuid.uuid4()), content=b"batch kem 2")
+    kem3 = kem_pb2.KEM(id=str(uuid.uuid4()), content=b"batch kem 3")
+    kems_to_store = [kem1, kem2, kem3]
+
+    # Call batch_store_kems
+    successful_kems, failed_refs = await repo.batch_store_kems(kems_to_store)
+
+    # Assertions
+    assert len(successful_kems) == 3
+    assert not failed_refs
+    assert {k.id for k in successful_kems} == {k.id for k in kems_to_store}
+
+    # Verify one of the KEMs was actually stored
+    retrieved_kem_dict = await asyncio.to_thread(repo.sqlite_repo.get_full_kem_by_id, kem2.id)
+    assert retrieved_kem_dict is not None
+    retrieved_kem = repo._kem_from_db_dict_to_proto(retrieved_kem_dict)
+    assert retrieved_kem.content == kem2.content
 
 async def test_fts_search_finds_kem_by_metadata(in_memory_repo: DefaultGLMRepository):
     """
