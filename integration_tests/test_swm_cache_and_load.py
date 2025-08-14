@@ -11,10 +11,12 @@ if project_root not in sys.path:
 import grpc
 from integration_tests.kps_client_simple import process_data_via_kps
 # Импорты для SWM
-from dcs_memory.services.swm.generated_grpc import swm_service_pb2
-from dcs_memory.services.swm.generated_grpc import swm_service_pb2_grpc
+from dcs_memory.generated_grpc import swm_service_pb2
+from dcs_memory.generated_grpc import swm_service_pb2_grpc
 # Импорты для KEMQuery (используется в SWM и GLM)
-from dcs_memory.common.grpc_protos.glm_service_pb2 import KEMQuery # Используем напрямую из общего proto
+# from dcs_memory.common.grpc_protos.glm_service_pb2 import KEMQuery # Используем напрямую из общего proto
+# Используем из temp_generated_grpc_code, если PYTHONPATH настроен на корень проекта
+from dcs_memory.generated_grpc.glm_service_pb2 import KEMQuery
 
 KPS_SERVICE_URL = os.getenv("KPS_SERVICE_URL", "localhost:50052")
 SWM_SERVICE_URL = os.getenv("SWM_SERVICE_URL", "localhost:50053")

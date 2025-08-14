@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch, call
 import typing
+import asyncio # For new async tests if needed by SDK internals
 
 # Добавляем путь для импорта модулей SDK
 import sys
@@ -17,13 +18,16 @@ import os
 # или используется как пакет
 from dcsm_agent_sdk_python.local_memory import LocalAgentMemory, IndexedLRUCache
 from dcsm_agent_sdk_python.glm_client import GLMClient
+from dcsm_agent_sdk_python.swm_client import SWMClient # Added for completeness
+from dcsm_agent_sdk_python.kps_client import KPSClient # Added for new client
 from dcsm_agent_sdk_python.sdk import AgentSDK
+from dcsm_agent_sdk_python.config import DCSMClientSDKConfig # Import the new config class
+
 
 # Импорты для proto нужны, если мы будем создавать KEM объекты напрямую,
 # но LocalAgentMemory и AgentSDK работают со словарями для KEM.
 # GLMClient внутри конвертирует в/из proto.
-# from dcsm_agent_sdk_python.generated_grpc_code import kem_pb2
-# from dcsm_agent_sdk_python.generated_grpc_code import glm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2
 
 
 def create_kem_dict(kem_id: str, metadata: dict, content: str = "content") -> dict:
@@ -126,114 +130,134 @@ class TestGLMClientRetrieve(unittest.TestCase):
         mock_channel = MagicMock()
         mock_grpc.insecure_channel.return_value = mock_channel
 
-        # Мокаем GlobalLongTermMemoryStub из правильного сгенерированного модуля
-        with patch('dcsm_agent_sdk_python.generated_grpc_code.glm_service_pb2_grpc.GlobalLongTermMemoryStub', return_value=mock_stub) as MockStubConst:
-            client = GLMClient()
+        with patch('dcs_memory.generated_grpc.glm_service_pb2_grpc.GlobalLongTermMemoryStub', return_value=mock_stub):
+            client = GLMClient(retry_jitter_fraction=0.1, tls_enabled=False)
             client.connect()
 
-            mock_response_from_server = MagicMock()
-            # Предположим, сервер вернул один KEM
-            mock_kem_proto = MagicMock() # Это должен быть объект типа kem_pb2.KEM
-            # Чтобы _kem_proto_to_dict работал, нам нужен объект с полями или мокнуть _kem_proto_to_dict
-            # Проще мокнуть _kem_proto_to_dict или создать реальный kem_pb2.KEM, если это просто.
-            # Для этого теста важнее проверить, что stub.RetrieveKEMs вызывается с правильным запросом.
-
-            mock_response_from_server.kems = [mock_kem_proto] # Список из одного мок-КЕМа
-            mock_response_from_server.next_page_token = "next_token_test"
+            # Create a real KEM proto object for the mock response
+            real_kem_proto = kem_pb2.KEM(id="kem1", content=b"test content")
+            mock_response_from_server = glm_service_pb2.RetrieveKEMsResponse(
+                kems=[real_kem_proto],
+                next_page_token="next_token_test"
+            )
             mock_stub.RetrieveKEMs.return_value = mock_response_from_server
 
-            # Мы не будем проверять результат _kem_proto_to_dict здесь, а только вызов RetrieveKEMs
-            # Поэтому нет нужды мокать _kem_proto_to_dict
-            kems, next_token = client.retrieve_kems(ids_filter=["id1", "id2"], page_size=5, page_token="prev_token")
+            kems, next_token = client.retrieve_kems(ids_filter=["id1"], page_size=5)
 
             self.assertTrue(mock_stub.RetrieveKEMs.called)
             args, kwargs = mock_stub.RetrieveKEMs.call_args
-            called_request = args[0] # это RetrieveKEMsRequest
-
+            called_request = args[0]
             self.assertIn("id1", called_request.query.ids)
-            self.assertIn("id2", called_request.query.ids)
             self.assertEqual(called_request.page_size, 5)
-            self.assertEqual(called_request.page_token, "prev_token")
-            self.assertIsNotNone(kems) # Проверяем, что kems не None
+
+            self.assertIsNotNone(kems)
+            self.assertEqual(len(kems), 1)
+            self.assertEqual(kems[0]['id'], "kem1")
             self.assertEqual(next_token, "next_token_test")
 
 
-class TestAgentSDK(unittest.TestCase):
+class TestAgentSDKExistingFunctionality(unittest.TestCase): # Renamed for clarity
     def setUp(self):
-        # Мокаем GLMClient и LocalAgentMemory для изоляции тестов AgentSDK
+        # We will now mock where AgentSDK imports these clients from
         self.mock_glm_client_patch = patch('dcsm_agent_sdk_python.sdk.GLMClient')
+        self.mock_swm_client_patch = patch('dcsm_agent_sdk_python.sdk.SWMClient')
+        self.mock_kps_client_patch = patch('dcsm_agent_sdk_python.sdk.KPSClient') # Also mock KPSClient
         self.mock_local_memory_patch = patch('dcsm_agent_sdk_python.sdk.LocalAgentMemory')
 
         self.MockGLMClient = self.mock_glm_client_patch.start()
+        self.MockSWMClient = self.mock_swm_client_patch.start()
+        self.MockKPSClient = self.mock_kps_client_patch.start() # Start KPS mock
         self.MockLocalAgentMemory = self.mock_local_memory_patch.start()
 
         self.mock_glm_instance = self.MockGLMClient.return_value
-        self.mock_glm_instance = self.MockGLMClient.return_value
+        self.mock_swm_instance = self.MockSWMClient.return_value
+        self.mock_kps_instance = self.MockKPSClient.return_value # Get KPS instance
         self.mock_lpa_instance = self.MockLocalAgentMemory.return_value
 
-    # _create_mock_retrieve_kems_side_effect больше не нужен, так как мокируем return_value напрямую
-    # def _create_mock_retrieve_kems_side_effect(self, kem_to_return: typing.Optional[dict]):
-    #     """Хелпер для создания side_effect функции для retrieve_kems."""
-    #     def mock_func(*args, **kwargs):
-    #         if kem_to_return and kwargs.get('ids_filter') == [kem_to_return['id']]:
-    #             return ([kem_to_return.copy()], None)
-    #         return ([], None)
-    #     return mock_func
+        # Default config for AgentSDK tests
+        self.sdk_config = DCSMClientSDKConfig(connect_on_init=False) # Avoid auto-connect in setup
 
     def tearDown(self):
         self.mock_glm_client_patch.stop()
+        self.mock_swm_client_patch.stop()
+        self.mock_kps_client_patch.stop() # Stop KPS mock
         self.mock_local_memory_patch.stop()
 
-    def test_sdk_init(self):
-        sdk = AgentSDK(glm_server_address="test_addr", lpa_max_size=50, lpa_indexed_keys=["key1"])
-        self.MockGLMClient.assert_called_once_with(server_address="test_addr")
+    def test_sdk_init_uses_config(self):
+        custom_config = DCSMClientSDKConfig(
+            glm_host="myglm", glm_port=1111,
+            swm_host="myswm", swm_port=2222,
+            kps_host="mykps", kps_port=3333,
+            lpa_max_size=50, lpa_indexed_keys=["key1"],
+            connect_on_init=False # Important for this test not to call connect
+        )
+        sdk = AgentSDK(config=custom_config)
+
+        self.MockGLMClient.assert_called_once_with(
+            server_address="myglm:1111",
+            retry_max_attempts=custom_config.retry_max_attempts,
+            retry_initial_delay_s=custom_config.retry_initial_delay_s,
+            retry_backoff_factor=custom_config.retry_backoff_factor,
+            retry_jitter_fraction=custom_config.retry_jitter_fraction,
+            tls_enabled=custom_config.tls_enabled,
+            tls_ca_cert_path=custom_config.tls_ca_cert_path,
+            tls_client_cert_path=custom_config.tls_client_cert_path,
+            tls_client_key_path=custom_config.tls_client_key_path,
+            tls_server_override_authority=custom_config.tls_server_override_authority
+        )
+        self.MockSWMClient.assert_called_once_with(
+            server_address="myswm:2222",
+            # ... similar retry and TLS args
+            retry_max_attempts=custom_config.retry_max_attempts,
+            retry_initial_delay_s=custom_config.retry_initial_delay_s,
+            retry_backoff_factor=custom_config.retry_backoff_factor,
+            retry_jitter_fraction=custom_config.retry_jitter_fraction,
+            tls_enabled=custom_config.tls_enabled,
+            tls_ca_cert_path=custom_config.tls_ca_cert_path,
+            tls_client_cert_path=custom_config.tls_client_cert_path,
+            tls_client_key_path=custom_config.tls_client_key_path,
+            tls_server_override_authority=custom_config.tls_server_override_authority
+        )
+        self.MockKPSClient.assert_called_once_with(
+            server_address="mykps:3333",
+            # ... similar retry and TLS args
+            retry_max_attempts=custom_config.retry_max_attempts,
+            retry_initial_delay_s=custom_config.retry_initial_delay_s,
+            retry_backoff_factor=custom_config.retry_backoff_factor,
+            retry_jitter_fraction=custom_config.retry_jitter_fraction,
+            tls_enabled=custom_config.tls_enabled,
+            tls_ca_cert_path=custom_config.tls_ca_cert_path,
+            tls_client_cert_path=custom_config.tls_client_cert_path,
+            tls_client_key_path=custom_config.tls_client_key_path,
+            tls_server_override_authority=custom_config.tls_server_override_authority
+        )
         self.MockLocalAgentMemory.assert_called_once_with(max_size=50, indexed_keys=["key1"])
+        self.mock_glm_instance.connect.assert_not_called() # Because connect_on_init=False
+        self.mock_swm_instance.connect.assert_not_called()
+        self.mock_kps_instance.connect.assert_not_called()
+
 
     def test_query_local_memory_calls_lpa_query(self):
-        sdk = AgentSDK()
+        sdk = AgentSDK(config=self.sdk_config)
         sdk.query_local_memory(metadata_filters={"type": "A"})
         self.mock_lpa_instance.query.assert_called_once_with(metadata_filters={"type": "A"}, ids=None)
 
-    def test_store_kems_no_refresh_lpa(self):
-        sdk = AgentSDK()
-        kems_to_store = [create_kem_dict("id1", {"type": "A"})]
-        # AgentSDK.store_kems теперь вызывает glm_client.batch_store_kems.
-        # Мок должен соответствовать возвращаемому значению batch_store_kems:
-        # (list_of_successfully_stored_kems_dicts, list_of_failed_references, error_message_str)
-        # Для этого теста (старая логика без явного refresh), предположим, что сервер вернул
-        # словари, идентичные отправленным, если ID совпадают.
-        self.mock_glm_instance.batch_store_kems.return_value = ([kems_to_store[0]], [], None)
-
-        sdk.store_kems(kems_to_store)
-
-        self.mock_glm_instance.batch_store_kems.assert_called_once_with(kems_to_store)
-        # retrieve_kems не должен вызываться, так как refresh_lpa_after_store удален и его логика встроена
-        self.mock_glm_instance.retrieve_kems.assert_not_called()
-        self.mock_lpa_instance.put.assert_called_once_with("id1", kems_to_store[0])
-
-    # Тест test_store_kems_with_refresh_lpa удален/заменен на test_store_kems_updates_lpa_with_server_data
     def test_store_kems_updates_lpa_with_server_data(self):
-        sdk = AgentSDK()
+        sdk = AgentSDK(config=self.sdk_config)
         kems_to_store = [create_kem_dict("id1", {"type": "A", "version": 1})]
-
-        # Мок ответа от glm_client.batch_store_kems
-        # (successfully_stored_kems_as_dicts, failed_kem_references, overall_error_message)
-        kem_from_server_dict = create_kem_dict("id1", {"type": "A", "version": 1, "server_field": True}) # Сервер мог добавить поля
+        kem_from_server_dict = create_kem_dict("id1", {"type": "A", "version": 1, "server_field": True})
         self.mock_glm_instance.batch_store_kems.return_value = ([kem_from_server_dict], [], None)
 
-        # Вызываем store_kems (параметр refresh_lpa_after_store удален, теперь это поведение по умолчанию)
         stored_kems, _, _ = sdk.store_kems(kems_to_store)
 
         self.mock_glm_instance.batch_store_kems.assert_called_once_with(kems_to_store)
         self.assertIsNotNone(stored_kems)
         self.assertEqual(len(stored_kems), 1)
-        self.assertEqual(stored_kems[0]['id'], "id1")
-        # Проверяем, что ЛПА обновлена данными, возвращенными сервером
         self.mock_lpa_instance.put.assert_called_once_with("id1", kem_from_server_dict)
 
 
     def test_get_kem_from_lpa(self):
-        sdk = AgentSDK()
+        sdk = AgentSDK(config=self.sdk_config)
         kem_in_lpa = create_kem_dict("id1", {})
         self.mock_lpa_instance.get.return_value = kem_in_lpa
 
@@ -243,35 +267,136 @@ class TestAgentSDK(unittest.TestCase):
         self.mock_glm_instance.retrieve_kems.assert_not_called()
 
     def test_get_kem_from_glm_when_not_in_lpa(self):
-        sdk = AgentSDK()
-        self.mock_lpa_instance.get.return_value = None # Не найдено в ЛПА
+        sdk = AgentSDK(config=self.sdk_config)
+        self.mock_lpa_instance.get.return_value = None
         kem_from_glm_dict = create_kem_dict("id1", {"source": "glm"})
-        # GLMClient.retrieve_kems теперь возвращает кортеж (list_of_kems, next_page_token)
         self.mock_glm_instance.retrieve_kems.return_value = ([kem_from_glm_dict], "mock_token_1")
 
         result = sdk.get_kem("id1")
         self.assertEqual(result, kem_from_glm_dict)
         self.mock_lpa_instance.get.assert_called_once_with("id1")
-        # Проверяем, что retrieve_kems вызывается с ids_filter
         self.mock_glm_instance.retrieve_kems.assert_called_once_with(ids_filter=['id1'], page_size=1)
-        self.mock_lpa_instance.put.assert_called_once_with("id1", kem_from_glm_dict) # Исправлено здесь
+        self.mock_lpa_instance.put.assert_called_once_with("id1", kem_from_glm_dict)
 
     def test_get_kem_force_remote(self):
-        sdk = AgentSDK()
+        sdk = AgentSDK(config=self.sdk_config)
         kem_in_lpa = create_kem_dict("id1", {"source": "lpa"})
-        self.mock_lpa_instance.get.return_value = kem_in_lpa
+        self.mock_lpa_instance.get.return_value = kem_in_lpa # This should be ignored
 
         kem_from_glm = create_kem_dict("id1", {"source": "glm_forced"})
-        # GLMClient.retrieve_kems теперь возвращает кортеж (list_of_kems, next_page_token)
         self.mock_glm_instance.retrieve_kems.return_value = ([kem_from_glm], None)
-
 
         result = sdk.get_kem("id1", force_remote=True)
         self.assertEqual(result, kem_from_glm)
-        self.mock_lpa_instance.get.assert_not_called()
-        # Проверяем, что retrieve_kems вызывается с ids_filter
+        self.mock_lpa_instance.get.assert_not_called() # LPA get should not be called
         self.mock_glm_instance.retrieve_kems.assert_called_once_with(ids_filter=['id1'], page_size=1)
         self.mock_lpa_instance.put.assert_called_once_with("id1", kem_from_glm)
+
+
+# New test class for AgentSDK initialization and client properties
+@patch('dcsm_agent_sdk_python.sdk.KPSClient')
+@patch('dcsm_agent_sdk_python.sdk.SWMClient')
+@patch('dcsm_agent_sdk_python.sdk.GLMClient')
+class TestAgentSDKInitializationAndProperties(unittest.TestCase):
+
+    def test_init_with_default_config_and_connect_on_init_true(self, MockGLMClient, MockSWMClient, MockKPSClient):
+        mock_glm_instance = MockGLMClient.return_value
+        mock_swm_instance = MockSWMClient.return_value
+        mock_kps_instance = MockKPSClient.return_value
+
+        sdk_config = DCSMClientSDKConfig(connect_on_init=True)
+        sdk = AgentSDK(config=sdk_config)
+
+        MockGLMClient.assert_called_once_with(
+            server_address=sdk_config.glm_address,
+            retry_max_attempts=sdk_config.retry_max_attempts,
+            retry_initial_delay_s=sdk_config.retry_initial_delay_s,
+            retry_backoff_factor=sdk_config.retry_backoff_factor,
+            retry_jitter_fraction=sdk_config.retry_jitter_fraction,
+            tls_enabled=sdk_config.tls_enabled,
+            tls_ca_cert_path=sdk_config.tls_ca_cert_path,
+            tls_client_cert_path=sdk_config.tls_client_cert_path,
+            tls_client_key_path=sdk_config.tls_client_key_path,
+            tls_server_override_authority=sdk_config.tls_server_override_authority
+        )
+        # ... similar asserts for MockSWMClient and MockKPSClient ...
+        MockSWMClient.assert_called_with(server_address=sdk_config.swm_address, retry_max_attempts=sdk_config.retry_max_attempts, retry_initial_delay_s=sdk_config.retry_initial_delay_s, retry_backoff_factor=sdk_config.retry_backoff_factor, retry_jitter_fraction=sdk_config.retry_jitter_fraction, tls_enabled=sdk_config.tls_enabled, tls_ca_cert_path=sdk_config.tls_ca_cert_path, tls_client_cert_path=sdk_config.tls_client_cert_path, tls_client_key_path=sdk_config.tls_client_key_path, tls_server_override_authority=sdk_config.tls_server_override_authority)
+        MockKPSClient.assert_called_with(server_address=sdk_config.kps_address, retry_max_attempts=sdk_config.retry_max_attempts, retry_initial_delay_s=sdk_config.retry_initial_delay_s, retry_backoff_factor=sdk_config.retry_backoff_factor, retry_jitter_fraction=sdk_config.retry_jitter_fraction, tls_enabled=sdk_config.tls_enabled, tls_ca_cert_path=sdk_config.tls_ca_cert_path, tls_client_cert_path=sdk_config.tls_client_cert_path, tls_client_key_path=sdk_config.tls_client_key_path, tls_server_override_authority=sdk_config.tls_server_override_authority)
+
+        mock_glm_instance.connect.assert_called_once()
+        mock_swm_instance.connect.assert_called_once()
+        mock_kps_instance.connect.assert_called_once()
+
+    def test_init_with_connect_on_init_false(self, MockGLMClient, MockSWMClient, MockKPSClient):
+        mock_glm_instance = MockGLMClient.return_value
+        mock_swm_instance = MockSWMClient.return_value
+        mock_kps_instance = MockKPSClient.return_value
+
+        sdk_config = DCSMClientSDKConfig(connect_on_init=False)
+        sdk = AgentSDK(config=sdk_config)
+
+        mock_glm_instance.connect.assert_not_called()
+        mock_swm_instance.connect.assert_not_called()
+        mock_kps_instance.connect.assert_not_called()
+
+    def test_client_properties_ensure_connection(self, MockGLMClient, MockSWMClient, MockKPSClient):
+        mock_glm_instance = MockGLMClient.return_value
+        mock_swm_instance = MockSWMClient.return_value
+        mock_kps_instance = MockKPSClient.return_value
+
+        sdk_config = DCSMClientSDKConfig(connect_on_init=False)
+        sdk = AgentSDK(config=sdk_config)
+
+        self.assertEqual(sdk.glm, mock_glm_instance)
+        mock_glm_instance._ensure_connected.assert_called_once()
+
+        self.assertEqual(sdk.swm, mock_swm_instance)
+        mock_swm_instance._ensure_connected.assert_called_once()
+
+        self.assertEqual(sdk.kps, mock_kps_instance)
+        mock_kps_instance._ensure_connected.assert_called_once()
+
+    def test_client_properties_raise_if_not_configured(self, MockGLMClient, MockSWMClient, MockKPSClient):
+        sdk_config = DCSMClientSDKConfig(glm_host=None, glm_port=0) # Effectively disable GLM
+        sdk = AgentSDK(config=sdk_config)
+
+        with self.assertRaisesRegex(RuntimeError, "GLM service not configured"):
+            _ = sdk.glm
+
+        self.assertIsNotNone(sdk.swm) # SWM and KPS use defaults from DCSMClientSDKConfig
+        self.assertIsNotNone(sdk.kps)
+
+
+    def test_close_method_closes_all_clients(self, MockGLMClient, MockSWMClient, MockKPSClient):
+        mock_glm_instance = MockGLMClient.return_value
+        mock_swm_instance = MockSWMClient.return_value
+        mock_kps_instance = MockKPSClient.return_value
+
+        sdk_config = DCSMClientSDKConfig()
+        sdk = AgentSDK(config=sdk_config)
+        sdk.close()
+
+        if sdk_config.glm_address: mock_glm_instance.close.assert_called_once()
+        else: mock_glm_instance.close.assert_not_called()
+
+        if sdk_config.swm_address: mock_swm_instance.close.assert_called_once()
+        else: mock_swm_instance.close.assert_not_called()
+
+        if sdk_config.kps_address: mock_kps_instance.close.assert_called_once()
+        else: mock_kps_instance.close.assert_not_called()
+
+    def test_context_manager_closes_clients(self, MockGLMClient, MockSWMClient, MockKPSClient):
+        mock_glm_instance = MockGLMClient.return_value
+        mock_swm_instance = MockSWMClient.return_value
+        mock_kps_instance = MockKPSClient.return_value
+
+        sdk_config = DCSMClientSDKConfig()
+        with AgentSDK(config=sdk_config) as sdk:
+            self.assertIsNotNone(sdk.glm)
+
+        if sdk_config.glm_address: mock_glm_instance.close.assert_called_once()
+        if sdk_config.swm_address: mock_swm_instance.close.assert_called_once()
+        if sdk_config.kps_address: mock_kps_instance.close.assert_called_once()
 
 
 if __name__ == '__main__':

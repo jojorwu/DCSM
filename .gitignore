@@ -11,6 +11,7 @@ node_modules/
 # Generated gRPC code (if you prefer not to commit it)
 # generated_grpc/
 # generated_grpc_code/
+# temp_generated_grpc_code/
 
 # IDE and editor specific files
 .idea/

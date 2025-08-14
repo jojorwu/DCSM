@@ -187,4 +187,3 @@ if __name__ == '__main__':
     # The primary check is the correctness of the shared_resource.value.
 
     log_message("RWLockFair simple stress test PASSED.")
-```

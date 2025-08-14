@@ -31,6 +31,7 @@ services:
       # Другие переменные GLM_* также будут управляться через config.yml или env vars с префиксом
     volumes:
       - ./config.yml:/app/config.yml:ro # Монтируем config.yml в read-only режиме
+      - ./certs:/certs:ro # Mount certificates
     depends_on:
       qdrant:
         condition: service_healthy # Ждать, пока Qdrant не станет healthy
@@ -53,6 +54,7 @@ services:
       # DEFAULT_VECTOR_SIZE: "384" # Управляется через config.yml или KPS_DEFAULT_VECTOR_SIZE
     volumes:
       - ./config.yml:/app/config.yml:ro
+      - ./certs:/certs:ro # Mount certificates
     depends_on:
       glm:
         condition: service_started # Или healthcheck, если будет добавлен в GLM
@@ -75,6 +77,7 @@ services:
       # SWM_INDEXED_METADATA_KEYS: "type,source" # Управляется через config.yml или SWM_SWM_INDEXED_METADATA_KEYS
     volumes:
       - ./config.yml:/app/config.yml:ro
+      - ./certs:/certs:ro # Mount certificates
     depends_on:
       glm:
         condition: service_started # Или healthcheck, если будет добавлен в GLM

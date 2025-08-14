@@ -142,11 +142,26 @@ The system loads configurations with the following priority (highest to lowest):
 
 This means environment variables can always override settings in `config.yml`.
 
+For client-side load balancing (e.g., when KPS or SWM connect to multiple instances of GLM), ensure the target service address in `config.yml` (e.g., `GLM_SERVICE_ADDRESS`) uses the `dns:///` scheme (e.g., `dns:///dcsm_glm:50051`). Additionally, for reliable DNS-based round-robin load balancing, it's recommended to set the `GRPC_DNS_RESOLVER=ares` environment variable for the client services (KPS, SWM) and ensure `grpcio[ares]` is installed (it is included in `requirements.txt`). The load balancing policy (e.g., `round_robin`) can be configured via `GRPC_CLIENT_LB_POLICY` in `config.yml`.
+
+### Security Configuration (TLS)
+
+Inter-service gRPC communication can be secured using TLS. This is configured via paths to SSL/TLS certificates and keys in the `config.yml` file.
+
+*   **Enabling TLS for a Server (e.g., GLM):**
+    *   Set `GRPC_SERVER_CERT_PATH` and `GRPC_SERVER_KEY_PATH` in the service's section (e.g., `glm:`) in `config.yml`. These paths should point to the server's certificate and private key files (PEM encoded) within the container (e.g., `/certs/glm/server.crt`).
+*   **Enabling Client Verification of a Secure Server (e.g., KPS client verifying GLM server):**
+    *   Set `GRPC_CLIENT_ROOT_CA_CERT_PATH` in the client service's section (e.g., `kps:`) in `config.yml`. This path should point to the root CA certificate that signed the server's certificate (e.g., `/certs/ca/ca.crt`).
+*   **Certificate Generation:** For development, you will need to generate a root CA and server certificates. Place these in a local `./certs` directory (e.g., `./certs/ca/ca.crt`, `./certs/glm/server.crt`, `./certs/glm/server.key`, etc.). The `docker-compose.yml` file is configured to mount this `./certs` directory into `/certs` within each service container. Basic OpenSSL commands for generating self-signed certificates for testing are provided in an appendix or a separate script (details TBD or see `tls_setup_guide.md` if created).
+*   **Current Scope:** The initial TLS implementation focuses on server-side authentication (clients verify servers). Mutual TLS (mTLS, where servers also verify client certificates) is a future enhancement.
+
+If TLS paths are not configured for a server, it will start with an insecure gRPC port. If TLS paths are configured for a client connection, it will attempt a secure connection; otherwise, it will attempt an insecure one.
+
 After successful startup, the following services will be available:
 *   **Qdrant**: Vector DB (gRPC port 6333, HTTP 6334)
-*   **GLM Service**: gRPC on port 50051
-*   **KPS Service**: gRPC on port 50052
-*   **SWM Service**: gRPC on port 50053
+*   **GLM Service**: gRPC on port 50051 (secure or insecure based on config)
+*   **KPS Service**: gRPC on port 50052 (secure or insecure based on config)
+*   **SWM Service**: gRPC on port 50053 (secure or insecure based on config)
 
 All services also expose a standard gRPC health check endpoint (`grpc.health.v1.Health/Check`) on their respective ports.
 

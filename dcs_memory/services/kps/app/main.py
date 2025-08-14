@@ -65,18 +65,13 @@ logger = logging.getLogger(__name__)
 # --- End Logging Setup ---
 
 # --- gRPC Code Import Block ---
-current_script_path = os.path.abspath(__file__)
-app_dir_kps = os.path.dirname(current_script_path)
-service_root_dir_kps = os.path.dirname(app_dir_kps)
-
-if service_root_dir_kps not in sys.path:
-    sys.path.insert(0, service_root_dir_kps)
-
-from generated_grpc import kem_pb2
-from generated_grpc import glm_service_pb2 # For GLM client
-from generated_grpc import glm_service_pb2_grpc # For GLM client
-from generated_grpc import kps_service_pb2 # For KPS server
-from generated_grpc import kps_service_pb2_grpc # For KPS server
+from dcs_memory.generated_grpc import (
+    kem_pb2,
+    glm_service_pb2,
+    glm_service_pb2_grpc,
+    kps_service_pb2,
+    kps_service_pb2_grpc,
+)
 # Import retry decorator
 from dcs_memory.common.grpc_utils import retry_grpc_call
 from dcs_memory.common.config import KPSConfig # Ensure KPSConfig is imported for type hint
@@ -86,15 +81,21 @@ try:
     import pybreaker
 except ImportError:
     pybreaker = None
+
+# For Health Checks
+from grpc_health.v1 import health_pb2 as health_pb2_types
+from grpc_health.v1 import health_pb2_grpc as health_pb2_grpc_health
+from grpc_health.v1.health_pb2 import HealthCheckRequest as HC_Request
 # --- End gRPC Code Import Block ---
 
 class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServiceServicer):
     def __init__(self):
         logger.info("Initializing KnowledgeProcessorServiceImpl...")
-        self.config: KPSConfig = config # Store config instance with type hint
+        self.config: KPSConfig = config
         self.glm_channel = None
         self.glm_stub = None
         self.embedding_model: typing.Optional[SentenceTransformer] = None
+        self._model_loaded_successfully: bool = False # Health check flag
 
         self.glm_circuit_breaker: typing.Optional[pybreaker.CircuitBreaker] = None
         if pybreaker and self.config.CIRCUIT_BREAKER_ENABLED:
@@ -106,15 +107,14 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
         else:
             logger.info(f"KPS: GLM client circuit breaker is disabled (pybreaker not installed or CIRCUIT_BREAKER_ENABLED=False).")
 
-
         try:
-            logger.info(f"Loading sentence-transformer model: {self.config.EMBEDDING_MODEL_NAME}...") # Use updated config name
+            logger.info(f"Loading sentence-transformer model: {self.config.EMBEDDING_MODEL_NAME}...")
             self.embedding_model = SentenceTransformer(self.config.EMBEDDING_MODEL_NAME)
 
             # Perform a test encoding to check model and get vector dimension
             test_embedding = self.embedding_model.encode(["test"])[0]
             model_vector_size = len(test_embedding)
-            logger.info(f"Model {self.config.SENTENCE_TRANSFORMER_MODEL} loaded. Vector dimension: {model_vector_size}")
+            logger.info(f"Model {self.config.EMBEDDING_MODEL_NAME} loaded. Vector dimension: {model_vector_size}")
 
             if model_vector_size != self.config.DEFAULT_VECTOR_SIZE:
                 logger.warning(
@@ -122,11 +122,29 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     f"does not match KPS_DEFAULT_VECTOR_SIZE ({self.config.DEFAULT_VECTOR_SIZE}) from config. "
                     f"This may lead to issues when storing in GLM if GLM's vector DB is configured differently."
                 )
+            self._model_loaded_successfully = True
         except Exception as e:
-            logger.error(f"Error loading sentence-transformer model '{self.config.SENTENCE_TRANSFORMER_MODEL}': {e}", exc_info=True)
-            self.embedding_model = None # Ensure model is None if loading failed
+            logger.error(f"Error loading sentence-transformer model '{self.config.EMBEDDING_MODEL_NAME}': {e}", exc_info=True)
+            self.embedding_model = None
+            self._model_loaded_successfully = False
 
-        try:
+        # GLM Client for Health Check (separate, simpler channel)
+        self.glm_health_check_channel: typing.Optional[grpc.Channel] = None
+        self.glm_health_check_stub: typing.Optional[health_pb2_grpc_health.HealthStub] = None # Correct stub type
+        if self.config.GLM_SERVICE_ADDRESS:
+            try:
+                # Options for health check client channel can be simpler or use a subset of main client options
+                health_check_grpc_options = [
+                    ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS), # Reuse for consistency
+                    ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
+                ]
+                self.glm_health_check_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=health_check_grpc_options)
+                self.glm_health_check_stub = health_pb2_grpc_health.HealthStub(self.glm_health_check_channel)
+                logger.info(f"KPS: GLM health check client initialized for target: {self.config.GLM_SERVICE_ADDRESS}")
+            except Exception as e_hc_client:
+                logger.error(f"KPS: Error initializing GLM health check client: {e_hc_client}", exc_info=True)
+
+        try: # Main GLM client for operations
             grpc_options = [
                 ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS),
                 ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
@@ -135,12 +153,63 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                 ('grpc.max_receive_message_length', self.config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
                 ('grpc.max_send_message_length', self.config.GRPC_MAX_SEND_MESSAGE_LENGTH),
             ]
-            self.glm_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=grpc_options)
-            self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
-            logger.info(f"GLM client for KPS initialized, target: {self.config.GLM_SERVICE_ADDRESS}, options: {grpc_options}")
+            if self.config.GRPC_CLIENT_LB_POLICY:
+                grpc_options.append(('grpc.lb_policy_name', self.config.GRPC_CLIENT_LB_POLICY))
+
+            target_address = self.config.GLM_SERVICE_ADDRESS
+            # Ensure GRPC_DNS_RESOLVER=ares is set in the environment for dns:/// scheme to work reliably with round_robin.
+            # No code change here for GRPC_DNS_RESOLVER, it's an environment setup.
+            logger.info(f"KPS: GLM client attempting to connect to: {target_address} with LB policy: {self.config.GRPC_CLIENT_LB_POLICY or 'default (pick_first)'}")
+
+            if self.config.GRPC_CLIENT_ROOT_CA_CERT_PATH:
+                logger.info(f"KPS: Attempting to create SECURE gRPC channel to GLM at {target_address}")
+                try:
+                    with open(self.config.GRPC_CLIENT_ROOT_CA_CERT_PATH, 'rb') as f:
+                        root_ca_cert = f.read()
+                    # For mTLS, client_key and client_cert would be loaded here too.
+                    # client_key = None; client_cert = None
+                    # if self.config.GRPC_CLIENT_KEY_PATH and self.config.GRPC_CLIENT_CERT_PATH:
+                    #     with open(self.config.GRPC_CLIENT_KEY_PATH, 'rb') as f: client_key = f.read()
+                    #     with open(self.config.GRPC_CLIENT_CERT_PATH, 'rb') as f: client_cert = f.read()
+
+                    channel_credentials = grpc.ssl_channel_credentials(root_certificates=root_ca_cert)
+                    # For mTLS:
+                    # channel_credentials = grpc.ssl_channel_credentials(root_certificates=root_ca_cert, private_key=client_key, certificate_chain=client_cert)
+
+                    self.glm_channel = grpc.secure_channel(target_address, channel_credentials, options=grpc_options)
+                    self.glm_health_check_channel = grpc.secure_channel(target_address, channel_credentials, options=health_check_grpc_options) # Also secure health check client
+                    logger.info(f"KPS: SECURE GLM client channels initialized for target: {target_address}")
+                except FileNotFoundError as e_certs:
+                    logger.critical(f"KPS: CRITICAL - Root CA or client cert/key file not found for GLM client: {e_certs}. KPS will likely fail to connect to GLM if GLM is secure.")
+                    # Fallback to insecure if certs are specified but not found? Or fail hard?
+                    # For now, let's allow fallback to insecure if this was a misconfiguration but paths were set.
+                    # Better: if paths set, they must be valid. If not set, then insecure.
+                    # The current logic will make it try secure, fail, and then KPS might not work.
+                    # This is acceptable for "enabling TLS" - if configured, it must work.
+                    self.glm_channel = None # Prevent use
+                    self.glm_health_check_channel = None # Prevent use
+                    raise RuntimeError(f"Failed to load TLS credentials for GLM client: {e_certs}") from e_certs
+                except Exception as e_secure_channel:
+                    logger.critical(f"KPS: CRITICAL - Failed to create SECURE gRPC channel to GLM: {e_secure_channel}.", exc_info=True)
+                    self.glm_channel = None
+                    self.glm_health_check_channel = None
+                    raise RuntimeError(f"Failed to create secure gRPC channel to GLM: {e_secure_channel}") from e_secure_channel
+            else:
+                logger.info(f"KPS: Creating INSECURE gRPC channel to GLM at {target_address} (no client CA cert path provided).")
+                self.glm_channel = grpc.insecure_channel(target_address, options=grpc_options)
+                self.glm_health_check_channel = grpc.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=health_check_grpc_options) # Health check also insecure
+
+            if self.glm_channel:
+                self.glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.glm_channel)
+            if self.glm_health_check_channel:
+                 self.glm_health_check_stub = health_pb2_grpc_health.HealthStub(self.glm_health_check_channel)
+
+            logger.info(f"GLM client for KPS initialized (channel type determined by TLS config). Target: {target_address}, options: {grpc_options}")
+
         except Exception as e:
             logger.error(f"Error initializing GLM client in KPS: {e}", exc_info=True)
-            self.glm_stub = None # Ensure stub is None if channel creation failed
+            self.glm_stub = None
+            self.glm_health_check_stub = None
 
     @retry_grpc_call(
         max_attempts=config.RETRY_MAX_ATTEMPTS, # These are now correctly sourced from config by the decorator through the instance
@@ -312,8 +381,67 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
         else:
             return actual_glm_call()
 
+    def _check_model_loaded(self) -> bool:
+        return self.embedding_model is not None and self._model_loaded_successfully
+
+    def _check_glm_connectivity(self) -> bool:
+        if not self.glm_health_check_stub:
+            logger.warning("KPS Health Check: GLM health check client not available.")
+            return False
+        try:
+            timeout = getattr(self.config, "HEALTH_CHECK_GLM_TIMEOUT_S", 2.0)
+            health_check_req = HC_Request(service="") # Check overall GLM health
+            # Note: GLM server itself needs to have grpc_health_checking enabled.
+            # This assumes GLM's health check endpoint is standard.
+            response = self.glm_health_check_stub.Check(health_check_req, timeout=timeout)
+            if response.status == health_pb2_types.HealthCheckResponse.SERVING:
+                return True
+            else:
+                logger.warning(f"KPS Health Check: GLM reported status {health_pb2_types.HealthCheckResponse.ServingStatus.Name(response.status)}.")
+                return False
+        except grpc.RpcError as e:
+            logger.warning(f"KPS Health Check: GLM connectivity check failed with gRPC error: Code={e.code()}, Details='{e.details()}'.")
+            return False
+        except Exception as e_glm_check: # Catch other potential errors during check
+            logger.warning(f"KPS Health Check: GLM connectivity check failed with unexpected error: {e_glm_check}")
+            return False
+
+    def check_overall_health(self) -> health_pb2_types.HealthCheckResponse.ServingStatus:
+        model_ok = self._check_model_loaded()
+        glm_ok = self._check_glm_connectivity()
+
+        if model_ok and glm_ok:
+            return health_pb2_types.HealthCheckResponse.SERVING
+
+        if not model_ok:
+             logger.warning("KPS Health Status: Potentially NOT_SERVING due to embedding model not loaded.")
+        if not glm_ok: # Only log GLM failure if it's configured
+             logger.warning("KPS Health Status: Potentially NOT_SERVING due to GLM connectivity issue.")
+        return health_pb2_types.HealthCheckResponse.NOT_SERVING
+
+
     def ProcessRawData(self, request: kps_service_pb2.ProcessRawDataRequest, context) -> kps_service_pb2.ProcessRawDataResponse:
         logger.info(f"KPS: ProcessRawData called for data_id='{request.data_id}', content_type='{request.content_type}'")
+
+        if not self.glm_stub:
+            msg = "KPS Misconfiguration: GLM service client not initialized."
+            logger.error(msg)
+            # This is a setup issue for KPS itself.
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, msg)
+            return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+
+        if not self.embedding_model:
+            msg = "KPS Misconfiguration: Embedding model not loaded."
+            logger.error(msg)
+            # If model is essential for all KPS ops, this is a FAILED_PRECONDITION.
+            # If KPS could proceed for non-text data without model, then it's more nuanced.
+            # Assuming for text, model is essential.
+            if request.content_type.startswith("text/"):
+                 context.abort(grpc.StatusCode.FAILED_PRECONDITION, msg)
+                 return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+            else:
+                 logger.warning(f"{msg} Proceeding without embeddings for non-text content.")
+
 
         # Idempotency Check
         if self.config.KPS_IDEMPOTENCY_CHECK_ENABLED and request.data_id:
@@ -325,31 +453,28 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
             retrieve_request = glm_service_pb2.RetrieveKEMsRequest(query=query, page_size=1)
 
             try:
-                # Use a shorter timeout for this check compared to StoreKEM? Or make it configurable.
-                # For now, using the same StoreKEM timeout as a general GLM interaction timeout.
-                # TODO: Consider a specific KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S
-                response = self._glm_retrieve_kems_with_retry(retrieve_request, timeout=self.config.GLM_STORE_KEM_TIMEOUT_S)
+                # timeout_check = getattr(self.config, "KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S", self.config.GLM_STORE_KEM_TIMEOUT_S)
+                # Directly use the new config field after adding it to KPSConfig
+                timeout_check = self.config.KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S
+                response = self._glm_retrieve_kems_with_retry(retrieve_request, timeout=timeout_check)
                 if response and response.kems:
                     existing_kem_id = response.kems[0].id
                     logger.info(f"KPS: Idempotency check positive. Data_id '{request.data_id}' already processed as KEM ID '{existing_kem_id}'.")
                     return kps_service_pb2.ProcessRawDataResponse(
                         kem_id=existing_kem_id,
-                        success=True,
+                        success=True, # Still success, but indicates pre-existence
                         status_message=f"Data already processed (KEM ID: {existing_kem_id})."
                     )
-            except grpc.RpcError as e_rpc:
-                logger.warning(f"KPS: Idempotency check failed with gRPC error (Code: {e_rpc.code()}): {e_rpc.details()}. Proceeding with processing.", exc_info=True)
             except pybreaker.CircuitBreakerError as e_cb:
-                 logger.warning(f"KPS: Idempotency check failed due to GLM circuit breaker open: {e_cb}. Proceeding with processing (will likely fail at StoreKEM).", exc_info=True)
+                 logger.warning(f"KPS: Idempotency check skipped due to GLM circuit breaker open: {e_cb}. Proceeding with processing (StoreKEM will likely also fail if CB remains open).")
+                 # Fail-open for idempotency check if CB is open for GLM.
+            except grpc.RpcError as e_rpc:
+                # If GLM is UNAVAILABLE or DEADLINE_EXCEEDED during check, log and proceed (fail-open for check).
+                # Other GLM errors during check might indicate issues but we still proceed.
+                logger.warning(f"KPS: Idempotency check GLM query failed (Code: {e_rpc.code()}): {e_rpc.details()}. Proceeding with processing.", exc_info=False) # Log less verbosely
             except Exception as e_generic:
-                logger.warning(f"KPS: Idempotency check failed with unexpected error: {e_generic}. Proceeding with processing.", exc_info=True)
+                logger.warning(f"KPS: Idempotency check failed with unexpected error: {e_generic}. Proceeding with processing.", exc_info=False)
 
-        if not self.glm_stub:
-            msg = "GLM service is unavailable to KPS (GLM client not initialized)."
-            logger.error(msg)
-            context.abort(grpc.StatusCode.INTERNAL, msg)
-            # This return is technically unreachable due to abort, but good for linters/type checkers.
-            return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
 
         try:
             content_to_embed = ""
@@ -375,19 +500,22 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                     logger.info(f"Embeddings generated by model (dimension: {len(embeddings)}).")
 
                     if len(embeddings) != self.config.DEFAULT_VECTOR_SIZE:
-                        msg = (f"Critical error: Model '{self.config.SENTENCE_TRANSFORMER_MODEL}' returned embedding of dimension {len(embeddings)}, "
-                               f"but DEFAULT_VECTOR_SIZE from KPS config is {self.config.DEFAULT_VECTOR_SIZE}. "
-                               f"Ensure this matches GLM's vector database configuration.")
+                        # This is an internal KPS configuration or model setup error.
+                        msg = (f"KPS Internal Error: Model '{self.config.EMBEDDING_MODEL_NAME}' output dimension {len(embeddings)} "
+                               f"mismatches configured DEFAULT_VECTOR_SIZE {self.config.DEFAULT_VECTOR_SIZE}.")
                         logger.error(msg)
-                        context.abort(grpc.StatusCode.INTERNAL, "Embedding dimension configuration mismatch.")
-                        return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
-                except Exception as e:
-                    msg = f"Error during embedding generation by model: {e}"
+                        context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Embedding dimension configuration mismatch in KPS.")
+                        return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+                except Exception as e_embed: # Catch specific model errors if possible
+                    msg = f"Error during embedding generation by model: {e_embed}"
                     logger.error(msg, exc_info=True)
-                    context.abort(grpc.StatusCode.INTERNAL, msg)
-                    return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
-            elif is_text_content and not self.embedding_model:
-                logger.warning("Embedding model not loaded; embeddings will not be generated for text content.")
+                    context.abort(grpc.StatusCode.INTERNAL, f"Embedding generation failed: {e_embed}")
+                    return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+            elif is_text_content and not self.embedding_model: # Model loading failed earlier, and it's text
+                # This case should have been caught by FAILED_PRECONDITION at the start of RPC if model is essential for text.
+                # If we reach here, it implies model is optional or non-text.
+                logger.warning("KPS: Embedding model not available; embeddings will not be generated for text content.")
+
 
             kem_to_store = kem_pb2.KEM(
                 content_type=request.content_type,
@@ -422,28 +550,60 @@ class KnowledgeProcessorServiceImpl(kps_service_pb2_grpc.KnowledgeProcessorServi
                         status_message=f"KEM successfully processed and stored with ID: {kem_id_from_glm}"
                     )
                 else:
-                    # This case should ideally be an exception from _glm_store_kem_with_retry if something went wrong.
-                    msg = "Error: GLM.StoreKEM did not return an expected KEM object or KEM ID."
+                    # If _glm_store_kem_with_retry succeeded (no exception) but response is malformed.
+                    msg = "KPS Internal Error: GLM.StoreKEM did not return an expected KEM object or KEM ID after a successful RPC."
                     logger.error(msg)
-                    # Return a clear failure if the response is not as expected after successful RPC.
-                    return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=msg)
-            except grpc.RpcError as e_glm:
-                logger.error(f"KPS: gRPC error from GLM after retries: code={e_glm.code()}, details={e_glm.details()}")
-                return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=f"Error interacting with GLM: {e_glm.details()}")
-            except Exception as e_other_after_glm: # Catch any other unexpected errors after GLM call
-                 logger.error(f"KPS: Unexpected error after GLM call in ProcessRawData: {e_other_after_glm}", exc_info=True)
-                 context.abort(grpc.StatusCode.INTERNAL, f"Internal KPS error after GLM call: {e_other_after_glm}")
-                 return kps_service_pb2.ProcessRawDataResponse(success=False, status_message=f"Internal KPS error: {e_other_after_glm}")
+                    context.abort(grpc.StatusCode.INTERNAL, msg)
+                    return kps_service_pb2.ProcessRawDataResponse() # Unreachable
 
-        except Exception as e: # Broad exception catch for the entire method
-            logger.error(f"KPS: Unexpected error in ProcessRawData: {e}", exc_info=True)
+            except pybreaker.CircuitBreakerError as e_cb_store:
+                msg = f"KPS: GLM service unavailable (circuit breaker open) for StoreKEM. Data_id='{request.data_id}'"
+                logger.error(f"{msg}: {e_cb_store}")
+                context.abort(grpc.StatusCode.UNAVAILABLE, msg) # Abort KPS RPC
+                return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+            except grpc.RpcError as e_glm_store:
+                logger.error(f"KPS: gRPC error from GLM StoreKEM (Data_id='{request.data_id}', Code: {e_glm_store.code()}): {e_glm_store.details()}", exc_info=False)
+                # Propagate specific error from GLM if possible, or map to a suitable KPS error.
+                # Example: If GLM says INVALID_ARGUMENT because KPS formed a bad KEM, KPS might return INTERNAL.
+                # If GLM says UNAVAILABLE, KPS returns UNAVAILABLE.
+                mapped_code = e_glm_store.code()
+                if mapped_code == grpc.StatusCode.INVALID_ARGUMENT: # If GLM says KEM is bad
+                     mapped_code = grpc.StatusCode.INTERNAL # KPS should have formed it correctly
+                context.abort(mapped_code, f"Failed to store KEM in GLM: {e_glm_store.details()}")
+                return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+            except Exception as e_store_other:
+                 logger.error(f"KPS: Unexpected error during GLM StoreKEM (Data_id='{request.data_id}'): {e_store_other}", exc_info=True)
+                 context.abort(grpc.StatusCode.INTERNAL, f"Unexpected internal error storing KEM: {e_store_other}")
+                 return kps_service_pb2.ProcessRawDataResponse() # Unreachable
+
+        except UnicodeDecodeError as e_decode: # Already handled above, but as a safeguard if logic changes
+            logger.error(f"KPS: Unicode decode error for data_id '{request.data_id}': {e_decode}", exc_info=True) # Should not be reached if handled earlier
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Invalid UTF-8 content for data_id '{request.data_id}'.")
+            return kps_service_pb2.ProcessRawDataResponse()
+        except Exception as e_main_process:
+            logger.error(f"KPS: Unexpected error in ProcessRawData for data_id '{request.data_id}': {e_main_process}", exc_info=True)
             context.abort(grpc.StatusCode.INTERNAL, "Internal KPS error during data processing.")
-            return kps_service_pb2.ProcessRawDataResponse(success=False, status_message="Internal KPS error.")
+            return kps_service_pb2.ProcessRawDataResponse() # Unreachable
 
-    def __del__(self):
+    def close_resources(self):
+        """Closes gRPC channels and other resources held by the servicer instance."""
         if self.glm_channel:
-            self.glm_channel.close()
-            logger.info("GLM client channel in KPS closed.")
+            try:
+                self.glm_channel.close()
+                logger.info("KPS: Main GLM client channel closed.")
+            except Exception as e:
+                logger.error(f"KPS: Error closing main GLM client channel: {e}", exc_info=True)
+        if self.glm_health_check_channel:
+            try:
+                self.glm_health_check_channel.close()
+                logger.info("KPS: GLM health check client channel closed.")
+            except Exception as e:
+                logger.error(f"KPS: Error closing GLM health check client channel: {e}", exc_info=True)
+
+    # __del__ is not a reliable way to close channels, use explicit close_resources
+    # def __del__(self):
+    #     self.close_resources()
+
 
 def serve():
     logger.info(f"KPS Configuration: GLM Address={config.GLM_SERVICE_ADDRESS}, KPS Listen Address={config.GRPC_LISTEN_ADDRESS}, "
@@ -462,15 +622,45 @@ def serve():
     )
 
     # Add Health Servicer
-    from grpc_health.v1 import health, health_pb2_grpc
-    health_servicer = health.HealthServicer()
-    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
-    # TODO: Implement more detailed health checks for KPS (e.g., model loaded, GLM connectivity).
-    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+    from grpc_health.v1 import health, health_pb2, health_pb2_grpc # Ensure health_pb2 for enums
+    # from grpc_health.v1.health_pb2 import HealthCheckRequest as HC_Request # Already imported above for class
 
+    # Custom HealthServicer for KPS
+    class KPSHealthServicer(health.HealthServicer):
+        def __init__(self, kps_service_instance: KnowledgeProcessorServiceImpl, initial_status: health_pb2_types.HealthCheckResponse.ServingStatus = health_pb2_types.HealthCheckResponse.SERVING):
+            super().__init__()
+            self._kps_service = kps_service_instance
+            self.set("", initial_status)
+            logger.info(f"KPS Initial Health Status set to: {health_pb2_types.HealthCheckResponse.ServingStatus.Name(initial_status)}")
 
-    server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
-    logger.info(f"Starting KPS (Knowledge Processor Service) on {config.GRPC_LISTEN_ADDRESS} with health checks enabled...")
+        def Check(self, request: health_pb2.HealthCheckRequest, context) -> health_pb2.HealthCheckResponse:
+            current_status = self._kps_service.check_overall_health()
+            self.set(request.service, current_status) # Update status for the requested service (or "" for overall)
+            return super().Check(request, context)
+
+    kps_health_servicer = KPSHealthServicer(servicer_instance, servicer_instance.check_overall_health())
+    health_pb2_grpc.add_HealthServicer_to_server(kps_health_servicer, server)
+
+    if config.GRPC_SERVER_CERT_PATH and config.GRPC_SERVER_KEY_PATH:
+        try:
+            with open(config.GRPC_SERVER_KEY_PATH, 'rb') as f:
+                server_key = f.read()
+            with open(config.GRPC_SERVER_CERT_PATH, 'rb') as f:
+                server_cert = f.read()
+
+            server_credentials = grpc.ssl_server_credentials([(server_key, server_cert)])
+            server.add_secure_port(config.GRPC_LISTEN_ADDRESS, server_credentials)
+            logger.info(f"Starting KPS (Knowledge Processor Service) SECURELY on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled.")
+        except FileNotFoundError as e_certs:
+            logger.critical(f"CRITICAL: TLS certificate/key file not found for KPS server: {e_certs}. KPS server NOT STARTED securely.")
+            return
+        except Exception as e_tls_setup:
+            logger.critical(f"CRITICAL: Error setting up TLS for KPS server: {e_tls_setup}. KPS server NOT STARTED securely.", exc_info=True)
+            return
+    else:
+        server.add_insecure_port(config.GRPC_LISTEN_ADDRESS)
+        logger.info(f"Starting KPS (Knowledge Processor Service) INSECURELY on {config.GRPC_LISTEN_ADDRESS} with detailed health checks enabled (TLS cert/key not configured).")
+
     server.start()
     logger.info(f"KPS started and listening for connections on {config.GRPC_LISTEN_ADDRESS}.")
     try:
@@ -478,7 +668,12 @@ def serve():
     except KeyboardInterrupt:
         logger.info("Stopping KPS server...")
     finally:
-        server.stop(config.GRPC_SERVER_SHUTDOWN_GRACE_S) # Use configured grace period
+        if 'servicer_instance' in locals() and hasattr(servicer_instance, 'close_resources'):
+            logger.info("KPS: Closing servicer resources...")
+            servicer_instance.close_resources()
+
+        logger.info(f"KPS: Stopping gRPC server with {config.GRPC_SERVER_SHUTDOWN_GRACE_S}s grace...")
+        server.stop(config.GRPC_SERVER_SHUTDOWN_GRACE_S)
         logger.info("KPS server stopped.")
 
 if __name__ == '__main__':

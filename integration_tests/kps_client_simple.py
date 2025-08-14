@@ -16,11 +16,11 @@ try:
     # Если KPS имеет свой generated_grpc, то from dcs_memory.services.kps.generated_grpc import ...
     # Предполагаем, что PYTHONPATH настроен так, что generated_grpc доступен.
     # Для простоты, предположим, что мы можем импортировать так, если тесты запускаются из корня:
-    from dcs_memory.services.kps.generated_grpc import kps_service_pb2
-    from dcs_memory.services.kps.generated_grpc import kps_service_pb2_grpc
+    from dcs_memory.generated_grpc import kps_service_pb2
+    from dcs_memory.generated_grpc import kps_service_pb2_grpc
 except ModuleNotFoundError:
     print("Ошибка: Не удалось импортировать сгенерированный gRPC код для KPS.")
-    print("Убедитесь, что gRPC код сгенерирован в dcs_memory/services/kps/generated_grpc")
+    print("Убедитесь, что gRPC код сгенерирован в dcs_memory/generated_grpc")
     print("и что PYTHONPATH настроен правильно, если запускаете этот скрипт не из корня проекта.")
     sys.exit(1)
 

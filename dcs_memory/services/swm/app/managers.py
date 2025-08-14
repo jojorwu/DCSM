@@ -4,9 +4,10 @@ import logging
 import time
 import uuid
 from typing import Dict, Set, List, Optional, AsyncGenerator
+from dataclasses import dataclass # Added import for dataclass
 
 from .config import SWMConfig
-from generated_grpc import kem_pb2, swm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, swm_service_pb2
 from google.protobuf.timestamp_pb2 import Timestamp
 
 # Assuming SubscriberInfo dataclass might be defined here or imported if it's common
@@ -18,11 +19,11 @@ logger = logging.getLogger(__name__)
 class SubscriberInfoInternal: # Renamed to avoid conflict if SubscriberInfo is also a proto message
     event_queue: asyncio.Queue
     original_topics: List[swm_service_pb2.SubscriptionTopic] # Store original topics for removal logic
+    subscriber_id: str # Added for easier reference
     # Parsed filters might be more complex and stored internally by the manager
     # For now, we can keep it simple or let the manager handle parsing internally.
     # parsed_filters: Dict[str, Set[str]]
     subscribes_to_all_kem_lifecycle: bool = False
-    subscriber_id: str # Added for easier reference
 
 
 class SubscriptionManager:
@@ -31,26 +32,25 @@ class SubscriptionManager:
         self.subscribers_lock = asyncio.Lock()
         self.subscribers: Dict[str, SubscriberInfoInternal] = {}
 
-        # Modified index structures to support event type filtering per filter criteria.
-        # For a specific filter (e.g., kem_id="X" or metadata.key="Y"), store which event types the subscriber wants.
-        # If desired_event_types is empty for a filter, it means all event types for that filter.
-        # Map: filter_key (e.g. "kem_id:X") -> subscriber_id -> Set[EventType] (empty set means all types)
-        self.specific_filters_to_subscribers: Dict[str, Dict[str, Set[swm_service_pb2.SWMMemoryEvent.EventType]]] = {}
-
+        # Corrected index structures:
         # For subscribers to ALL KEM_LIFECYCLE_EVENTS (no specific filter_criteria or empty filter_criteria)
-        # Map: subscriber_id -> Set[EventType] (empty set means all types for "all KEMs")
-        self.general_kem_lifecycle_subscribers: Dict[str, Set[swm_service_pb2.SWMMemoryEvent.EventType]] = {}
-        logger.info("SubscriptionManager initialized with new index structures for event type filtering.")
+        self.general_kem_lifecycle_subscribers: Set[str] = set()
 
-    def _parse_filter_key(self, key_from_criteria: str, value_from_criteria: str) -> Optional[str]:
-        """Helper to create a unique key for specific_filters_to_subscribers map."""
-        if key_from_criteria == "kem_id":
-            return f"kem_id:{value_from_criteria}"
-        elif key_from_criteria.startswith("metadata."):
-            actual_meta_key = key_from_criteria.split("metadata.", 1)[1]
-            if actual_meta_key:
-                return f"metadata:{actual_meta_key}:{value_from_criteria}"
-        return None
+        # For subscribers to specific KEM IDs
+        # Map: kem_id_value -> Set[subscriber_id]
+        self.kem_id_to_subscribers: Dict[str, Set[str]] = {}
+
+        # For subscribers to specific metadata key-value pairs
+        # Map: metadata_key -> metadata_value -> Set[subscriber_id]
+        self.metadata_exact_match_to_subscribers: Dict[str, Dict[str, Set[str]]] = {}
+
+        # self.specific_filters_to_subscribers was an attempt at a more complex structure,
+        # but current parsing and usage are simpler with kem_id_to_subscribers and metadata_exact_match_to_subscribers.
+        # We will remove self.specific_filters_to_subscribers for clarity and use the direct maps.
+
+        logger.info("SubscriptionManager initialized with corrected index structures.")
+
+    # _parse_filter_key is no longer needed with direct index population.
 
     async def add_subscriber(self, subscriber_id: str, topics: List[swm_service_pb2.SubscriptionTopic], requested_q_size: int) -> asyncio.Queue:
         actual_q_size = max(self.config.SUBSCRIBER_MIN_QUEUE_SIZE,
@@ -58,127 +58,120 @@ class SubscriptionManager:
                                 self.config.SUBSCRIBER_MAX_QUEUE_SIZE))
         event_queue = asyncio.Queue(maxsize=actual_q_size)
 
-        parsed_filters: Dict[str, Set[str]] = {}
-        sub_all_kem = False # Default: not subscribed to all KEM events
+        # Store filters parsed for this specific subscriber to aid in removal from indexes later
+        parsed_specific_filters_for_this_sub: Dict[str, Set[str]] = {}
+        sub_all_kem = False
 
-        has_at_least_one_kem_topic_with_filter = False
-
-        if not topics: # No topics provided at all
-            # If the default behavior for an empty topic list for KEM_LIFECYCLE_EVENTS
-            # (if such a concept exists implicitly) means "subscribe to all", this needs to be handled.
-            # For now, no topics means no KEM subscriptions.
-            pass
-        else:
+        if topics:
             for topic in topics:
                 if topic.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS:
                     if not topic.filter_criteria or topic.filter_criteria.strip() == "":
-                        # Explicit subscription to all KEM events via empty filter on KEM_LIFECYCLE_EVENTS topic
                         sub_all_kem = True
-                        parsed_filters.clear() # No specific filters needed if subscribed to all
-                        break # Found "subscribe to all" condition
+                        # If subscribing to all, specific filters for KEM_LIFECYCLE_EVENTS are overridden for this subscriber
+                        # We still process other topic types if any, but for KEMs, it's all.
+                        # Clear any KEM-specific filters collected so far for this subscriber.
+                        parsed_specific_filters_for_this_sub.clear()
+                        break # No need to parse other KEM_LIFECYCLE_EVENTS filters if this one is "all"
 
-                    # Parse filter_criteria (simple key=value for now)
                     if '=' in topic.filter_criteria:
                         key, value = topic.filter_criteria.split("=", 1)
-                        key = key.strip()
-                        value = value.strip()
-                        if key and value: # Ensure key and value are not empty after strip
-                            parsed_filters.setdefault(key, set()).add(value)
-                            if key == "kem_id" or (key.startswith("metadata.") and key.split("metadata.",1)[1]):
-                                has_at_least_one_kem_topic_with_filter = True
+                        key = key.strip(); value = value.strip()
+                        if key and value:
+                            parsed_specific_filters_for_this_sub.setdefault(key, set()).add(value)
                         else:
                             logger.warning(f"SubscriptionManager: Malformed filter_criteria '{topic.filter_criteria}' for subscriber '{subscriber_id}'. Skipped.")
                     else:
                         logger.warning(f"SubscriptionManager: Unparseable filter_criteria '{topic.filter_criteria}' (no '=') for subscriber '{subscriber_id}'. Skipped.")
 
-            if not sub_all_kem and not has_at_least_one_kem_topic_with_filter and \
-               any(t.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS for t in topics):
-                # This case means there were KEM_LIFECYCLE_EVENTS topics, but none had valid specific filters,
-                # and none were an explicit "subscribe to all" (empty filter).
-                # Defaulting to "subscribe to all" in this ambiguous case might be too broad.
-                # Let's make it so that if there are KEM topics but no valid filters, it's NOT a sub_all_kem.
-                # It means they might have provided malformed filters.
-                # If the intent was to subscribe to all, filter_criteria should be empty.
-                # Thus, sub_all_kem remains False unless explicitly set by an empty filter_criteria.
-                pass
-
-
         sub_info = SubscriberInfoInternal(
             event_queue=event_queue,
-            original_topics=list(topics), # Store a copy
-            subscribes_to_all_kem_lifecycle=sub_all_kem,
+            original_topics=list(topics), # Store a copy for removal logic
+            subscribes_to_all_kem_lifecycle=sub_all_kem, # Store if this sub gets all KEM events
             subscriber_id=subscriber_id
         )
 
         async with self.subscribers_lock:
             if subscriber_id in self.subscribers:
                 logger.warning(f"SubscriptionManager: Subscriber ID '{subscriber_id}' already exists. Removing old index entries before re-registering.")
-                self._remove_subscriber_from_indexes_internal(subscriber_id, self.subscribers[subscriber_id].original_topics) # Use original_topics from stored sub_info
+                # Use original_topics from the existing SubscriberInfoInternal for correct removal
+                self._remove_subscriber_from_indexes_internal(subscriber_id, self.subscribers[subscriber_id].original_topics)
 
             self.subscribers[subscriber_id] = sub_info
 
-            if sub_info.subscribes_to_all_kem_lifecycle:
-                self.general_kem_event_subscribers.add(subscriber_id)
+            if sub_all_kem:
+                self.general_kem_lifecycle_subscribers.add(subscriber_id)
                 logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' added to general KEM event subscribers.")
-            elif parsed_filters: # Only add to specific indexes if not sub_all_kem and there are parsed_filters
-                for key, values in parsed_filters.items():
+            else: # Only process specific filters if not subscribed to all KEM events
+                for key, values_set in parsed_specific_filters_for_this_sub.items():
                     if key == "kem_id":
-                        for value in values:
-                            self.kem_id_to_subscribers.setdefault(value, set()).add(subscriber_id)
-                            logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' indexed for kem_id='{value}'.")
+                        for value_item in values_set:
+                            self.kem_id_to_subscribers.setdefault(value_item, set()).add(subscriber_id)
+                            logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' indexed for kem_id='{value_item}'.")
                     elif key.startswith("metadata."):
                         actual_meta_key = key.split("metadata.", 1)[1]
-                        if actual_meta_key: # Ensure there's a key after "metadata."
+                        if actual_meta_key:
                             meta_key_index = self.metadata_exact_match_to_subscribers.setdefault(actual_meta_key, {})
-                            for value in values:
-                                meta_key_index.setdefault(value, set()).add(subscriber_id)
-                                logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' indexed for metadata.{actual_meta_key}='{value}'.")
-            # If not sub_all_kem and no valid parsed_filters for KEMs, they won't receive KEM events.
-            logger.info(f"SubscriptionManager: Subscriber '{subscriber_id}' added/updated. Total subscribers: {len(self.subscribers)}. General KEM subs: {len(self.general_kem_event_subscribers)}.")
+                            for value_item in values_set:
+                                meta_key_index.setdefault(value_item, set()).add(subscriber_id)
+                                logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' indexed for metadata.{actual_meta_key}='{value_item}'.")
+
+            logger.info(f"SubscriptionManager: Subscriber '{subscriber_id}' added/updated. Total subscribers: {len(self.subscribers)}. General KEM subs: {len(self.general_kem_lifecycle_subscribers)}. KEM ID specific subs: {len(self.kem_id_to_subscribers)}. Metadata specific subs: {len(self.metadata_exact_match_to_subscribers)}.")
         return event_queue
 
     async def remove_subscriber(self, subscriber_id: str):
         async with self.subscribers_lock:
-            removed_info = self.subscribers.pop(subscriber_id, None)
-            if removed_info:
-                logger.info(f"SubscriptionManager: Subscriber '{subscriber_id}' removed from list. Remaining: {len(self.subscribers)}")
-                self._remove_subscriber_from_indexes_internal(subscriber_id, removed_info.original_topics) # Use original_topics from the removed info
+            removed_sub_info = self.subscribers.pop(subscriber_id, None)
+            if removed_sub_info:
+                logger.info(f"SubscriptionManager: Subscriber '{subscriber_id}' removed from main list. Remaining: {len(self.subscribers)}")
+                # Use the original_topics from the removed SubscriberInfoInternal for accurate index cleanup
+                self._remove_subscriber_from_indexes_internal(subscriber_id, removed_sub_info.original_topics)
             else:
                 logger.warning(f"SubscriptionManager: Attempted to remove non-existent subscriber '{subscriber_id}'.")
 
     def _remove_subscriber_from_indexes_internal(self, subscriber_id: str, original_topics: List[swm_service_pb2.SubscriptionTopic]):
         # This method must be called under self.subscribers_lock by the caller
-        self.general_kem_event_subscribers.discard(subscriber_id)
 
-        # Re-parse filters from original_topics to ensure correct removal from indexes
-        # This avoids relying on potentially stale parsed_filters in a SubscriberInfo if it was modified elsewhere (though it shouldn't be)
-        filters_to_remove: Dict[str, Set[str]] = {}
+        # Check if this subscriber was a general KEM lifecycle subscriber
+        # This check is based on the original_topics that led to its registration.
+        was_general_subscriber = False
+        parsed_specific_filters_for_removal: Dict[str, Set[str]] = {}
+
         for topic in original_topics:
-            if topic.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS and \
-               topic.filter_criteria and '=' in topic.filter_criteria:
-                key, value = topic.filter_criteria.split("=", 1)
-                key = key.strip(); value = value.strip()
-                filters_to_remove.setdefault(key, set()).add(value)
+            if topic.type == swm_service_pb2.SubscriptionTopic.TopicType.KEM_LIFECYCLE_EVENTS:
+                if not topic.filter_criteria or topic.filter_criteria.strip() == "":
+                    was_general_subscriber = True
+                    parsed_specific_filters_for_removal.clear() # No specific filters if it was general
+                    break
+                if '=' in topic.filter_criteria:
+                    key, value = topic.filter_criteria.split("=", 1)
+                    key = key.strip(); value = value.strip()
+                    if key and value:
+                        parsed_specific_filters_for_removal.setdefault(key, set()).add(value)
 
-        for kem_id_val in filters_to_remove.get("kem_id", set()):
-            if kem_id_val in self.kem_id_to_subscribers:
-                self.kem_id_to_subscribers[kem_id_val].discard(subscriber_id)
-                if not self.kem_id_to_subscribers[kem_id_val]:
-                    del self.kem_id_to_subscribers[kem_id_val]
+        if was_general_subscriber:
+            self.general_kem_lifecycle_subscribers.discard(subscriber_id)
+            logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' removed from general KEM lifecycle subscribers.")
+        else: # Only remove from specific filters if not a general subscriber
+            for key, values_set in parsed_specific_filters_for_removal.items():
+                if key == "kem_id":
+                    for value_item in values_set:
+                        if value_item in self.kem_id_to_subscribers:
+                            self.kem_id_to_subscribers[value_item].discard(subscriber_id)
+                            if not self.kem_id_to_subscribers[value_item]:
+                                del self.kem_id_to_subscribers[value_item]
+                elif key.startswith("metadata."):
+                    actual_meta_key = key.split("metadata.", 1)[1]
+                    if actual_meta_key and actual_meta_key in self.metadata_exact_match_to_subscribers:
+                        value_map = self.metadata_exact_match_to_subscribers[actual_meta_key]
+                        for value_item in values_set:
+                            if value_item in value_map:
+                                value_map[value_item].discard(subscriber_id)
+                                if not value_map[value_item]:
+                                    del value_map[value_item]
+                        if not value_map:
+                            del self.metadata_exact_match_to_subscribers[actual_meta_key]
+            logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' removed from specific filter indexes.")
 
-        for meta_filter_key, meta_filter_values in filters_to_remove.items():
-            if meta_filter_key.startswith("metadata."):
-                actual_meta_key = meta_filter_key.split("metadata.",1)[1]
-                if actual_meta_key and actual_meta_key in self.metadata_exact_match_to_subscribers:
-                    value_map = self.metadata_exact_match_to_subscribers[actual_meta_key]
-                    for meta_value in meta_filter_values:
-                        if meta_value in value_map:
-                            value_map[meta_value].discard(subscriber_id)
-                            if not value_map[meta_value]:
-                                del value_map[meta_value]
-                    if not value_map: # If the map for this actual_meta_key is now empty
-                        del self.metadata_exact_match_to_subscribers[actual_meta_key]
-        logger.debug(f"SubscriptionManager: Subscriber '{subscriber_id}' removed from specific filter indexes.")
 
     async def notify_kem_event(self, kem: kem_pb2.KEM, event_type: swm_service_pb2.SWMMemoryEvent.EventType, source_agent_id: str = "SWM_SERVER"):
         if not kem or not kem.id:
@@ -191,36 +184,38 @@ class SubscriptionManager:
             details=f"Event type {event_type} for KEM ID {kem.id}"
         )
 
-        subscribers_to_notify_map: Dict[str, SubscriberInfoInternal] = {} # Use dict to avoid duplicate notifications if sub matches multiple ways
+        # Use a set to collect subscriber IDs to ensure each subscriber gets the event at most once per notification
+        subscriber_ids_to_notify_set: Set[str] = set()
 
         async with self.subscribers_lock: # Lock for reading subscriber indexes and list
-            # 1. General subscribers
-            for sub_id in self.general_kem_event_subscribers:
-                if sub_id in self.subscribers and sub_id not in subscribers_to_notify_map:
-                     subscribers_to_notify_map[sub_id] = self.subscribers[sub_id]
+            # 1. General subscribers (now a Set[str])
+            subscriber_ids_to_notify_set.update(self.general_kem_lifecycle_subscribers)
 
             # 2. Subscribers by KEM ID
             if kem.id in self.kem_id_to_subscribers:
-                for sub_id in self.kem_id_to_subscribers[kem.id]:
-                    if sub_id in self.subscribers and sub_id not in subscribers_to_notify_map:
-                         subscribers_to_notify_map[sub_id] = self.subscribers[sub_id]
+                subscriber_ids_to_notify_set.update(self.kem_id_to_subscribers[kem.id])
 
             # 3. Subscribers by metadata
             if kem.metadata:
                 for meta_key, meta_value_kem in kem.metadata.items():
                     if meta_key in self.metadata_exact_match_to_subscribers:
                         value_map = self.metadata_exact_match_to_subscribers[meta_key]
-                        if meta_value_kem in value_map:
-                            for sub_id in value_map[meta_value_kem]:
-                                if sub_id in self.subscribers and sub_id not in subscribers_to_notify_map:
-                                     subscribers_to_notify_map[sub_id] = self.subscribers[sub_id]
+                        if meta_value_kem in value_map: # meta_value_kem is string from protobuf
+                            subscriber_ids_to_notify_set.update(value_map[meta_value_kem])
 
-        if not subscribers_to_notify_map:
+            # Retrieve SubscriberInfoInternal for all unique IDs collected
+            subscribers_to_dispatch_to = {
+                sub_id: self.subscribers[sub_id]
+                for sub_id in subscriber_ids_to_notify_set
+                if sub_id in self.subscribers # Ensure subscriber still exists
+            }
+
+        if not subscribers_to_dispatch_to:
             logger.debug(f"SubscriptionManager: No subscribers for KEM event on '{kem.id}' (type: {event_type}).")
             return
 
-        logger.debug(f"SubscriptionManager: Dispatching event for KEM '{kem.id}' (type: {event_type}) to {len(subscribers_to_notify_map)} subscribers.")
-        for sub_id, sub_info_item in subscribers_to_notify_map.items():
+        logger.debug(f"SubscriptionManager: Dispatching event for KEM '{kem.id}' (type: {event_type}) to {len(subscribers_to_dispatch_to)} subscribers.")
+        for sub_id, sub_info_item in subscribers_to_dispatch_to.items(): # Corrected variable name here
             try:
                 if sub_info_item.event_queue.full():
                     logger.warning(f"Subscriber queue full for subscriber_id='{sub_id}', event_id='{event_to_dispatch.event_id}' (KEM_ID='{kem.id}') lost. Queue size: {sub_info_item.event_queue.qsize()}/{sub_info_item.event_queue.maxsize}")
@@ -247,29 +242,40 @@ else
 end
 """
 
+RENEW_LOCK_LUA_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  return 1
+else
+  return 0
+end
+"""
+
 class DistributedLockManager:
     def __init__(self, config: SWMConfig, redis_client: any): # 'any' for aioredis.Redis type hint if not globally available
         self.config = config
         self.redis = redis_client # Store the aioredis client
-        # self.locks: Dict[str, LockInfoInternalSWM] = {} # No longer needed, Redis is source of truth
-        # self.lock_condition = asyncio.Condition() # No longer needed for Redis implementation with polling
-        self._stop_event = asyncio.Event() # Kept if _expired_lock_cleanup_loop is adapted
-        self._cleanup_task: Optional[asyncio.Task] = None # Cleanup loop might be removed or simplified
+        self._stop_event = asyncio.Event()
+        self._cleanup_task: Optional[asyncio.Task] = None
 
-        # Load Lua script for releasing locks
         self._release_script_sha: Optional[str] = None
-        asyncio.create_task(self._load_lua_scripts()) # Load scripts in background
-
+        self._renew_script_sha: Optional[str] = None
+        # Do not call async methods from __init__
         logger.info("DistributedLockManager initialized to use Redis.")
+
+    async def initialize(self):
+        """Asynchronously loads Lua scripts into Redis. Should be called after creation."""
+        await self._load_lua_scripts()
 
     async def _load_lua_scripts(self):
         try:
             if self.redis:
                 self._release_script_sha = await self.redis.script_load(RELEASE_LOCK_LUA_SCRIPT)
-                logger.info(f"DistributedLockManager: Loaded Redis Lua script for lock release (SHA: {self._release_script_sha}).")
+                logger.info(f"DistributedLockManager: Loaded Lua script for lock release (SHA: {self._release_script_sha}).")
+                self._renew_script_sha = await self.redis.script_load(RENEW_LOCK_LUA_SCRIPT)
+                logger.info(f"DistributedLockManager: Loaded Lua script for lock renewal (SHA: {self._renew_script_sha}).")
         except Exception as e:
             logger.error(f"DistributedLockManager: Failed to load Lua scripts into Redis: {e}", exc_info=True)
-            # Application might still work but lock release won't be atomic via script if SHA is None.
 
     async def start_cleanup_task(self):
         # With Redis TTLs, an explicit cleanup loop for expired locks is less critical.
@@ -332,23 +338,50 @@ class DistributedLockManager:
                 existing_lock_value_bytes = await self.redis.get(lock_key)
                 if existing_lock_value_bytes:
                     existing_lock_value = existing_lock_value_bytes.decode('utf-8', errors='ignore')
-                    if existing_lock_value.startswith(f"{agent_id}:"): # Check if current agent holds it
-                        # Attempt to renew by re-setting with XX and new PX.
-                        # This is an optimistic renewal. A more robust renewal might use Lua.
-                        renewed = await self.redis.set(lock_key, existing_lock_value, xx=True, px=effective_lease_ms)
-                        if renewed:
-                            acquired_at_unix_ms = now_unix_ms # Or fetch original acquisition time if stored separately
-                            expires_at = now_unix_ms + effective_lease_ms
-                            logger.info(f"LockManager: Lock on '{resource_id}' already held by '{agent_id}', lease renewed. Expires: {expires_at}")
-                            return swm_service_pb2.AcquireLockResponse(
-                                resource_id=resource_id, agent_id=agent_id, status=swm_service_pb2.LockStatusValue.ALREADY_HELD_BY_YOU,
-                                lock_id=existing_lock_value, acquired_at_unix_ms=acquired_at_unix_ms, # This acquired_at is renewal time
-                                lease_expires_at_unix_ms=expires_at, message="Lock already held; lease renewed."
-                            )
-                        else: # Renewal failed (e.g. key expired between GET and SET XX)
-                            logger.warning(f"LockManager: Failed to renew lock for '{resource_id}' held by '{agent_id}' (key might have expired). Retrying acquisition.")
-                            # Continue loop to attempt fresh acquisition
-                    # else: Lock held by another agent (or value format is unexpected)
+                    # Check if the current agent holds the lock by comparing the full lock_value (which is the lock_id)
+                    # This requires the agent to pass its current lock_id if it's trying to renew.
+                    # The acquire_lock RPC doesn't have a field for "current_lock_id_if_renewing".
+                    # So, we can only reliably check if the agent_id part matches.
+                    # The Lua script for renewal (if we were to use it here) would need the exact current lock_value.
+                    #
+                    # Current logic: If `SET NX` fails, it means lock exists.
+                    # If an agent calls `acquire_lock` again for a lock it might hold,
+                    # the `lock_value` generated in this call will be new.
+                    # So, simply trying `SET NX PX` again is the correct path for a "fresh" acquire.
+                    # The "renewal" part is if the agent *knew* it held the lock and wanted to extend it.
+                    # The current API `acquire_lock` doesn't distinguish well between "acquire new" and "renew existing for me".
+                    #
+                    # Let's assume the current interpretation: if SET NX PX fails, and the lock *is* held by the current agent_id
+                    # (by parsing the agent_id from the stored lock_value), then it's a renewal scenario.
+                    # The `lock_value` generated for THIS call is `agent_id:new_uuid`.
+                    # The `existing_lock_value` is `agent_id:old_uuid`.
+                    #
+                    # To use the Lua renewal script, the agent would need to provide its *current* `lock_id` (which is `existing_lock_value`).
+                    # Since `acquire_lock` doesn't take `current_lock_id`, we can't use the Lua renewal script directly here
+                    # without changing the API or how `lock_value` is constructed/used.
+                    #
+                    # The previous optimistic renewal `await self.redis.set(lock_key, existing_lock_value, xx=True, px=effective_lease_ms)`
+                    # was attempting to renew the *existing_lock_value* if it was found.
+                    # This is more like a "refresh lease if I still own it".
+                    #
+                    # Let's stick to the behavior that `acquire_lock` always tries to get a *new* lock or fail/timeout.
+                    # If an agent wants to renew, it should perhaps use a different method or `acquire_lock`
+                    # could be made smarter if it gets the *same* agent_id trying to acquire again.
+                    #
+                    # For now, if `lock_acquired` is false, it means it's held by someone (could be self with old UUID, or other).
+                    # The polling loop will just keep trying `SET NX PX` with the *new* `lock_value`.
+                    # This means an agent calling `acquire_lock` again for a resource it holds will effectively
+                    # try to acquire it "fresh" if its old lease expires. This is simpler and avoids complex renewal logic here.
+                    # The `ALREADY_HELD_BY_YOU` status would only be returned if the *exact same* `lock_value` somehow was attempted to be set again,
+                    # which is unlikely with UUIDs.
+                    #
+                    # The Lua script for renewal is better suited for an explicit `renew_lock(resource_id, current_lock_id, new_lease_ms)` API.
+                    # Given the current API, the polling loop for `SET NX PX` is the path.
+                    # The `ALREADY_HELD_BY_YOU` part of the original in-memory logic is harder to map directly
+                    # to `SET NX PX` without an explicit renewal call.
+                    #
+                    # If `SET NX PX` fails, the lock is held. We just wait and retry.
+                    pass # Fall through to polling logic
 
                 # If timeout is 0, don't wait/retry
                 if timeout_ms == 0:

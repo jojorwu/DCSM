@@ -15,7 +15,7 @@ from dcsm_agent_sdk_python.glm_client import GLMClient
 # RETRYABLE_STATUS_CODES и _retry_grpc_call (теперь retry_grpc_call) больше не импортируются отсюда,
 # так как они инкапсулированы в dcs_memory.common.grpc_utils и используются GLMClient внутренне.
 # Импортируем также glm_service_pb2 для создания фейковых запросов/ответов, если потребуется
-from dcsm_agent_sdk_python.generated_grpc_code import glm_service_pb2
+from dcs_memory.generated_grpc import glm_service_pb2
 
 
 # Вспомогательная функция для создания фейковой ошибки RpcError
@@ -33,7 +33,7 @@ class TestGLMClientRetry(unittest.TestCase):
         self.mock_grpc_channel = self.mock_grpc_channel_patcher.start()
         self.mock_channel_instance = self.mock_grpc_channel.return_value
 
-        self.mock_glm_stub_patcher = patch('dcsm_agent_sdk_python.generated_grpc_code.glm_service_pb2_grpc.GlobalLongTermMemoryStub')
+        self.mock_glm_stub_patcher = patch('dcs_memory.generated_grpc.glm_service_pb2_grpc.GlobalLongTermMemoryStub')
         self.MockGLMStub = self.mock_glm_stub_patcher.start()
         self.mock_stub_instance = self.MockGLMStub.return_value
 
@@ -118,7 +118,7 @@ class TestGLMClientRetry(unittest.TestCase):
         # Нам нужно мокнуть stub.RetrieveKEMs
         mock_grpc_response = glm_service_pb2.RetrieveKEMsResponse()
         # Попробуем импортировать kem_pb2 здесь снова, на всякий случай
-        from dcsm_agent_sdk_python.generated_grpc_code import kem_pb2 as local_kem_pb2
+        from dcs_memory.generated_grpc import kem_pb2 as local_kem_pb2
         kem_to_add = local_kem_pb2.KEM(id="kem1")
         kem_to_add.content = "data".encode()
         mock_grpc_response.kems.append(kem_to_add)
@@ -129,14 +129,14 @@ class TestGLMClientRetry(unittest.TestCase):
             mock_grpc_response # Успешный ответ
         ]
 
-        # Мокаем _kem_proto_to_dict, так как он вызывается после успешного RetrieveKEMs
-        with patch.object(client, '_kem_proto_to_dict', return_value=mock_kem_dict):
-            kems, next_token = client.retrieve_kems(ids_filter=["kem1"])
+        # The conversion is now done inside the client method, which is already under test.
+        # No need to patch the conversion utility separately if we are checking the final output.
+        kems_retrieved, next_token_retrieved = client.retrieve_kems(ids_filter=["kem1"])
 
-        self.assertIsNotNone(kems)
-        self.assertEqual(len(kems), 1)
-        self.assertEqual(kems[0]["id"], "kem1")
-        self.assertEqual(next_token, "next_token")
+        self.assertIsNotNone(kems_retrieved)
+        self.assertEqual(len(kems_retrieved), 1)
+        self.assertEqual(kems_retrieved[0]['id'], "kem1")
+        self.assertEqual(next_token_retrieved, "next_token")
         self.assertEqual(self.mock_stub_instance.RetrieveKEMs.call_count, 2)
         self.assertEqual(self.mock_time_sleep.call_count, 1)
 

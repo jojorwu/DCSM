@@ -6,6 +6,7 @@ import sys
 import os
 import uuid
 import logging
+import json # Added import for json
 # import threading # No longer needed if IndexedLRUCache is fully replaced by Redis logic
 import random
 
@@ -17,16 +18,21 @@ import typing
 from typing import Optional, List, Set, Dict, Callable, AsyncGenerator, Tuple
 
 from dcs_memory.common.grpc_utils import async_retry_grpc_call # Import async retry decorator
+from google.protobuf.timestamp_pb2 import Timestamp # Added import for Timestamp
 
-# Attempt to import aioredis
+# Attempt to import redis.asyncio as aioredis
 try:
-    import aioredis # type: ignore
+    import redis.asyncio as aioredis
 except ImportError:
     aioredis = None # type: ignore
-    logging.getLogger(__name__).warning("aioredis library not found. RedisKemCache will not be available.")
+    logging.getLogger(__name__).warning("redis library not found, Redis-based components will not be available.")
 
+# For Health Checks (ensure these are after logging setup if they log at import time)
+from grpc_health.v1 import health_pb2, health_pb2_grpc
+from grpc_health.v1._async import HealthServicer
+from grpc_health.v1.health_pb2 import HealthCheckRequest as HC_Request
 
-from .config import SWMConfig
+from .config import SWMConfig # Moved SWMConfig import before setup_logging uses it for type hint
 from .managers import SubscriptionManager, DistributedLockManager, DistributedCounterManager
 # Import RedisKemCache only if aioredis is available, or handle its absence
 if aioredis:
@@ -37,22 +43,32 @@ else:
 # config instance is created after setup_logging is defined, so pass it then.
 # logger will be configured by setup_logging.
 
-from .config import SWMConfig # Moved up to be available for setup_logging type hint
+from .config import SWMConfig
+from pythonjsonlogger import jsonlogger # Ensure this is imported if used by setup_logging
+
+# Attempt to import pybreaker, make it optional
+try:
+    import pybreaker
+except ImportError:
+    pybreaker = None
 
 # Centralized logging setup
-def setup_logging(log_config: SWMConfig): # Type hint SWMConfig
+def setup_logging(log_config: SWMConfig):
     handlers_list = []
-    formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
+
+    if log_config.LOG_OUTPUT_MODE in ["json_stdout", "json_file"]:
+        json_fmt_str = getattr(log_config, 'LOG_JSON_FORMAT', log_config.LOG_FORMAT)
+        formatter = jsonlogger.JsonFormatter(fmt=json_fmt_str, datefmt=log_config.LOG_DATE_FORMAT)
+    else: # For "stdout", "file"
+        formatter = logging.Formatter(fmt=log_config.LOG_FORMAT, datefmt=log_config.LOG_DATE_FORMAT)
 
     if log_config.LOG_OUTPUT_MODE in ["stdout", "json_stdout"]:
-        # TODO: JSON Formatter for json_stdout
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
         handlers_list.append(stream_handler)
 
     if log_config.LOG_OUTPUT_MODE in ["file", "json_file"]:
         if log_config.LOG_FILE_PATH:
-            # TODO: JSON Formatter for json_file, directory creation, rotation
             try:
                 file_handler = logging.FileHandler(log_config.LOG_FILE_PATH)
                 file_handler.setFormatter(formatter)
@@ -102,48 +118,100 @@ config = SWMConfig() # Global config instance for the module
 logger = setup_logging(config) # Global logger instance for the module
 
 
-from generated_grpc import kem_pb2
-from generated_grpc import glm_service_pb2
-from generated_grpc import glm_service_pb2_grpc
-from generated_grpc import swm_service_pb2
-from generated_grpc import swm_service_pb2_grpc
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2, glm_service_pb2_grpc, swm_service_pb2, swm_service_pb2_grpc
 
 # IndexedLRUCache class definition is removed.
 
 class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemoryServiceServicer):
     def __init__(self, service_config: SWMConfig): # Accept config instance
-        self.config = service_config # Use passed config
-        # Logger is already configured at module level.
-        # Setting level on the instance logger is not standard if module logger is used.
-        # logger.setLevel(self.config.get_log_level_int()) # This would affect the global module logger
+        self.config = service_config
         logger.info(f"Initializing SharedWorkingMemoryServiceImpl with config ID: {id(self.config)}...")
 
         self.aio_glm_channel: Optional[grpc_aio.Channel] = None
         self.aio_glm_stub: Optional[glm_service_pb2_grpc.GlobalLongTermMemoryStub] = None
-        # Retryable error codes are handled by the async_retry_grpc_call decorator by default.
-        # If specific codes are needed for SWM's GLM calls, they can be configured and passed.
-        try:
-            if self.config.GLM_SERVICE_ADDRESS:
-                grpc_options = [
+
+        self.glm_circuit_breaker: Optional[pybreaker.CircuitBreaker] = None
+        if pybreaker and self.config.CIRCUIT_BREAKER_ENABLED:
+            self.glm_circuit_breaker = pybreaker.CircuitBreaker(
+                fail_max=self.config.CIRCUIT_BREAKER_FAIL_MAX,
+                reset_timeout=self.config.CIRCUIT_BREAKER_RESET_TIMEOUT_S
+            )
+            logger.info(f"SWM: GLM client circuit breaker enabled: fail_max={self.config.CIRCUIT_BREAKER_FAIL_MAX}, reset_timeout={self.config.CIRCUIT_BREAKER_RESET_TIMEOUT_S}s")
+        else:
+            logger.info(f"SWM: GLM client circuit breaker is disabled (pybreaker not installed or CIRCUIT_BREAKER_ENABLED=False).")
+
+        # GLM Client for Health Check (separate, simpler channel)
+        self.glm_health_check_channel: typing.Optional[grpc_aio.Channel] = None
+        self.glm_health_check_stub: typing.Optional[health_pb2_grpc.HealthStub] = None
+        if self.config.GLM_SERVICE_ADDRESS:
+            try:
+                health_check_grpc_options = [ # Simplified options for health check client
                     ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS),
                     ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
-                    ('grpc.keepalive_permit_without_calls', 1 if self.config.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS else 0),
-                    ('grpc.http2.min_ping_interval_without_data_ms', self.config.GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS),
-                    ('grpc.max_receive_message_length', self.config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
-                    ('grpc.max_send_message_length', self.config.GRPC_MAX_SEND_MESSAGE_LENGTH),
                 ]
-                self.aio_glm_channel = grpc_aio.insecure_channel(
-                    self.config.GLM_SERVICE_ADDRESS,
-                    options=grpc_options
-                )
-                self.aio_glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.aio_glm_channel)
-                logger.info(f"GLM client (async) for SWM initialized, target: {self.config.GLM_SERVICE_ADDRESS}, options: {grpc_options}")
-            else:
-                logger.warning("GLM_SERVICE_ADDRESS not configured. GLM features will be unavailable in SWM.")
-        except Exception as e:
-            logger.error(f"Error initializing asynchronous GLM client in SWM: {e}", exc_info=True)
-            self.aio_glm_stub = None
-            if self.aio_glm_channel: logger.warning("SWM: GLM async channel was created but stub initialization failed.")
+                self.glm_health_check_channel = grpc_aio.insecure_channel(self.config.GLM_SERVICE_ADDRESS, options=health_check_grpc_options)
+                self.glm_health_check_stub = health_pb2_grpc.HealthStub(self.glm_health_check_channel) # This was already using insecure_channel
+                logger.info(f"SWM: GLM health check client initialized for target: {self.config.GLM_SERVICE_ADDRESS} (using insecure channel for now, will match main client).")
+            except Exception as e_hc_client:
+                logger.error(f"SWM: Error initializing GLM health check client: {e_hc_client}", exc_info=True)
+                self.glm_health_check_stub = None # Ensure it's None on failure
+
+        # Main GLM client for operations
+        if self.config.GLM_SERVICE_ADDRESS:
+            grpc_options = [
+                ('grpc.keepalive_time_ms', self.config.GRPC_KEEPALIVE_TIME_MS),
+                ('grpc.keepalive_timeout_ms', self.config.GRPC_KEEPALIVE_TIMEOUT_MS),
+                ('grpc.keepalive_permit_without_calls', 1 if self.config.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS else 0),
+                ('grpc.http2.min_ping_interval_without_data_ms', self.config.GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS),
+                ('grpc.max_receive_message_length', self.config.GRPC_MAX_RECEIVE_MESSAGE_LENGTH),
+                ('grpc.max_send_message_length', self.config.GRPC_MAX_SEND_MESSAGE_LENGTH),
+            ]
+            if self.config.GRPC_CLIENT_LB_POLICY:
+                grpc_options.append(('grpc.lb_policy_name', self.config.GRPC_CLIENT_LB_POLICY))
+
+            target_address = self.config.GLM_SERVICE_ADDRESS
+            logger.info(f"SWM: GLM client (async) preparing to connect to: {target_address} with LB policy: {self.config.GRPC_CLIENT_LB_POLICY or 'default (pick_first)'}")
+
+            try:
+                if self.config.GRPC_CLIENT_ROOT_CA_CERT_PATH:
+                    logger.info(f"SWM: Attempting to create SECURE gRPC channels (main and health) to GLM at {target_address}")
+                    with open(self.config.GRPC_CLIENT_ROOT_CA_CERT_PATH, 'rb') as f:
+                        root_ca_cert = f.read()
+                    channel_credentials = grpc.ssl_channel_credentials(root_certificates=root_ca_cert)
+
+                    self.aio_glm_channel = grpc_aio.secure_channel(target_address, channel_credentials, options=grpc_options)
+                    # Secure health check channel as well
+                    self.glm_health_check_channel = grpc_aio.secure_channel(target_address, channel_credentials, options=health_check_grpc_options)
+                    logger.info(f"SWM: SECURE GLM client channels (main and health) initialized for target: {target_address}")
+                else:
+                    logger.info(f"SWM: Creating INSECURE gRPC channels (main and health) to GLM at {target_address} (no client CA cert path provided).")
+                    self.aio_glm_channel = grpc_aio.insecure_channel(target_address, options=grpc_options)
+                    # Ensure health check channel is also insecure if main is
+                    if self.glm_health_check_channel: # If it was somehow created before, close it
+                        asyncio.create_task(self.glm_health_check_channel.close()) # Close existing if any
+                    self.glm_health_check_channel = grpc_aio.insecure_channel(target_address, options=health_check_grpc_options)
+
+                if self.aio_glm_channel:
+                    self.aio_glm_stub = glm_service_pb2_grpc.GlobalLongTermMemoryStub(self.aio_glm_channel)
+                if self.glm_health_check_channel: # Re-init stub if channel was changed
+                    self.glm_health_check_stub = health_pb2_grpc.HealthStub(self.glm_health_check_channel)
+
+                logger.info(f"GLM client (async) for SWM initialized (channel type determined by TLS config). Target: {target_address}")
+
+            except FileNotFoundError as e_certs_swm:
+                logger.critical(f"SWM: CRITICAL - Root CA file not found for GLM client: {e_certs_swm}. SWM may fail to connect to a secure GLM.")
+                self.aio_glm_stub = None; self.aio_glm_channel = None
+                self.glm_health_check_stub = None; self.glm_health_check_channel = None
+                raise RuntimeError(f"Failed to load TLS credentials for SWM's GLM client: {e_certs_swm}") from e_certs_swm
+            except Exception as e_swm_glm_client:
+                logger.error(f"Error initializing asynchronous GLM client in SWM: {e_swm_glm_client}", exc_info=True)
+                self.aio_glm_stub = None; self.aio_glm_channel = None # Ensure cleanup on error
+                self.glm_health_check_stub = None; self.glm_health_check_channel = None
+                # Potentially re-raise or handle based on severity if init must succeed
+        else:
+            logger.warning("SWM: GLM_SERVICE_ADDRESS not configured. GLM features will be unavailable.")
+            self.aio_glm_stub = None # Ensure stubs are None
+            self.glm_health_check_stub = None
 
         self.redis_client: Optional[aioredis.Redis] = None # type: ignore
         self.redis_kem_cache: Optional[RedisKemCache] = None # type: ignore
@@ -187,10 +255,12 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
     async def start_background_tasks(self):
         self._stop_event.clear()
+        if self.lock_manager:
+            await self.lock_manager.initialize()
         await self.lock_manager.start_cleanup_task()
 
         if self._glm_persistence_worker_task is None or self._glm_persistence_worker_task.done():
-            self._glm_persistence_worker_task = asyncio.create_task(self._glm_persistence_worker())
+            self._glm_persistence_worker_task = asyncio.create_task(self._persistence_worker())
             logger.info("SWM: GLM persistence worker task started.")
 
         if self.redis_client and RedisKemCache and self.redis_kem_cache and \
@@ -236,8 +306,70 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
             except Exception as e: logger.error(f"SWM: Error closing Redis client: {e}", exc_info=True)
             self.redis_client = None; self.redis_kem_cache = None
 
+        if self.glm_health_check_channel: # Close GLM health check channel
+            logger.info("SWM: Closing GLM health check client channel.")
+            try: await self.glm_health_check_channel.close()
+            except Exception as e: logger.error(f"SWM: Error closing GLM health check channel: {e}", exc_info=True)
+            self.glm_health_check_channel = None; self.glm_health_check_stub = None
+
+
+    async def _check_redis_health(self) -> bool:
+        if not self.redis_client:
+            logger.warning("SWM Health Check: Redis client not available.")
+            return False
+        try:
+            timeout = getattr(self.config, "HEALTH_CHECK_REDIS_TIMEOUT_S", 1.0)
+            await asyncio.wait_for(self.redis_client.ping(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"SWM Health Check: Redis PING timed out after {timeout}s.")
+            return False
+        except (aioredis.exceptions.ConnectionError, ConnectionRefusedError, aioredis.exceptions.RedisError) as e_redis_ping: # type: ignore
+            logger.warning(f"SWM Health Check: Redis PING failed: {e_redis_ping}")
+            return False
+        except Exception as e_ping_other:
+            logger.warning(f"SWM Health Check: Redis PING failed with unexpected error: {e_ping_other}")
+            return False
+
+    async def _check_glm_connectivity(self) -> bool:
+        if not self.config.GLM_SERVICE_ADDRESS:
+            return True
+        if not self.glm_health_check_stub:
+            logger.warning("SWM Health Check: GLM health check client not available.")
+            return False
+        try:
+            timeout = getattr(self.config, "HEALTH_CHECK_GLM_TIMEOUT_S", 2.0)
+            health_check_req = HC_Request(service="")
+            response = await self.glm_health_check_stub.Check(health_check_req, timeout=timeout) # await Check
+            if response.status == health_pb2.HealthCheckResponse.SERVING:
+                return True
+            else:
+                logger.warning(f"SWM Health Check: GLM reported status {health_pb2.HealthCheckResponse.ServingStatus.Name(response.status)}.")
+                return False
+        except grpc.RpcError as e:
+            logger.warning(f"SWM Health Check: GLM connectivity check failed with gRPC error: Code={e.code()}, Details='{e.details()}'.")
+            return False
+        except Exception as e_glm_check:
+            logger.warning(f"SWM Health Check: GLM connectivity check failed with unexpected error: {e_glm_check}")
+            return False
+
+    async def check_overall_health(self) -> health_pb2.HealthCheckResponse.ServingStatus:
+        redis_ok = await self._check_redis_health()
+        glm_ok = await self._check_glm_connectivity()
+
+        if redis_ok and glm_ok:
+            return health_pb2.HealthCheckResponse.SERVING
+
+        if not redis_ok:
+            logger.warning("SWM Health Status: Potentially NOT_SERVING due to Redis unavailability.")
+        if not glm_ok and self.config.GLM_SERVICE_ADDRESS:
+            logger.warning("SWM Health Status: Potentially NOT_SERVING due to GLM connectivity issue.")
+
+        return health_pb2.HealthCheckResponse.NOT_SERVING
+
+
     async def _listen_for_redis_evictions(self):
-        if not self.redis_client or not RedisKemCache or not self.redis_kem_cache:
+        if not self.redis_client or not RedisKemCache or not self.redis_kem_cache: # type: ignore
             logger.error("SWM Redis Eviction Listener: Prerequisites not met. Listener cannot start.")
             return
 
@@ -346,15 +478,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                  logger.error(f"SWM Redis Eviction Listener: Error during final pubsub cleanup: {e_final_unsub}", exc_info=True)
         logger.info("SWM Redis Eviction Listener: Stopped.")
 
-    # --- GLM Client Methods (using async_retry_grpc_call decorator) ---
-    # Note: The config for RETRY_MAX_ATTEMPTS etc. for SWM's GLM client calls
-# Attempt to import pybreaker, make it optional
-try:
-    import pybreaker
-except ImportError:
-    pybreaker = None
-
-# --- GLM Client Methods (using async_retry_grpc_call decorator and internal circuit breaker) ---
+    # --- GLM Client Methods (using async_retry_grpc_call decorator and internal circuit breaker) ---
     @async_retry_grpc_call(
         max_attempts=config.RETRY_MAX_ATTEMPTS, # Sourced from SWMConfig instance
         initial_delay_s=config.RETRY_INITIAL_DELAY_S,
@@ -364,7 +488,7 @@ except ImportError:
     async def _glm_retrieve_kems_async_with_retry(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int) -> glm_service_pb2.RetrieveKEMsResponse:
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for RetrieveKEMs.")
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, initial_metadata=None, trailing_metadata=None, details="SWM Internal Error: GLM client not available")
 
         async def actual_glm_call():
             logger.debug(f"Calling GLM RetrieveKEMs (async). Timeout: {timeout}s")
@@ -388,7 +512,7 @@ except ImportError:
     async def _glm_store_kem_async_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int) -> glm_service_pb2.StoreKEMResponse:
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for StoreKEM.");
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, initial_metadata=None, trailing_metadata=None, details="SWM Internal Error: GLM client not available")
 
         async def actual_glm_call():
             logger.debug(f"Calling GLM StoreKEM (async). Timeout: {timeout}s")
@@ -412,7 +536,7 @@ except ImportError:
     async def _glm_batch_store_kems_async_with_retry(self, request: glm_service_pb2.BatchStoreKEMsRequest, timeout: int) -> glm_service_pb2.BatchStoreKEMsResponse:
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for BatchStoreKEMs.");
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, initial_metadata=None, trailing_metadata=None, details="SWM Internal Error: GLM client not available")
 
         async def actual_glm_call():
             logger.debug(f"Calling GLM BatchStoreKEMs (async). KEMs: {len(request.kems)}, Timeout: {timeout}s")
@@ -434,7 +558,7 @@ except ImportError:
         return response
 
 
-    async def _glm_persistence_worker(self):
+    async def _persistence_worker(self):
         logger.info("SWM: GLM Persistence Worker started.")
         while not self._stop_event.is_set():
             current_batch_items_with_retry: List[Tuple[kem_pb2.KEM, int]] = []
@@ -857,18 +981,54 @@ async def serve():
     swm_service_pb2_grpc.add_SharedWorkingMemoryServiceServicer_to_server(servicer_instance,server)
 
     # Add Health Servicer for async server
-    from grpc_health.v1 import health_async, health_pb2_grpc # Use health_async for async server
-    # The HealthServicer from health_async is already an async servicer
-    health_servicer = health_async.HealthServicer()
-    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
-    # TODO: Implement more detailed health checks for SWM (e.g., Redis connectivity, GLM connectivity).
-    health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
+    # Imports for health checks are now at the top of the file
+
+    class SWMHealthServicer(HealthServicer):
+        def __init__(self, swm_service_instance: SharedWorkingMemoryServiceImpl):
+            super().__init__()
+            self._swm_service = swm_service_instance
+            asyncio.create_task(self._set_initial_status()) # Schedule initial status check
+
+        async def _set_initial_status(self):
+            # Ensure config is available on the service instance for this initial call if needed by checks
+            if hasattr(self._swm_service, 'config') and self._swm_service.config is not None:
+                 initial_status = await self._swm_service.check_overall_health()
+                 self.set("", initial_status)
+                 logger.info(f"SWM Initial Health Status set to: {health_pb2.HealthCheckResponse.ServingStatus.Name(initial_status)}")
+            else:
+                 logger.warning("SWMHealthServicer: SWM service instance not fully configured at initial status set time. Defaulting to UNKNOWN.")
+                 self.set("", health_pb2.HealthCheckResponse.UNKNOWN)
 
 
-    listen_addr = servicer_instance.config.GRPC_LISTEN_ADDRESS # This is already from config
-    server.add_insecure_port(listen_addr)
+        async def Check(self, request: health_pb2.HealthCheckRequest, context: grpc_aio.ServicerContext) -> health_pb2.HealthCheckResponse:
+            current_status = await self._swm_service.check_overall_health()
+            self.set(request.service, current_status)
+            return await super().Check(request, context)
 
-    logger.info(f"Starting SWM async server on {listen_addr} with options: {final_server_options} and health checks enabled...")
+    swm_health_servicer = SWMHealthServicer(servicer_instance)
+    health_pb2_grpc.add_HealthServicer_to_server(swm_health_servicer, server)
+
+    listen_addr = servicer_instance.config.GRPC_LISTEN_ADDRESS
+    if config.GRPC_SERVER_CERT_PATH and config.GRPC_SERVER_KEY_PATH:
+        try:
+            with open(config.GRPC_SERVER_KEY_PATH, 'rb') as f:
+                server_key = f.read()
+            with open(config.GRPC_SERVER_CERT_PATH, 'rb') as f:
+                server_cert = f.read()
+
+            server_credentials = grpc.ssl_server_credentials([(server_key, server_cert)])
+            server.add_secure_port(listen_addr, server_credentials)
+            logger.info(f"Starting SWM async server SECURELY on {listen_addr} with options: {final_server_options} and detailed health checks enabled...")
+        except FileNotFoundError as e_certs:
+            logger.critical(f"CRITICAL: TLS certificate/key file not found for SWM server: {e_certs}. SWM server NOT STARTED securely.")
+            return
+        except Exception as e_tls_setup:
+            logger.critical(f"CRITICAL: Error setting up TLS for SWM server: {e_tls_setup}. SWM server NOT STARTED securely.", exc_info=True)
+            return
+    else:
+        server.add_insecure_port(listen_addr)
+        logger.info(f"Starting SWM async server INSECURELY on {listen_addr} with options: {final_server_options} and detailed health checks enabled (TLS cert/key not configured).")
+
     try:
         await server.start()
         if servicer_instance.redis_kem_cache:
@@ -878,7 +1038,7 @@ async def serve():
             # Start non-Redis dependent tasks
             await servicer_instance.lock_manager.start_cleanup_task()
             if servicer_instance._glm_persistence_worker_task is None or servicer_instance._glm_persistence_worker_task.done():
-                 servicer_instance._glm_persistence_worker_task = asyncio.create_task(servicer_instance._glm_persistence_worker())
+                 servicer_instance._glm_persistence_worker_task = asyncio.create_task(servicer_instance._persistence_worker())
                  logger.info("SWM: GLM persistence worker task started (Redis not available).")
 
         logger.info(f"SWM server started and listening on {listen_addr}.")
@@ -905,5 +1065,3 @@ if __name__=='__main__':
     except KeyboardInterrupt: logger.info("SWM main process interrupted by user.")
     except SystemExit as e_sysexit: logger.info(f"SWM main process exited: {e_sysexit}")
     except Exception as e_main: logger.critical(f"SWM main unhandled exception: {e_main}",exc_info=True)
-
-```

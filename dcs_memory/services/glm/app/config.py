@@ -1,6 +1,7 @@
-from typing import Optional
+from typing import Optional, Dict, Any, List # Added Dict, Any, List
 from pydantic import Field # Для Field, если нужны будут более сложные валидации или алиасы
 import os
+import logging # Added logging
 
 # Добавляем путь к common, если запускаем этот файл напрямую (для тестов config)
 # sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../')))
@@ -38,6 +39,69 @@ class GLMConfig(BaseServiceConfig):
     # Переопределяем LOG_LEVEL, если нужно специфичное для GLM значение по умолчанию,
     # или оно будет наследоваться из BaseServiceConfig (INFO)
     # LOG_LEVEL: str = "INFO"
+
+    # Storage backend selection
+    GLM_STORAGE_BACKEND_TYPE: str = Field(
+        default="default_sqlite_qdrant",
+        description="Type of persistent storage backend to use (e.g., 'default_sqlite_qdrant', 'in_memory')."
+    )
+    GLM_STORAGE_BACKENDS_CONFIGS: Dict[str, Any] = Field( # Changed from Dict[str, Dict[str,Any]] to Dict[str,Any] for Pydantic v2 compatibility with complex types if needed later, or just plain dicts.
+        default_factory=dict,
+        description="Dictionary holding configurations for different storage backends, keyed by backend type. Specific settings are defined by each backend implementation."
+    )
+
+    # Re-adding fields that were present in more recent versions from other tasks
+    SQLITE_CONNECT_TIMEOUT_S: int = Field(default=10, description="SQLite connection timeout in seconds.")
+    QDRANT_CLIENT_TIMEOUT_S: int = Field(default=10, description="Timeout for Qdrant client operations in seconds.")
+    QDRANT_DEFAULT_DISTANCE_METRIC: str = Field(default="COSINE", description="Default distance metric for Qdrant collections (e.g. COSINE, DOT, EUCLID).") # Kept as str, QdrantKemRepository converts to enum
+    QDRANT_PREFLIGHT_CHECK_TIMEOUT_S: int = Field(default=2, description="Timeout for Qdrant pre-flight check in seconds.")
+
+    HEALTH_CHECK_SQLITE_QUERY: str = Field(default="SELECT 1", description="SQLite query for health check.")
+    HEALTH_CHECK_QDRANT_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for Qdrant health check operation.")
+
+    SQLITE_CACHE_SIZE_KB: Optional[int] = Field(
+        default=-2048, # Default to 2MiB per connection
+        description="SQLite per-connection cache size. Negative value N means N KiB. Positive value N means N pages. Example: -2048 for 2MiB."
+    )
+
+    # KPS Service Connection (for GLM to call KPS, e.g., for indexing external data)
+    KPS_SERVICE_HOST: str = Field(default="localhost", description="Hostname for the KPS gRPC service.")
+    KPS_SERVICE_PORT: int = Field(default=50053, description="Port for the KPS gRPC service.")
+    # TODO: Add KPS client TLS settings if needed (similar to GRPC_SERVER_CERT_PATH etc.)
+
+    external_data_sources: List['ExternalDataSourceConfig'] = Field(
+        default_factory=list,
+        description="List of configurations for external data sources GLM can connect to."
+    )
+
+
+class ExternalDataSourceConfig(BaseServiceConfig): # Inherit for consistent settings behavior
+    model_config = SettingsConfigDict(
+        env_prefix='GLM_EXTERNAL_', # Example: GLM_EXTERNAL_MYDB_TYPE for a source named 'mydb'
+        case_sensitive=False,
+        extra='ignore'
+    )
+
+    name: str = Field(description="Unique user-defined name for this external data source. Used in KEMQuery to target this source.")
+    type: str = Field(description="Type of the external data source (e.g., 'postgresql', 'mongodb', 'csv_dir').")
+
+    # Connection options: provide either a URI or individual details
+    connection_uri: Optional[str] = Field(default=None, description="Connection URI for the data source (e.g., SQLAlchemy style).")
+    connection_details: Dict[str, Any] = Field(default_factory=dict, description="Key-value pairs for connection parameters (e.g., host, port, user, password, dbname).")
+
+    mapping_config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Configuration for mapping external data to KEMs. Structure depends on the 'type' and connector implementation (e.g., table names, column mappings, query templates)."
+    )
+
+    # Optional: Add a validator to ensure either connection_uri or connection_details are provided, but not both, or that details are sufficient for a type.
+    # @validator('connection_uri', always=True)
+    # def check_connection_options(cls, v, values):
+    #     if v and values.get('connection_details'):
+    #         raise ValueError("Provide either 'connection_uri' or 'connection_details', not both.")
+    #     if not v and not values.get('connection_details'):
+    #         raise ValueError("Either 'connection_uri' or 'connection_details' must be provided.")
+    #     return v
 
 
 if __name__ == '__main__':
@@ -107,6 +171,34 @@ if __name__ == '__main__':
 
     print(f"Log Level (from env for Base): {config_from_env.LOG_LEVEL}")
     assert config_from_env.LOG_LEVEL == "WARNING" # Прочитает LOG_LEVEL из окружения
+
+    print("--- Testing External Data Source Config Parsing ---")
+    ext_config_data = {
+        "external_data_sources": [
+            {
+                "name": "pg_source1",
+                "type": "postgresql",
+                "connection_uri": "postgresql://user:pass@host1/db1",
+                "mapping_config": {"table": "table1"}
+            },
+            {
+                "name": "local_files",
+                "type": "csv_dir",
+                "connection_details": {"path": "/mnt/data/csvs"},
+                "mapping_config": {"delimiter": ","}
+            }
+        ]
+    }
+    config_with_ext = GLMConfig(**ext_config_data)
+    assert len(config_with_ext.external_data_sources) == 2
+    assert config_with_ext.external_data_sources[0].name == "pg_source1"
+    assert config_with_ext.external_data_sources[0].type == "postgresql"
+    assert config_with_ext.external_data_sources[0].connection_uri == "postgresql://user:pass@host1/db1"
+    assert config_with_ext.external_data_sources[0].mapping_config == {"table": "table1"}
+    assert config_with_ext.external_data_sources[1].name == "local_files"
+    assert config_with_ext.external_data_sources[1].connection_details == {"path": "/mnt/data/csvs"}
+    print("External Data Source Config Parsed OK.")
+
 
     del os.environ["GLM_QDRANT_PORT"]
     del os.environ["GLM_DEFAULT_PAGE_SIZE"]

@@ -45,6 +45,12 @@ class BaseServiceConfig(BaseSettings):
     GRPC_SERVER_MAX_CONNECTION_AGE_MS: int = Field(default=0, description="gRPC server max connection age in ms (0 for infinite).")
     GRPC_SERVER_MAX_CONNECTION_AGE_GRACE_MS: int = Field(default=0, description="gRPC server max connection age grace period in ms (0 for infinite).")
 
+    # gRPC Client Load Balancing Policy
+    GRPC_CLIENT_LB_POLICY: Optional[str] = Field(
+        default="round_robin",
+        description="gRPC client-side load balancing policy (e.g., 'round_robin', 'pick_first'). Null/empty uses gRPC default. For 'round_robin' with DNS, ensure target address uses 'dns:///' scheme and GRPC_DNS_RESOLVER=ares is set in env for best results."
+    )
+
     # Circuit Breaker Configuration (shared defaults)
     CIRCUIT_BREAKER_ENABLED: bool = Field(default=True, description="Enable or disable circuit breakers globally for client calls.")
     CIRCUIT_BREAKER_FAIL_MAX: int = Field(default=5, description="Maximum number of failures before opening the circuit.")
@@ -69,6 +75,16 @@ class BaseServiceConfig(BaseSettings):
     )
     # Optional: For JSON logging, specify if default log record fields should be renamed or if specific ones are desired
     # For now, we'll rely on python-json-logger's defaults and ability to add extra fields via logging calls.
+
+    # TLS Configuration (Paths to PEM-encoded files)
+    # For Servers:
+    GRPC_SERVER_CERT_PATH: Optional[str] = Field(default=None, description="Path to the gRPC server's SSL certificate file (PEM format).")
+    GRPC_SERVER_KEY_PATH: Optional[str] = Field(default=None, description="Path to the gRPC server's SSL private key file (PEM format).")
+    # For Clients (e.g., a service acting as a client to another, or for mTLS server config):
+    GRPC_CLIENT_ROOT_CA_CERT_PATH: Optional[str] = Field(default=None, description="Path to the root CA certificate file (PEM format) for verifying server certificates.")
+    GRPC_CLIENT_CERT_PATH: Optional[str] = Field(default=None, description="Path to the gRPC client's SSL certificate file (PEM format) for mTLS.")
+    GRPC_CLIENT_KEY_PATH: Optional[str] = Field(default=None, description="Path to the gRPC client's SSL private key file (PEM format) for mTLS.")
+
 
     @classmethod
     def settings_customise_sources(
@@ -186,6 +202,20 @@ class GLMConfig(BaseServiceConfig):
     QDRANT_CLIENT_TIMEOUT_S: int = Field(default=10, description="Timeout for Qdrant client operations in seconds.")
     QDRANT_DEFAULT_DISTANCE_METRIC: Literal["COSINE", "DOT", "EUCLID"] = Field(default="COSINE", description="Default distance metric for Qdrant collections.")
     QDRANT_PREFLIGHT_CHECK_TIMEOUT_S: int = Field(default=2, description="Timeout for Qdrant pre-flight check in seconds.")
+
+    # GLM Health Check Settings
+    HEALTH_CHECK_SQLITE_QUERY: str = Field(default="SELECT 1", description="SQLite query for health check.")
+    # HEALTH_CHECK_QDRANT_TIMEOUT_S is implicitly covered by QDRANT_CLIENT_TIMEOUT_S for now,
+    # as the check uses the existing client. If a separate timeout for health check calls to Qdrant is needed,
+    # it could be added, but might require a separate Qdrant client instance for health checks.
+    # For simplicity, we assume the main client timeout is acceptable for health pings.
+    # Let's add it for explicit control if desired, though the implementation might just use main client.
+    HEALTH_CHECK_QDRANT_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for Qdrant health check operation.")
+
+    # Address for KPS, used by IndexExternalDataSource
+    KPS_SERVICE_ADDRESS: Optional[str] = Field(default=None, description="Address of the KPS service GLM connects to for indexing.")
+
+
     # GRPC_SERVER_MAX_WORKERS can be inherited from Base or overridden here if GLM needs specific value
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited or overridden
 
@@ -195,7 +225,7 @@ class KPSConfig(BaseServiceConfig):
     _service_config_key: ClassVar[str] = "kps"
     model_config = SettingsConfigDict(env_prefix='KPS_', extra='ignore')
 
-    GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service KPS connects to.")
+    GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service KPS connects to. For client-side load balancing, use 'dns:///service_name:port' and set GRPC_DNS_RESOLVER=ares environment variable.")
     EMBEDDING_MODEL_NAME: str = Field(description="Name or path to the sentence-transformer model.")
     DEFAULT_VECTOR_SIZE: int = Field(description="Expected/generated embedding dimension.")
     DEFAULT_PROCESSING_BATCH_SIZE: int = Field(default=32, description="Default batch size for processing documents.")
@@ -204,7 +234,11 @@ class KPSConfig(BaseServiceConfig):
     # KPS Idempotency Settings
     KPS_IDEMPOTENCY_CHECK_ENABLED: bool = Field(default=True, description="Enable idempotency checks for ProcessRawData based on data_id.")
     KPS_IDEMPOTENCY_METADATA_KEY: str = Field(default="source_data_id", description="Metadata key used to store/check data_id for idempotency.")
+
+    # KPS Health Check Settings
+    HEALTH_CHECK_GLM_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for KPS health checking GLM.")
     # TODO: Consider KPS_GLM_IDEMPOTENCY_CHECK_TIMEOUT_S if a separate timeout is needed for this specific GLM query.
+
 
     # GRPC_SERVER_MAX_WORKERS can be inherited or overridden
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited or overridden
@@ -215,7 +249,7 @@ class SWMConfig(BaseServiceConfig):
     _service_config_key: ClassVar[str] = "swm"
     model_config = SettingsConfigDict(env_prefix='SWM_', extra='ignore')
 
-    GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service for SWM.")
+    GLM_SERVICE_ADDRESS: str = Field(description="Address of the GLM service for SWM. For client-side load balancing, use 'dns:///service_name:port' and set GRPC_DNS_RESOLVER=ares environment variable.")
     MAX_CACHE_SIZE_KEMS: int = Field(description="Maximum number of KEMs in SWM's LRU cache (conceptual for Redis, actual eviction by Redis policies).")
     DEFAULT_KEM_TTL_SECONDS: int = Field(default=3600, description="Default TTL for KEMs in cache in seconds (used by RedisKemCache).")
 
@@ -263,6 +297,12 @@ class SWMConfig(BaseServiceConfig):
 
     # Redis Key Prefixes and Naming
     SWM_EVICTION_SOURCE_AGENT_ID: str = Field(default="SWM_REDIS_EVICTION", description="Source agent ID for KEM eviction events from Redis.")
+
+    # SWM Content Compression Settings
+    SWM_COMPRESSION_ENABLED: bool = Field(default=True, description="Enable compressing KEM content before storing in Redis.")
+    SWM_COMPRESSION_TYPE: Literal["lz4", "zlib"] = Field(default="lz4", description="Compression algorithm to use if enabled.")
+    SWM_COMPRESSION_MIN_SIZE_BYTES: int = Field(default=1024, description="Minimum size of KEM content in bytes to trigger compression.")
+
     REDIS_KEM_KEY_PREFIX: str = Field(default="swm_kem:", description="Prefix for KEM data keys in Redis.")
     REDIS_INDEX_META_KEY_PREFIX: str = Field(default="swm_idx:meta:", description="Prefix for metadata index keys in Redis.")
     REDIS_INDEX_DATE_CREATED_KEY: str = Field(default="swm_idx:date:created_at", description="Redis key for 'created_at' sorted set index.")
@@ -280,22 +320,18 @@ class SWMConfig(BaseServiceConfig):
     REDIS_LOCK_ACQUIRE_POLL_INTERVAL_S: float = Field(default=0.1, description="Polling interval when trying to acquire a distributed lock, in seconds.")
     REDIS_COUNTER_KEY_PREFIX: str = Field(default="dcsm:counter:", description="Prefix for distributed counter keys in Redis.")
 
+    # SWM Health Check Settings
+    HEALTH_CHECK_REDIS_TIMEOUT_S: float = Field(default=1.0, description="Timeout in seconds for SWM health checking Redis (PING).")
+    HEALTH_CHECK_GLM_TIMEOUT_S: float = Field(default=2.0, description="Timeout in seconds for SWM health checking GLM.")
+
     # SWM_INDEXED_METADATA_KEYS is already in SWMConfig
     # GRPC_SERVER_SHUTDOWN_GRACE_S can be inherited from BaseServiceConfig for SWM (async server)
 
 
-    @field_validator("SWM_INDEXED_METADATA_KEYS", mode="before")
-    @classmethod
-    def _parse_comma_separated_list(cls, value: Union[str, List[str]]) -> List[str]:
-        if isinstance(value, str):
-            return [key.strip() for key in value.split(',') if key.strip()]
-        elif isinstance(value, list):
-            return [str(key).strip() for key in value if str(key).strip()]
-        return []
 
 # Note: The __main__ block below is for quick testing of this config.py file directly.
 # For it to work correctly with the new YAML loading, you'd need a sample 'config.yml'
-# in the same directory or point DCSM_CONFIG_FILE env var to it.
+    # in the same directory or point DCSM_CONFIG_FILE env var to it.
 if __name__ == '__main__':
     # Create a dummy config.yml for testing
     dummy_config_content = """
@@ -377,5 +413,3 @@ swm:
     except OSError:
         pass
     print("\n--- Config test complete ---")
-
-```

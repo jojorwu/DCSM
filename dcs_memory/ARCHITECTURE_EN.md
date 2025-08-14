@@ -30,21 +30,26 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 
 *   **Location:** `dcs_memory/services/glm/`
 *   **Purpose:** Provides reliable and scalable persistent storage for all KEMs in the system.
-*   **Core Functions:**
-    *   Storing KEMs, including their content, metadata, and vector embeddings.
-    *   Retrieving KEMs by their unique identifiers.
-    *   Complex querying of KEMs using metadata filtering and date ranges.
-    *   Vector searchsimilarity search based on embeddings to find semantically similar KEMs.
-    *   Updating and deleting existing KEMs.
-    *   **Write Conflict Handling**: When saving KEMs (`StoreKEM`, `BatchStoreKEMs`) with an existing ID, the data is overwritten (logic of `INSERT OR REPLACE` in SQLite and `upsert` in Qdrant).
-    *   **Batch Storing and Consistency (`BatchStoreKEMs`)**: The `BatchStoreKEMs` method attempts to save each KEM in the batch. If embeddings for any KEM (if present) cannot be saved to Qdrant, the corresponding record for that KEM is deleted from SQLite to maintain basic consistency between metadata and vector stores. Internally, Qdrant updates for batches are optimized by sending points to Qdrant in a single batch call where possible.
-*   **Technologies (current implementation):**
-    *   gRPC for API definition and serving.
-    *   Qdrant: Used as a vector database for storing embeddings and performing similarity searches.
-    *   SQLite: Used for storing structured metadata and the main content of KEMs.
-*   **API (gRPC - `glm_service.proto`):**
-    *   `StoreKEM`: Saves or updates a single KEM. Generates an ID if not provided.
-    *   `RetrieveKEMs`: Retrieves KEMs based on complex criteria, including filters, vector queries, and pagination.
+*   **Storage Architecture:** GLM employs a `BasePersistentStorageRepository` abstraction layer. This allows the actual storage mechanism to be pluggable and configured.
+    *   **Configuration:** The active storage backend is determined by the `glm_storage_backend_type` setting in `config.yml` (or the `GLM_STORAGE_BACKEND_TYPE` environment variable). Backend-specific parameters can be provided under the `glm_storage_backends_configs` section in `config.yml`.
+    *   **Default Backend (`default_sqlite_qdrant`):**
+        *   This is the standard backend, utilizing SQLite for metadata and KEM content, and Qdrant for vector embeddings and similarity search.
+        *   It orchestrates writes and reads across these two datastores, including basic compensating actions to maintain consistency (e.g., rolling back a SQLite write if a corresponding Qdrant write fails).
+        *   Its configuration parameters (DB filename, Qdrant host/port, etc.) are primarily sourced from the top-level `glm:` section of `config.yml` or `GLM_*` environment variables.
+    *   **In-Memory Backend (`in_memory`):**
+        *   A non-persistent, in-memory storage option primarily for testing, development, or scenarios where data persistence is not required.
+        *   It implements basic filtering but currently does not support vector search.
+        *   Specific parameters (e.g., `max_kems`) can be set in `config.yml` under `glm_storage_backends_configs.in_memory`.
+    *   **Extensibility:** The `BasePersistentStorageRepository` ABC (in `dcs_memory/services/glm/app/repositories/base.py`) defines the contract for new storage backends. Developers can implement this interface to integrate other databases or storage systems with GLM.
+*   **Core Functions (exposed via gRPC API, fulfilled by the active storage backend):**
+    *   Storing KEMs (including content, metadata, vector embeddings).
+    *   Retrieving KEMs by ID or complex criteria (metadata filters, date ranges, vector search where supported by backend).
+    *   Updating and deleting KEMs.
+    *   Batch storage operations.
+*   **Error Handling**: The GLM service layer translates exceptions raised by the active storage repository (e.g., `KemNotFoundError`, `BackendUnavailableError`, `StorageError`) into appropriate gRPC status codes for the client (e.g., `NOT_FOUND`, `UNAVAILABLE`, `INTERNAL`).
+*   **API (gRPC - `glm_service.proto`):** (The external gRPC API remains consistent regardless of the chosen backend)
+    *   `StoreKEM`: Saves or updates a single KEM. ID generation and timestamp management are handled by the backend.
+    *   `RetrieveKEMs`: Retrieves KEMs based on complex criteria, including filters, vector queries (if backend supports), and pagination.
     *   `UpdateKEM`: Partially updates an existing KEM by its ID.
     *   `DeleteKEM`: Deletes a KEM by its ID.
 
@@ -60,9 +65,9 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **Technologies (current implementation):**
     *   gRPC for API.
     *   `sentence-transformers`: for generating embeddings.
-    *   GLM gRPC client (with a built-in retry mechanism `@retry_grpc_call` for enhanced fault tolerance when interacting with GLM).
+    *   GLM gRPC client: This client is equipped with retry mechanisms (`@retry_grpc_call`) and circuit breaker patterns for resilience. These features help KPS handle transient GLM issues gracefully and contribute to KPS returning meaningful error statuses (e.g., `UNAVAILABLE` or `INTERNAL`) to its own clients if GLM is persistently failing or returns an error. It also supports client-side load balancing (e.g., `round_robin` via DNS service discovery when GLM is scaled) configurable via shared gRPC client settings. For effective DNS load balancing, the `GRPC_DNS_RESOLVER=ares` environment variable should be set for the KPS service.
 *   **API (gRPC - `kps_service.proto`):**
-    *   `ProcessRawData`: Accepts raw data and metadata, processes them, and initiates storage in GLM. Returns the ID of the saved KEM and the operation status.
+    *   `ProcessRawData`: Accepts raw data and metadata, processes them, and initiates storage in GLM. Returns the ID of the saved KEM and the operation status, using standard gRPC status codes like `INVALID_ARGUMENT` for bad input or `INTERNAL` / `UNAVAILABLE` if downstream processing fails.
 
 ### 3.4. Shared Working Memory Service (SWM)
 
@@ -75,7 +80,9 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
     *   **Cache Querying:** Provides an interface (`QuerySWM`) for agents to request KEMs from the Redis cache with filtering by ID, indexed metadata, and dates. Default sorting is by update date.
     *   **KEM Publishing:** Agents can publish KEMs to SWM (`PublishKEMToSWM`). KEMs are stored in the Redis cache. If persistence is flagged, KEMs are queued for asynchronous batch writing to GLM.
     *   **Event Subscription:** The `SubscribeToSWMEvents` method allows agents to subscribe to KEM creation (`KEM_PUBLISHED`), update (`KEM_UPDATED`), and eviction (`KEM_EVICTED`) events within SWM. Filtering by ID, metadata, and event type is supported. `KEM_EVICTED` events are generated based on Redis Keyspace Notifications.
-    *   **Distributed Lock and Counter Management:** Provides mechanisms for agent coordination using Redis as the backend. `DistributedLockManager` uses Redis `SET NX PX` for lock acquisition and Lua scripts for safe release. `DistributedCounterManager` uses Redis atomic increment/decrement operations.
+    *   **Distributed Lock and Counter Management:** Provides mechanisms for agent coordination using Redis as the backend.
+        *   `DistributedLockManager` uses Redis `SET resource_key unique_value NX PX lease_ms` for initial lock acquisition. Lock release is performed atomically using a Lua script that verifies the unique lock value. A separate Lua script has been designed for atomic lock lease renewal (checking the unique lock value and using `PEXPIRE`), intended for a future dedicated `renew_lock(current_lock_id, ...)` method; the current `acquire_lock` method always attempts to acquire a new lock instance rather than renewing an existing one based on a prior lock ID.
+        *   `DistributedCounterManager` uses Redis atomic increment/decrement operations (`INCRBY`, `GET`).
 *   **Caching and Eviction Strategies in SWM**:
     *   **Storage**: Redis. KEMs are stored as Redis Hashes. Secondary indexes for metadata (on keys specified in `SWM_INDEXED_METADATA_KEYS`) and for `created_at`/`updated_at` dates are maintained using Redis Sets and Sorted Sets, respectively.
     *   **Eviction**: Managed by Redis based on the `allkeys-lru` policy and the `maxmemory` setting.
@@ -86,10 +93,11 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **Technologies (current implementation):**
     *   gRPC for API.
     *   Redis: For the primary KEM cache and secondary indexes. Uses the `aioredis` client.
-    *   GLM gRPC client (asynchronous, with retry logic).
+    *   GLM gRPC client (asynchronous): This client also incorporates retry mechanisms (`@async_retry_grpc_call`) and circuit breakers, which help SWM manage GLM unavailability or errors, impacting responses for operations like `LoadKEMsFromGLM` or the background persistence worker. It supports client-side load balancing (e.g., `round_robin` via DNS) similarly to the KPS GLM client, requiring appropriate configuration and the `GRPC_DNS_RESOLVER=ares` environment variable for the SWM service.
     *   Internal `asyncio.Queue` for SWM's Pub/Sub mechanism and for the GLM persistence queue.
+    *   **Error Handling**: SWM's own gRPC methods use standard codes like `INVALID_ARGUMENT` for malformed requests, `NOT_FOUND` if a resource (e.g., a lock) isn't found, `UNAVAILABLE` if a backend like Redis is down, or `INTERNAL` for other unexpected issues.
 *   **API (gRPC - `swm_service.proto`):**
-    *   `PublishKEMToSWM`: Publishes a KEM to SWM (Redis). Optionally queues it for asynchronous persistence to GLM.
+    *   `PublishKEMToSWM`: Publishes a KEM to SWM (Redis). Optionally queues it for asynchronous persistence to GLM. Returns status indicating success or issues (e.g., if queueing for GLM fails).
     *   `SubscribeToSWMEvents`: Subscribes to SWM events.
     *   `QuerySWM`: Queries KEMs from the SWM cache (Redis) with filtering.
     *   `LoadKEMsFromGLM`: Initiates loading of KEMs from GLM into the SWM cache (Redis).
@@ -296,19 +304,25 @@ The Dynamic Contextualized Shared Memory (DCSM) system is designed for efficient
 *   **More Sophisticated Caching and Eviction Policies in SWM:** For example, based on access frequency, KEM size, or explicit agent-set priorities.
 *   **Enhanced Filtering in `QuerySWM`:** Support for more complex queries on cached data, if feasible without turning SWM into a full-fledged database.
 *   **Implementation of Other Services:** Such as a service for managing agent configurations or a memory usage analytics service.
-*   **Security:** Adding authentication (e.g., gRPC token-based) and authorization (granular access rights to KEMs and service methods).
+*   **Security:**
+    *   **Transport Layer Security (TLS):** Implemented for inter-service gRPC communication (server-side TLS). Clients (KPS, SWM) can verify server certificates using a common Root CA. This is configurable via `GRPC_SERVER_CERT_PATH`, `GRPC_SERVER_KEY_PATH` (for servers) and `GRPC_CLIENT_ROOT_CA_CERT_PATH` (for clients) in `config.yml`. Mutual TLS (mTLS) is a future enhancement.
+    *   **Authentication & Authorization:** Adding comprehensive authentication (e.g., gRPC token-based) and authorization (granular access rights to KEMs and service methods) remains future work.
 *   **Containerization and Deployment:** Preparing `Dockerfile` for each service and `docker-compose.yml` examples to simplify local deployment and testing of the entire system. Transitioning to Kubernetes for production environments.
 *   **Comprehensive Integration and Load Testing.**
 *   **Error Handling and Fault Tolerance (Current State and Development):**
     *   **Current State**:
-        *   GLM clients (in KPS, SWM, AgentSDK) use a retry mechanism (`@retry_grpc_call`) for gRPC calls to GLM, helping to handle transient network issues or GLM restarts.
-        *   The GLM service has basic logic (`BatchStoreKEMs`) to maintain consistency between SQLite and Qdrant during batch insertions (if embeddings fail to save in Qdrant, the record is removed from SQLite).
-        *   The GLM service will not start if Qdrant is unavailable at startup. KPS and SWM log warnings if GLM is unavailable at their startup but may continue with limited functionality (e.g., SWM without persistence能力 or loading from GLM).
+        *   Inter-service gRPC calls (KPS->GLM, SWM->GLM, AgentSDK->Services) are protected by configurable retry mechanisms and circuit breakers to handle transient network issues or temporary service unavailability.
+        *   Client-side load balancing (e.g., `round_robin`) can be configured for these calls if the target service (e.g., GLM) is deployed with multiple instances and service discovery (e.g., DNS) is set up accordingly. This typically requires using the `dns:///` scheme in the target address and setting the `GRPC_DNS_RESOLVER=ares` environment variable in the client service's environment.
+        *   The GLM service has basic logic (`BatchStoreKEMs`, `StoreKEM`) to improve consistency between SQLite and Qdrant during writes, including some compensating actions on failure.
+        *   The GLM service will not start if Qdrant is unavailable at startup. KPS and SWM log warnings if GLM is unavailable at their startup but may continue with limited functionality. SWM also has a critical dependency on Redis.
+        *   SWM includes a Dead Letter Queue (DLQ) for KEMs that fail persistence to GLM after multiple retries.
+        *   KPS includes an optional idempotency check for `ProcessRawData` requests based on `data_id`.
+        *   Services now more consistently utilize standard gRPC status codes (e.g., `INVALID_ARGUMENT`, `NOT_FOUND`, `UNAVAILABLE`, `INTERNAL`, `ALREADY_EXISTS`) to communicate the outcome of operations and the nature of any errors, enhancing client understanding and diagnosability.
     *   **Development Directions**:
-        *   More granular error handling and rollback strategies for complex operations involving multiple services.
-        *   Implementation of "circuit breaker" patterns to prevent cascading failures.
-        *   Improved service behavior logique during prolonged unavailability of critical dependencies (e.g., queuing strategies for deferred processing).
-        *   **Health Checks**: All gRPC services (GLM, KPS, SWM) expose standard gRPC health check endpoints (`grpc.health.v1.Health/Check`). This allows orchestrators and monitoring systems to verify service health. Initial implementations report a basic SERVING status, with TODOs to add more detailed dependency checks.
+        *   More granular error handling and rollback strategies, particularly for GLM's multi-datastore operations.
+        *   Further refinement of circuit breaker interaction with specific gRPC error codes if needed.
+        *   Improved service behavior logique during prolonged unavailability of critical dependencies.
+        *   **Health Checks**: All gRPC services (GLM, KPS, SWM) expose standard gRPC health check endpoints (`grpc.health.v1.Health/Check`). These checks verify critical dependencies (e.g., GLM checks SQLite/Qdrant; KPS checks model/GLM; SWM checks Redis/GLM), allowing orchestrators to assess service health accurately.
 
 ### 3.6. The `IndexedLRUCache` Mechanism
 

@@ -5,7 +5,7 @@ cd "$SCRIPT_DIR" || exit 1 # Change to the script's directory for correct relati
 echo "Current directory for generation: $(pwd)"
 
 CENTRAL_PROTO_PATH_FROM_SCRIPT="../../common/grpc_protos"
-GENERATED_OUTPUT_DIR="./generated_grpc"
+GENERATED_OUTPUT_DIR="../../generated_grpc"
 
 echo "Generating gRPC code for GLM service..."
 echo "Source .proto files from: $CENTRAL_PROTO_PATH_FROM_SCRIPT"
@@ -33,7 +33,8 @@ $PYTHON_EXE -m grpc_tools.protoc \
     --python_out="$GENERATED_OUTPUT_DIR" \
     --grpc_python_out="$GENERATED_OUTPUT_DIR" \
     "$CENTRAL_PROTO_PATH_FROM_SCRIPT/kem.proto" \
-    "$CENTRAL_PROTO_PATH_FROM_SCRIPT/glm_service.proto"
+    "$CENTRAL_PROTO_PATH_FROM_SCRIPT/glm_service.proto" \
+    "$CENTRAL_PROTO_PATH_FROM_SCRIPT/kps_service.proto"
     # "$CENTRAL_PROTO_PATH_FROM_SCRIPT/swm_service.proto" # SWM not included for now
 
 # Create __init__.py in generated_grpc to make it a package
