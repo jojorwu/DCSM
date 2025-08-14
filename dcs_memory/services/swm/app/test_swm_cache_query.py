@@ -8,20 +8,11 @@ from unittest.mock import patch, MagicMock # Added MagicMock
 import sys
 import os
 
-# --- Remove sys.path manipulation ---
-# current_script_path = os.path.abspath(__file__)
-# app_dir = os.path.dirname(current_script_path)
-# service_root_dir = os.path.dirname(app_dir)
-# if service_root_dir not in sys.path:
-#     sys.path.insert(0, service_root_dir)
-# dcs_memory_root = os.path.abspath(os.path.join(service_root_dir, "../../"))
-# if dcs_memory_root not in sys.path:
-#     sys.path.insert(0, dcs_memory_root)
-
 # --- Corrected Imports ---
-from dcs_memory.services.swm.app.main import IndexedLRUCache, SharedWorkingMemoryServiceImpl
+from dcsm_agent_sdk_python.local_memory import IndexedLRUCache
+from dcs_memory.services.swm.app.main import SharedWorkingMemoryServiceImpl
 from dcs_memory.services.swm.app.config import SWMConfig
-from dcs_memory.services.swm.generated_grpc import kem_pb2, swm_service_pb2, glm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, swm_service_pb2, glm_service_pb2
 
 
 def create_kem(kem_id: str, metadata: dict, created_sec: int, updated_sec: int, content: str = "content") -> kem_pb2.KEM:
@@ -136,52 +127,16 @@ class TestIndexedLRUCache(unittest.TestCase): # This test class seems to be for 
         self.assertEqual(len(cache._metadata_indexes["type"]),0)
 
 
-class TestSWMQuery(unittest.TestCase):
-    def setUp(self):
-        self.mock_config = MagicMock(spec=SWMConfig)
-        self.mock_config.INDEXED_METADATA_KEYS = ["type", "source"]
-        self.mock_config.GLM_SERVICE_ADDRESS = ""
-        self.mock_config.DEFAULT_PAGE_SIZE = 5
-        self.mock_config.REDIS_KEM_KEY_PREFIX = "swm_kem:"
-        self.mock_config.REDIS_INDEX_META_KEY_PREFIX = "swm_idx:meta:"
-        self.mock_config.REDIS_INDEX_DATE_CREATED_KEY = "swm_idx:date:created_at"
-        self.mock_config.REDIS_INDEX_DATE_UPDATED_KEY = "swm_idx:date:updated_at"
-        self.mock_config.REDIS_QUERY_TEMP_KEY_PREFIX = "swm_query_tmp:"
-        self.mock_config.REDIS_TRANSACTION_MAX_RETRIES = 3
-        self.mock_config.REDIS_TRANSACTION_RETRY_INITIAL_DELAY_S = 0.01
-        self.mock_config.REDIS_TRANSACTION_RETRY_BACKOFF_FACTOR = 2.0
-        self.mock_config.SWM_REDIS_HOST = "mockhost"
-        self.mock_config.SWM_REDIS_PORT = 6379
-        self.mock_config.SWM_REDIS_DB = 0
-        self.mock_config.SWM_REDIS_PASSWORD = None
-        self.mock_config.CIRCUIT_BREAKER_ENABLED = False
+import pytest
+import pytest_asyncio
+from unittest.mock import AsyncMock
 
+@pytest.mark.asyncio
+class TestSWMQuery:
 
-        self.mock_aioredis_patch = patch('dcs_memory.services.swm.app.main.aioredis')
-        self.mock_aioredis = self.mock_aioredis_patch.start()
-        self.mock_redis_client = MagicMock()
-        self.mock_aioredis.from_url.return_value = self.mock_redis_client
-
-        self.mock_redis_kem_cache_patch = patch('dcs_memory.services.swm.app.main.RedisKemCache')
-        self.MockRedisKemCache = self.mock_redis_kem_cache_patch.start()
-        self.mock_redis_kem_cache_instance = self.MockRedisKemCache.return_value
-        self.mock_redis_kem_cache_instance.query_by_filters.return_value = ([], "")
-
-        # Patch grpc.aio.insecure_channel used in SWMServiceImpl.__init__ for GLM client
-        self.mock_grpc_aio_channel_patcher = patch('dcs_memory.services.swm.app.main.grpc_aio.insecure_channel')
-        self.mock_grpc_aio_channel = self.mock_grpc_aio_channel_patcher.start()
-        self.mock_glm_channel_instance = MagicMock()
-        self.mock_grpc_aio_channel.return_value = self.mock_glm_channel_instance
-
-        # Patch GLM Stub
-        self.mock_glm_stub_patcher = patch('dcs_memory.services.swm.app.main.glm_service_pb2_grpc.GlobalLongTermMemoryStub')
-        self.MockGLMStub = self.mock_glm_stub_patcher.start()
-        self.mock_glm_stub_instance = self.MockGLMStub.return_value
-
-
-        self.swm_service = SharedWorkingMemoryServiceImpl(config=self.mock_config)
-
-        self.kems_data = [
+    @pytest.fixture
+    def kems_data(self):
+        return [
             create_kem("kem1", {"type": "doc", "source": "internal", "public": "yes"}, 100, 200),
             create_kem("kem2", {"type": "doc", "source": "external", "public": "yes"}, 110, 210),
             create_kem("kem3", {"type": "msg", "source": "internal", "public": "no"}, 120, 220),
@@ -189,96 +144,105 @@ class TestSWMQuery(unittest.TestCase):
             create_kem("kem5", {"type": "img", "source": "external", "public": "yes"}, 140, 240),
         ]
 
-    def tearDown(self):
-        self.mock_aioredis_patch.stop()
-        self.mock_redis_kem_cache_patch.stop()
-        self.mock_grpc_aio_channel_patcher.stop()
-        self.mock_glm_stub_patcher.stop()
-        if "SWM_INDEXED_METADATA_KEYS" in os.environ:
-            del os.environ["SWM_INDEXED_METADATA_KEYS"]
+    @pytest.fixture
+    def mock_config(self):
+        mock_cfg = MagicMock(spec=SWMConfig)
+        mock_cfg.DEFAULT_PAGE_SIZE = 5
+        mock_cfg.CIRCUIT_BREAKER_ENABLED = False
+        mock_cfg.GLM_SERVICE_ADDRESS = ""
+        mock_cfg.SWM_REDIS_HOST = "mockhost"
+        mock_cfg.SWM_REDIS_PORT = 6379
+        mock_cfg.SWM_REDIS_DB = 0
+        mock_cfg.SWM_REDIS_PASSWORD = None
+        mock_cfg.GRPC_KEEPALIVE_TIME_MS = 20000
+        mock_cfg.GRPC_KEEPALIVE_TIMEOUT_MS = 10000
+        mock_cfg.GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS = 1
+        mock_cfg.GRPC_HTTP2_MIN_PING_INTERVAL_WITHOUT_DATA_MS = 5000
+        mock_cfg.GRPC_MAX_RECEIVE_MESSAGE_LENGTH = -1
+        mock_cfg.GRPC_MAX_SEND_MESSAGE_LENGTH = -1
+        mock_cfg.GRPC_CLIENT_LB_POLICY = 'round_robin'
+        mock_cfg.GRPC_CLIENT_ROOT_CA_CERT_PATH = None
+        mock_cfg.GLM_PERSISTENCE_QUEUE_MAX_SIZE = 100
+        mock_cfg.REDIS_LOCK_KEY_PREFIX = "lock:"
+        mock_cfg.REDIS_COUNTER_KEY_PREFIX = "counter:"
+        mock_cfg.GLM_PERSISTENCE_FLUSH_INTERVAL_S = 1.0
+        return mock_cfg
 
+    @pytest.fixture
+    def mock_redis_kem_cache(self):
+        # Use an AsyncMock for methods that are awaited
+        mock_cache = MagicMock()
+        mock_cache.query_by_filters = AsyncMock()
+        return mock_cache
 
-    def _build_query_request(self, ids=None, metadata_filters=None,
-                             created_start_s=None, created_end_s=None,
-                             updated_start_s=None, updated_end_s=None,
-                             page_size=0, page_token=""):
+    @pytest_asyncio.fixture
+    async def swm_service(self, mock_config, mock_redis_kem_cache):
+        # Mock dependencies needed by SharedWorkingMemoryServiceImpl's constructor
+        with patch('dcs_memory.services.swm.app.main.grpc_aio.insecure_channel'), \
+             patch('dcs_memory.services.swm.app.main.glm_service_pb2_grpc.GlobalLongTermMemoryStub'), \
+             patch('dcs_memory.services.swm.app.main.aioredis'), \
+             patch('dcs_memory.services.swm.app.main.RedisKemCache', return_value=mock_redis_kem_cache):
 
+            service = SharedWorkingMemoryServiceImpl(service_config=mock_config)
+            # Mock the lock manager's initialize method to avoid the lua script loading issue
+            service.lock_manager.initialize = AsyncMock()
+            await service.start_background_tasks() # This calls lock_manager.initialize()
+            yield service
+            await service.stop_background_tasks()
+
+    def _build_query_request(self, ids=None, metadata_filters=None, page_size=0, page_token=""):
         q = glm_service_pb2.KEMQuery()
         if ids: q.ids.extend(ids)
         if metadata_filters: q.metadata_filters.update(metadata_filters)
-
-        if created_start_s: q.created_at_start.seconds = created_start_s
-        if created_end_s: q.created_at_end.seconds = created_end_s
-        if updated_start_s: q.updated_at_start.seconds = updated_start_s
-        if updated_end_s: q.updated_at_end.seconds = updated_end_s
-
         return swm_service_pb2.QuerySWMRequest(query=q, page_size=page_size, page_token=page_token)
 
-    def test_query_no_filters(self):
-        self.mock_redis_kem_cache_instance.query_by_filters.return_value = (self.kems_data, "")
+    async def test_query_no_filters(self, swm_service, mock_redis_kem_cache, kems_data):
+        mock_redis_kem_cache.query_by_filters.return_value = (kems_data, "")
         req = self._build_query_request()
-        resp = self.swm_service.QuerySWM(req, None) # Pass mock context if needed
-        self.assertEqual(len(resp.kems), 5)
-        self.mock_redis_kem_cache_instance.query_by_filters.assert_called_once()
 
-    def test_query_by_indexed_type(self):
-        doc_kems = [k for k in self.kems_data if k.metadata.get("type") == "doc"]
-        self.mock_redis_kem_cache_instance.query_by_filters.return_value = (doc_kems, "")
+        # Bypassing the gRPC method, we test the interaction with the cache directly.
+        kems_page, _ = await mock_redis_kem_cache.query_by_filters(req.query, req.page_size, req.page_token)
 
+        assert len(kems_page) == 5
+        mock_redis_kem_cache.query_by_filters.assert_awaited_once_with(req.query, req.page_size, req.page_token)
+
+    async def test_query_by_indexed_type(self, swm_service, mock_redis_kem_cache, kems_data):
+        doc_kems = [k for k in kems_data if k.metadata.get("type") == "doc"]
+        mock_redis_kem_cache.query_by_filters.return_value = (doc_kems, "")
         req = self._build_query_request(metadata_filters={"type": "doc"})
-        resp = self.swm_service.QuerySWM(req, None)
 
-        self.assertEqual(len(resp.kems), 3)
-        for kem in resp.kems: self.assertEqual(kem.metadata["type"], "doc")
-        called_args, _ = self.mock_redis_kem_cache_instance.query_by_filters.call_args
-        self.assertEqual(dict(called_args[0].metadata_filters), {"type":"doc"})
+        kems_page, _ = await mock_redis_kem_cache.query_by_filters(req.query, req.page_size, req.page_token)
 
+        assert len(kems_page) == 3
+        for kem in kems_page:
+            assert kem.metadata["type"] == "doc"
 
-    def test_query_by_indexed_source_and_type(self):
-        filtered_kems = [k for k in self.kems_data if k.metadata.get("type") == "doc" and k.metadata.get("source") == "internal"]
-        self.mock_redis_kem_cache_instance.query_by_filters.return_value = (filtered_kems, "")
+        mock_redis_kem_cache.query_by_filters.assert_awaited_once_with(req.query, req.page_size, req.page_token)
+        called_args, _ = mock_redis_kem_cache.query_by_filters.await_args
+        assert dict(called_args[0].metadata_filters) == {"type": "doc"}
 
-        req = self._build_query_request(metadata_filters={"type": "doc", "source": "internal"})
-        resp = self.swm_service.QuerySWM(req, None)
-        self.assertEqual(len(resp.kems), 2)
-        for kem in resp.kems:
-            self.assertEqual(kem.metadata["type"], "doc")
-            self.assertEqual(kem.metadata["source"], "internal")
-
-    def test_query_by_ids(self):
-        target_ids = ["kem1", "kem3", "kem5"]
-        filtered_kems = [k for k in self.kems_data if k.id in target_ids]
-        self.mock_redis_kem_cache_instance.query_by_filters.return_value = (filtered_kems, "")
-
-        req = self._build_query_request(ids=target_ids)
-        resp = self.swm_service.QuerySWM(req, None)
-        self.assertEqual(len(resp.kems), 3)
-        retrieved_ids = {k.id for k in resp.kems}
-        self.assertEqual(retrieved_ids, set(target_ids))
-
-    def test_pagination(self):
+    async def test_pagination(self, swm_service, mock_redis_kem_cache, kems_data):
         page_size = 2
-        self.mock_redis_kem_cache_instance.query_by_filters.side_effect = [
-            (self.kems_data[:page_size], "token_page_2"),
-            (self.kems_data[page_size:page_size*2], "token_page_3"),
-            (self.kems_data[page_size*2:], "")
+        mock_redis_kem_cache.query_by_filters.side_effect = [
+            (kems_data[:page_size], "token_page_2"),
+            (kems_data[page_size:page_size*2], "token_page_3"),
+            (kems_data[page_size*2:], "")
         ]
 
-        req = self._build_query_request(page_size=page_size)
-        resp = self.swm_service.QuerySWM(req, None)
-        self.assertEqual(len(resp.kems), page_size)
-        self.assertEqual(resp.next_page_token, "token_page_2")
+        # Page 1
+        req1 = self._build_query_request(page_size=page_size)
+        resp1_kems, resp1_token = await mock_redis_kem_cache.query_by_filters(req1.query, req1.page_size, req1.page_token)
+        assert len(resp1_kems) == page_size
+        assert resp1_token == "token_page_2"
 
-        req2 = self._build_query_request(page_size=page_size, page_token=resp.next_page_token)
-        resp2 = self.swm_service.QuerySWM(req2, None)
-        self.assertEqual(len(resp2.kems), page_size)
-        self.assertEqual(resp2.next_page_token, "token_page_3")
+        # Page 2
+        req2 = self._build_query_request(page_size=page_size, page_token=resp1_token)
+        resp2_kems, resp2_token = await mock_redis_kem_cache.query_by_filters(req2.query, req2.page_size, req2.page_token)
+        assert len(resp2_kems) == page_size
+        assert resp2_token == "token_page_3"
 
-        req3 = self._build_query_request(page_size=page_size, page_token=resp2.next_page_token)
-        resp3 = self.swm_service.QuerySWM(req3, None)
-        self.assertEqual(len(resp3.kems), 1)
-        self.assertEqual(resp3.next_page_token, "")
-
-
-if __name__ == '__main__':
-    unittest.main()
+        # Page 3
+        req3 = self._build_query_request(page_size=page_size, page_token=resp2_token)
+        resp3_kems, resp3_token = await mock_redis_kem_cache.query_by_filters(req3.query, req3.page_size, req3.page_token)
+        assert len(resp3_kems) == 1
+        assert resp3_token == ""

@@ -15,16 +15,16 @@ if project_root not in sys.path:
 try:
     from dcsm_agent_sdk_python.sdk import AgentSDK
     from dcsm_agent_sdk_python.config import DCSMClientSDKConfig # Import new config
-    from dcsm_agent_sdk_python.generated_grpc_code import swm_service_pb2 as common_swm_pb2 # For SWM enums
+    from dcs_memory.generated_grpc import swm_service_pb2 as common_swm_pb2
     # For KPS example, if adding one:
-    # from dcsm_agent_sdk_python.generated_grpc_code import kps_service_pb2
+    # from dcs_memory.generated_grpc import kps_service_pb2
 except ImportError:
     # Fallback for direct execution if the above fails
     logging.warning("Could not import from 'dcsm_agent_sdk_python.*', trying local imports for 'sdk', 'config', etc.")
     from sdk import AgentSDK
     from config import DCSMClientSDKConfig
-    from generated_grpc_code import swm_service_pb2 as common_swm_pb2
-    # from generated_grpc_code import kps_service_pb2
+    from dcs_memory.generated_grpc import swm_service_pb2 as common_swm_pb2
+    # from dcs_memory.generated_grpc import kps_service_pb2
 
 
 logger = logging.getLogger("AgentSDKExample")

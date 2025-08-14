@@ -6,5 +6,8 @@ asyncpg # For PostgreSQL external connector
 PyYAML
 pydantic-settings
 aiosqlite
+python-json-logger
 pytest
 pytest-asyncio
+grpcio-testing
+grpcio-health-checking

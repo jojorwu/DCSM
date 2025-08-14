@@ -5,7 +5,7 @@ import time # For timestamps
 from typing import List, Tuple, Optional, Dict, Any, Set
 import copy # For deep copying KEMs to simulate storage
 
-from generated_grpc import kem_pb2, glm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from .base import BasePersistentStorageRepository, StorageError, KemNotFoundError, InvalidQueryError, BackendUnavailableError

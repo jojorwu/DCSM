@@ -8,3 +8,8 @@ grpcio-health-checking>=1.48.1 # For gRPC health checks (compatible with recent 
 pybreaker>=1.0.0 # For circuit breaker pattern
 grpcio[ares]>=1.48.1 # To ensure 'ares' DNS resolver is available for gRPC client-side LB
 asyncpg # For GLM PostgreSQL external connector (dev/integration)
+qdrant-client>=1.7.3
+aiosqlite>=0.19.0
+# TODO: Re-enable sentence-transformers when disk space issue is resolved
+# sentence-transformers>=2.2.2
+cachetools>=5.3.1

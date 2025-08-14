@@ -36,14 +36,14 @@ class DCSMClientSDKConfig(BaseSettings):
     # direct GLM_HOST type env vars are desired without the SDK_ prefix for sub-models.
     # Let's use Field to make them optional and provide defaults directly.
 
-    glm_host: str = Field(default="localhost", alias="DCSM_GLM_HOST")
-    glm_port: int = Field(default=50051, alias="DCSM_GLM_PORT")
+    glm_host: Optional[str] = Field(default="localhost")
+    glm_port: int = Field(default=50051)
 
-    swm_host: str = Field(default="localhost", alias="DCSM_SWM_HOST")
-    swm_port: int = Field(default=50052, alias="DCSM_SWM_PORT") # Corrected from sdk.py's default of 50053 for swm
+    swm_host: Optional[str] = Field(default="localhost")
+    swm_port: int = Field(default=50052) # Corrected from sdk.py's default of 50053 for swm
 
-    kps_host: str = Field(default="localhost", alias="DCSM_KPS_HOST")
-    kps_port: int = Field(default=50053, alias="DCSM_KPS_PORT")
+    kps_host: Optional[str] = Field(default="localhost")
+    kps_port: int = Field(default=50053)
 
     # Local Agent Memory (LAM) / Local Persistent Array (LPA) settings
     lpa_max_size: int = Field(default=100)
@@ -63,8 +63,9 @@ class DCSMClientSDKConfig(BaseSettings):
     tls_enabled: bool = Field(default=False, description="Enable TLS for all client connections.")
     tls_ca_cert_path: Optional[str] = Field(default=None, description="Path to the CA certificate file for verifying server certs.")
     # For mTLS:
-    # tls_client_cert_path: Optional[str] = Field(default=None, description="Path to client's TLS certificate file.")
-    # tls_client_key_path: Optional[str] = Field(default=None, description="Path to client's TLS key file.")
+    tls_client_cert_path: Optional[str] = Field(default=None, description="Path to client's TLS certificate file.")
+    tls_client_key_path: Optional[str] = Field(default=None, description="Path to client's TLS key file.")
+    tls_server_override_authority: Optional[str] = Field(default=None, description="The server name to use for SSL verification.")
 
 
     # Pydantic model config
@@ -117,11 +118,3 @@ if __name__ == '__main__':
     # config_override = DCSMClientSDKConfig()
     # print(f"\n  Overridden GLM Host: {config_override.glm_host}")
 
-```
-
-*Self-correction during generation:*
-Initially, I used nested `ServiceEndpointConfig` models. However, Pydantic's `env_prefix` for `BaseSettings` applies to the top-level fields. For nested models to pick up environment variables like `DCSM_SDK_GLM_HOST` directly (without Pydantic trying to find `DCSM_SDK_GLM__HOST`), it's simpler to have flat fields in the main config model (`DCSMClientSDKConfig`) and use `Field(alias=...)` if we want the environment variables to have a different naming scheme than the model fields. Or, just name the model fields to match the desired env var structure after the prefix.
-
-I've opted for flat fields like `glm_host`, `glm_port` directly in `DCSMClientSDKConfig` and used `Field(default=..., alias=...)` which is a bit redundant if the field name itself matches the env var (after prefix). A simpler way is just `glm_host: str = "localhost"`. Pydantic will then look for `DCSM_SDK_GLM_HOST`. I've simplified to this.
-
-I've also added basic TLS configuration options (`tls_enabled`, `tls_ca_cert_path`) as placeholders for future secure channel implementation. The port for SWM has been corrected to 50052, and KPS to 50053, assuming this is the more standard setup.

@@ -12,11 +12,18 @@ class IndexedLRUCache(Cache):
         self._lock = threading.Lock()
         self._on_evict_callback = on_evict_callback
 
-    def _add_to_metadata_indexes(self, kem_data: dict):
-        if not kem_data or not kem_data.get('id'): return
-        kem_id = kem_data['id']
-        metadata = kem_data.get('metadata', {})
-        if not isinstance(metadata, dict): return
+    def _get_kem_props(self, kem_data: typing.Union[dict, typing.Any]) -> typing.Tuple[typing.Optional[str], typing.Optional[typing.Mapping]]:
+        """Safely extracts id and metadata from a KEM object, which can be a dict or a protobuf message."""
+        if hasattr(kem_data, 'id') and hasattr(kem_data, 'metadata'):  # Proto-like object
+            return kem_data.id, kem_data.metadata
+        elif isinstance(kem_data, dict):  # Dictionary
+            return kem_data.get('id'), kem_data.get('metadata', {})
+        return None, None
+
+    def _add_to_metadata_indexes(self, kem_data: typing.Any):
+        kem_id, metadata = self._get_kem_props(kem_data)
+        if not kem_id or not metadata:
+            return
 
         for meta_key in self._indexed_keys:
             if meta_key in metadata:
@@ -24,11 +31,10 @@ class IndexedLRUCache(Cache):
                 if isinstance(value, str):
                     self._metadata_indexes.setdefault(meta_key, {}).setdefault(value, set()).add(kem_id)
 
-    def _remove_from_metadata_indexes(self, kem_data: dict):
-        if not kem_data or not kem_data.get('id'): return
-        kem_id = kem_data['id']
-        metadata = kem_data.get('metadata', {})
-        if not isinstance(metadata, dict): return
+    def _remove_from_metadata_indexes(self, kem_data: typing.Any):
+        kem_id, metadata = self._get_kem_props(kem_data)
+        if not kem_id or not metadata:
+            return
 
         for meta_key in self._indexed_keys:
             if meta_key in metadata:
@@ -41,7 +47,7 @@ class IndexedLRUCache(Cache):
                         if not self._metadata_indexes[meta_key]:
                             del self._metadata_indexes[meta_key]
 
-    def __setitem__(self, kem_id: str, kem_data: dict):
+    def __setitem__(self, kem_id: str, kem_data: typing.Any):
         with self._lock:
             evicted_kem_data = None
             if kem_id in self._lru:
@@ -59,7 +65,7 @@ class IndexedLRUCache(Cache):
             self._lru[kem_id] = kem_data
             self._add_to_metadata_indexes(kem_data)
 
-    def __getitem__(self, kem_id: str) -> dict:
+    def __getitem__(self, kem_id: str) -> typing.Any:
         with self._lock:
             return self._lru[kem_id]
 
@@ -71,11 +77,11 @@ class IndexedLRUCache(Cache):
             else:
                 raise KeyError(kem_id)
 
-    def get(self, kem_id: str, default=None) -> typing.Optional[dict]:
+    def get(self, kem_id: str, default=None) -> typing.Optional[typing.Any]:
         with self._lock:
             return self._lru.get(kem_id, default)
 
-    def pop(self, kem_id: str, default=object()) -> dict:
+    def pop(self, kem_id: str, default=object()) -> typing.Any:
         with self._lock:
             if kem_id in self._lru:
                 kem_data = self._lru.pop(kem_id)
@@ -94,11 +100,11 @@ class IndexedLRUCache(Cache):
         with self._lock:
             return kem_id in self._lru
 
-    def values(self) -> typing.List[dict]:
+    def values(self) -> typing.List[typing.Any]:
         with self._lock:
             return list(self._lru.values())
 
-    def items(self) -> typing.List[typing.Tuple[str, dict]]:
+    def items(self) -> typing.List[typing.Tuple[str, typing.Any]]:
         with self._lock:
             return list(self._lru.items())
 
@@ -181,14 +187,14 @@ class LocalAgentMemory:
         # If candidate_kems is all cache items (Stage 2, because no indexed and no initial ID load), this filters by ID.
         if ids:
             ids_set = set(ids)
-            candidate_kems = [k for k in candidate_kems if k.get('id') in ids_set]
+            candidate_kems = [k for k in candidate_kems if (k.id if hasattr(k, 'id') else k.get('id')) in ids_set]
 
         # Stage 4: Filter by unindexed metadata
         if unindexed_metadata_queries:
             filtered_kems_after_unindexed = []
             for kem in candidate_kems:
                 match = True
-                kem_meta = kem.get('metadata', {})
+                kem_meta = (kem.metadata if hasattr(kem, 'metadata') else kem.get('metadata', {})) or {}
                 for key, value in unindexed_metadata_queries.items():
                     if kem_meta.get(key) != value:
                         match = False; break

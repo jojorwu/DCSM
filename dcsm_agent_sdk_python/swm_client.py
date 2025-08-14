@@ -5,10 +5,10 @@ import time # For sleep in retry decorator, though decorator itself is now in gr
 from typing import Optional, List, Tuple, Generator # Added Generator
 import typing # Ensure typing is imported for older Python versions if needed by dataclasses
 
-from .generated_grpc_code import kem_pb2
-from .generated_grpc_code import glm_service_pb2 # For KEMQuery type hint
-from .generated_grpc_code import swm_service_pb2
-from .generated_grpc_code import swm_service_pb2_grpc
+from dcs_memory.generated_grpc import kem_pb2
+from dcs_memory.generated_grpc import glm_service_pb2 # For KEMQuery type hint
+from dcs_memory.generated_grpc import swm_service_pb2
+from dcs_memory.generated_grpc import swm_service_pb2_grpc
 # from google.protobuf.json_format import MessageToDict, ParseDict # Replaced by utils
 from .proto_utils import kem_dict_to_proto, kem_proto_to_dict
 

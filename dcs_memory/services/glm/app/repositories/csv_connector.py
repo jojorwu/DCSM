@@ -6,7 +6,7 @@ import logging
 from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime, timezone
 
-from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2
 from dcs_memory.services.glm.app.config import ExternalDataSourceConfig, GLMConfig
 from .external_base import BaseExternalRepository
 from .base import StorageError, BackendUnavailableError, InvalidQueryError # Reusing exceptions

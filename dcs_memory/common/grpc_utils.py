@@ -28,16 +28,17 @@ DEFAULT_INITIAL_DELAY_S = 1.0  # seconds
 DEFAULT_BACKOFF_FACTOR = 2.0
 DEFAULT_JITTER_FRACTION = 0.1 # 10% jitter, e.g., for a 1s delay, jitter is +/- 0.1s
 
-def retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+def retry_grpc_call(_func=None, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                     initial_delay_s: float = DEFAULT_INITIAL_DELAY_S,
                     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
                     jitter_fraction: float = DEFAULT_JITTER_FRACTION,
                     retryable_error_codes: tuple = RETRYABLE_ERROR_CODES,
                     circuit_breaker: Optional[pybreaker.CircuitBreaker] = None, # type: ignore
                     cb_enabled: bool = True):
-                    # cb_enabled allows config to globally disable CBs even if one is passed
     """
     Decorator to automatically retry a gRPC call, with optional circuit breaker protection.
+
+    Can be used as `@retry_grpc_call` or with arguments `@retry_grpc_call(...)`.
 
     :param max_attempts: Maximum number of call attempts.
     :param initial_delay_s: Initial delay before the first retry, in seconds.
@@ -79,54 +80,44 @@ def retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                             logger.error(
                                 f"gRPC call to {func.__name__} failed after {max_attempts} attempts. "
                                 f"Last error: {rpc_code} - {e.details()}",
-                                exc_info=False # Do not log full stack trace for the last expected retryable error
+                                exc_info=False
                             )
-                            raise  # Re-raise the last RpcError if all attempts are exhausted
+                            raise
 
-                        # Calculate jitter: random value between -jitter_fraction and +jitter_fraction
                         jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                        actual_delay_s = max(0, current_delay_s + jitter_value) # Ensure delay is not negative
+                        actual_delay_s = max(0, current_delay_s + jitter_value)
 
                         logger.warning(
                             f"gRPC call to {func.__name__} failed (attempt {attempt}/{max_attempts}) "
                             f"with status {rpc_code}. Retrying in {actual_delay_s:.2f}s. "
                             f"Details: {e.details()}",
-                            exc_info=False # Do not log full stack trace for every retry attempt
+                            exc_info=False
                         )
                         time.sleep(actual_delay_s)
                         current_delay_s *= backoff_factor
                     else:
-                        # If the error code is not in retryable_error_codes, re-raise it immediately
                         logger.error(
                             f"gRPC call to {func.__name__} failed with non-retryable status "
                             f"{rpc_code if rpc_code else 'N/A'}. "
                             f"Details: {e.details() if hasattr(e, 'details') and callable(e.details) else str(e)}",
-                            exc_info=True # Log full stack trace for non-retryable errors
+                            exc_info=True
                         )
                         raise
-                except Exception as e_generic: # Catch other potential exceptions (e.g., network issues before gRPC layer)
-                    logger.error(
-                        f"A non-gRPC error occurred during call to {func.__name__} (attempt {attempt}/{max_attempts}): {e_generic}",
-                        exc_info=True
-                    )
-                    if attempt == max_attempts:
-                        raise # Re-raise if this is the last attempt
-
-                    # For non-gRPC errors, apply similar delay logic before retrying
-                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                    actual_delay_s = max(0, current_delay_s + jitter_value)
-                    logger.info(f"Retrying {func.__name__} after non-gRPC error in {actual_delay_s:.2f}s.")
-                    time.sleep(actual_delay_s)
-                    current_delay_s *= backoff_factor
 
             # This part should not be reached if max_attempts >= 1,
             # as the loop will either return a successful result or raise an exception.
             logger.error(f"Sync gRPC call to {func.__name__} exhausted attempts without success or specific error handling.")
             return None # Should ideally not happen with proper error raising.
         return wrapper
-    return decorator
 
-def async_retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    if _func is None:
+        # Called as @retry_grpc_call(...)
+        return decorator
+    else:
+        # Called as @retry_grpc_call
+        return decorator(_func)
+
+def async_retry_grpc_call(_func=None, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                           initial_delay_s: float = DEFAULT_INITIAL_DELAY_S,
                           backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
                           jitter_fraction: float = DEFAULT_JITTER_FRACTION,
@@ -135,6 +126,8 @@ def async_retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                           cb_enabled: bool = True):
     """
     Decorator to automatically retry an ASYNCHRONOUS gRPC call, with optional circuit breaker.
+
+    Can be used as `@async_retry_grpc_call` or with arguments `@async_retry_grpc_call(...)`.
     """
     def decorator(async_func: Callable[..., Any]):
         @wraps(async_func)
@@ -185,26 +178,18 @@ def async_retry_grpc_call(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                             exc_info=True
                         )
                         raise
-                except Exception as e_generic: # Catch other errors
-                    # If this was a CircuitBreakerError from a non-pybreaker source, it would be caught here.
-                    # However, we explicitly catch pybreaker.CircuitBreakerError above.
-                    logger.error(
-                        f"A non-gRPC error occurred during async call to {async_func.__name__} (attempt {attempt}/{max_attempts}): {e_generic}",
-                        exc_info=True
-                    )
-                    if attempt == max_attempts:
-                        raise
-                    jitter_value = random.uniform(-jitter_fraction, jitter_fraction) * current_delay_s
-                    actual_delay_s = max(0, current_delay_s + jitter_value)
-                    logger.info(f"Retrying async {async_func.__name__} after non-gRPC error in {actual_delay_s:.2f}s.")
-                    await asyncio.sleep(actual_delay_s)
-                    current_delay_s *= backoff_factor
 
             # Should be unreachable if max_attempts >=1
             logger.error(f"Async gRPC call to {async_func.__name__} exhausted attempts without returning or raising.")
             raise RuntimeError(f"Async call {async_func.__name__} failed after all retries.") # Ensure something is raised
         return wrapper
-    return decorator
+
+    if _func is None:
+        # Called as @async_retry_grpc_call(...)
+        return decorator
+    else:
+        # Called as @async_retry_grpc_call
+        return decorator(_func)
 
 
 # Example of how to use the decorator (for testing or reference)

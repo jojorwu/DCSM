@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Tuple, Optional, Dict, Any
-from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2 # KEMQuery is in glm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2 # KEMQuery is in glm_service_pb2
 
 class BasePersistentStorageRepository(ABC):
     """

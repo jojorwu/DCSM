@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional, Dict, Any
 # A more robust way might be to define a non-proto KEMQuery-like dataclass here
 # if we want to decouple this interface from specific proto versions.
 # However, for now, using the proto types directly for clarity.
-from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2
 from ..config import ExternalDataSourceConfig # Relative import for config within the same app
 
 

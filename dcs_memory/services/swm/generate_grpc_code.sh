@@ -5,7 +5,7 @@ cd "$SCRIPT_DIR" || exit 1 # Change to the script's directory
 echo "Current directory for SWM code generation: $(pwd)"
 
 CENTRAL_PROTO_PATH_FROM_SCRIPT="../../common/grpc_protos" # Path to common protos
-GENERATED_OUTPUT_DIR="./generated_grpc" # Local directory for generated code
+GENERATED_OUTPUT_DIR="../../generated_grpc" # Local directory for generated code
 
 echo "Generating gRPC code for SWM service..."
 echo "Source .proto files from: $CENTRAL_PROTO_PATH_FROM_SCRIPT"

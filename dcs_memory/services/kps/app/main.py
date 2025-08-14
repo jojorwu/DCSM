@@ -65,18 +65,13 @@ logger = logging.getLogger(__name__)
 # --- End Logging Setup ---
 
 # --- gRPC Code Import Block ---
-current_script_path = os.path.abspath(__file__)
-app_dir_kps = os.path.dirname(current_script_path)
-service_root_dir_kps = os.path.dirname(app_dir_kps)
-
-if service_root_dir_kps not in sys.path:
-    sys.path.insert(0, service_root_dir_kps)
-
-from generated_grpc import kem_pb2
-from generated_grpc import glm_service_pb2 # For GLM client
-from generated_grpc import glm_service_pb2_grpc # For GLM client
-from generated_grpc import kps_service_pb2 # For KPS server
-from generated_grpc import kps_service_pb2_grpc # For KPS server
+from dcs_memory.generated_grpc import (
+    kem_pb2,
+    glm_service_pb2,
+    glm_service_pb2_grpc,
+    kps_service_pb2,
+    kps_service_pb2_grpc,
+)
 # Import retry decorator
 from dcs_memory.common.grpc_utils import retry_grpc_call
 from dcs_memory.common.config import KPSConfig # Ensure KPSConfig is imported for type hint

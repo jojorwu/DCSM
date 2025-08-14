@@ -28,7 +28,8 @@ except ImportError:
     logging.getLogger(__name__).warning("aioredis library not found. RedisKemCache will not be available.")
 
 # For Health Checks (ensure these are after logging setup if they log at import time)
-from grpc_health.v1 import health_async, health_pb2, health_pb2_grpc
+from grpc_health.v1 import health_pb2, health_pb2_grpc
+from grpc_health.v1._async import HealthServicer
 from grpc_health.v1.health_pb2 import HealthCheckRequest as HC_Request
 
 from .config import SWMConfig # Moved SWMConfig import before setup_logging uses it for type hint
@@ -44,6 +45,12 @@ else:
 
 from .config import SWMConfig
 from pythonjsonlogger import jsonlogger # Ensure this is imported if used by setup_logging
+
+# Attempt to import pybreaker, make it optional
+try:
+    import pybreaker
+except ImportError:
+    pybreaker = None
 
 # Centralized logging setup
 def setup_logging(log_config: SWMConfig):
@@ -111,11 +118,7 @@ config = SWMConfig() # Global config instance for the module
 logger = setup_logging(config) # Global logger instance for the module
 
 
-from generated_grpc import kem_pb2
-from generated_grpc import glm_service_pb2
-from generated_grpc import glm_service_pb2_grpc
-from generated_grpc import swm_service_pb2
-from generated_grpc import swm_service_pb2_grpc
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2, glm_service_pb2_grpc, swm_service_pb2, swm_service_pb2_grpc
 
 # IndexedLRUCache class definition is removed.
 
@@ -252,10 +255,12 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
 
     async def start_background_tasks(self):
         self._stop_event.clear()
+        if self.lock_manager:
+            await self.lock_manager.initialize()
         await self.lock_manager.start_cleanup_task()
 
         if self._glm_persistence_worker_task is None or self._glm_persistence_worker_task.done():
-            self._glm_persistence_worker_task = asyncio.create_task(self._glm_persistence_worker())
+            self._glm_persistence_worker_task = asyncio.create_task(self._persistence_worker())
             logger.info("SWM: GLM persistence worker task started.")
 
         if self.redis_client and RedisKemCache and self.redis_kem_cache and \
@@ -473,15 +478,7 @@ class SharedWorkingMemoryServiceImpl(swm_service_pb2_grpc.SharedWorkingMemorySer
                  logger.error(f"SWM Redis Eviction Listener: Error during final pubsub cleanup: {e_final_unsub}", exc_info=True)
         logger.info("SWM Redis Eviction Listener: Stopped.")
 
-    # --- GLM Client Methods (using async_retry_grpc_call decorator) ---
-    # Note: The config for RETRY_MAX_ATTEMPTS etc. for SWM's GLM client calls
-# Attempt to import pybreaker, make it optional
-try:
-    import pybreaker
-except ImportError:
-    pybreaker = None
-
-# --- GLM Client Methods (using async_retry_grpc_call decorator and internal circuit breaker) ---
+    # --- GLM Client Methods (using async_retry_grpc_call decorator and internal circuit breaker) ---
     @async_retry_grpc_call(
         max_attempts=config.RETRY_MAX_ATTEMPTS, # Sourced from SWMConfig instance
         initial_delay_s=config.RETRY_INITIAL_DELAY_S,
@@ -491,7 +488,7 @@ except ImportError:
     async def _glm_retrieve_kems_async_with_retry(self, request: glm_service_pb2.RetrieveKEMsRequest, timeout: int) -> glm_service_pb2.RetrieveKEMsResponse:
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for RetrieveKEMs.")
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, initial_metadata=None, trailing_metadata=None, details="SWM Internal Error: GLM client not available")
 
         async def actual_glm_call():
             logger.debug(f"Calling GLM RetrieveKEMs (async). Timeout: {timeout}s")
@@ -515,7 +512,7 @@ except ImportError:
     async def _glm_store_kem_async_with_retry(self, request: glm_service_pb2.StoreKEMRequest, timeout: int) -> glm_service_pb2.StoreKEMResponse:
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for StoreKEM.");
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, initial_metadata=None, trailing_metadata=None, details="SWM Internal Error: GLM client not available")
 
         async def actual_glm_call():
             logger.debug(f"Calling GLM StoreKEM (async). Timeout: {timeout}s")
@@ -539,7 +536,7 @@ except ImportError:
     async def _glm_batch_store_kems_async_with_retry(self, request: glm_service_pb2.BatchStoreKEMsRequest, timeout: int) -> glm_service_pb2.BatchStoreKEMsResponse:
         if not self.aio_glm_stub:
             logger.error("SWM: GLM async client not available for BatchStoreKEMs.");
-            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, "SWM Internal Error: GLM client not available")
+            raise grpc_aio.AioRpcError(grpc.StatusCode.INTERNAL, initial_metadata=None, trailing_metadata=None, details="SWM Internal Error: GLM client not available")
 
         async def actual_glm_call():
             logger.debug(f"Calling GLM BatchStoreKEMs (async). KEMs: {len(request.kems)}, Timeout: {timeout}s")
@@ -561,7 +558,7 @@ except ImportError:
         return response
 
 
-    async def _glm_persistence_worker(self):
+    async def _persistence_worker(self):
         logger.info("SWM: GLM Persistence Worker started.")
         while not self._stop_event.is_set():
             current_batch_items_with_retry: List[Tuple[kem_pb2.KEM, int]] = []
@@ -986,7 +983,7 @@ async def serve():
     # Add Health Servicer for async server
     # Imports for health checks are now at the top of the file
 
-    class SWMHealthServicer(health_async.HealthServicer):
+    class SWMHealthServicer(HealthServicer):
         def __init__(self, swm_service_instance: SharedWorkingMemoryServiceImpl):
             super().__init__()
             self._swm_service = swm_service_instance
@@ -1041,7 +1038,7 @@ async def serve():
             # Start non-Redis dependent tasks
             await servicer_instance.lock_manager.start_cleanup_task()
             if servicer_instance._glm_persistence_worker_task is None or servicer_instance._glm_persistence_worker_task.done():
-                 servicer_instance._glm_persistence_worker_task = asyncio.create_task(servicer_instance._glm_persistence_worker())
+                 servicer_instance._glm_persistence_worker_task = asyncio.create_task(servicer_instance._persistence_worker())
                  logger.info("SWM: GLM persistence worker task started (Redis not available).")
 
         logger.info(f"SWM server started and listening on {listen_addr}.")

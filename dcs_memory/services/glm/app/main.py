@@ -2,7 +2,8 @@ import asyncio
 import logging
 import os
 import sys
-import grpc.aio as grpc
+import grpc
+import grpc.aio
 from typing import Optional
 
 from dcs_memory.services.glm.app.config import GLMConfig
@@ -12,7 +13,7 @@ from dcs_memory.services.glm.app.repositories.base import (
     KemNotFoundError,
     StorageError,
 )
-from dcs_memory.services.glm.generated_grpc import (
+from dcs_memory.generated_grpc import (
     glm_service_pb2,
     glm_service_pb2_grpc,
     kps_service_pb2,
@@ -41,7 +42,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         kps_address = self.config.KPS_SERVICE_ADDRESS
         if kps_address:
             try:
-                channel = grpc.insecure_channel(kps_address)
+                channel = grpc.aio.insecure_channel(kps_address)
                 self.kps_client_stub = kps_service_pb2_grpc.KnowledgeProcessingServiceStub(channel)
                 logger.info(f"KPS client stub initialized for address {kps_address}.")
             except Exception as e:
@@ -80,7 +81,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         except Exception as e:
             await context.abort(grpc.StatusCode.INTERNAL, f"An unexpected error occurred: {e}")
 
-    async def DeleteKEM(self, request: glm_service_pb2.DeleteKEMRequest, context: grpc.aio.ServicerContext) -> empty_pb2.Empty:
+    async def DeleteKEM(self, request: glm_service_pb2.DeleteKEMRequest, context: grpc.ServicerContext) -> empty_pb2.Empty:
         try:
             await self.storage_repository.delete_kem(request.kem_id)
             return empty_pb2.Empty()
@@ -89,7 +90,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         except Exception as e:
             await context.abort(grpc.StatusCode.INTERNAL, f"An unexpected error occurred: {e}")
 
-    async def BatchStoreKEMs(self, request: glm_service_pb2.BatchStoreKEMsRequest, context: grpc.aio.ServicerContext) -> glm_service_pb2.BatchStoreKEMsResponse:
+    async def BatchStoreKEMs(self, request: glm_service_pb2.BatchStoreKEMsRequest, context: grpc.ServicerContext) -> glm_service_pb2.BatchStoreKEMsResponse:
         try:
             successful, failed = await self.storage_repository.batch_store_kems(request.kems)
             return glm_service_pb2.BatchStoreKEMsResponse(successfully_stored_kems=successful, failed_kem_references=failed)
@@ -98,7 +99,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         except Exception as e:
             await context.abort(grpc.StatusCode.INTERNAL, f"An unexpected error occurred: {e}")
 
-    async def IndexExternalDataSource(self, request: glm_service_pb2.IndexExternalDataSourceRequest, context: grpc.aio.ServicerContext) -> glm_service_pb2.IndexExternalDataSourceResponse:
+    async def IndexExternalDataSource(self, request: glm_service_pb2.IndexExternalDataSourceRequest, context: grpc.ServicerContext) -> glm_service_pb2.IndexExternalDataSourceResponse:
         data_source_name = request.data_source_name
         logger.info(f"IndexExternalDataSource called for: {data_source_name}")
 
@@ -159,7 +160,7 @@ class GlobalLongTermMemoryServicerImpl(glm_service_pb2_grpc.GlobalLongTermMemory
         )
 
 async def serve():
-    server = grpc.server()
+    server = grpc.aio.server()
 
     from dcs_memory.services.glm.app.repositories.default_impl import DefaultGLMRepository
     app_dir = os.path.dirname(os.path.abspath(__file__))

@@ -87,11 +87,14 @@ class TestDCSMClientSDKConfig(unittest.TestCase):
 
     def test_invalid_port_type_in_env(self):
         os.environ["DCSM_SDK_GLM_PORT"] = "not_an_int"
-        with self.assertRaises(ValidationError): # Pydantic v2 raises ValidationError
+        # Pydantic v2's BaseSettings might not raise on init for simple type errors,
+        # but will fail validation. We can test this by catching the expected error.
+        with self.assertRaises(ValidationError) as e:
             DCSMClientSDKConfig()
+        # Check that the error message contains information about the invalid field
+        self.assertIn("glm_port", str(e.exception))
         del os.environ["DCSM_SDK_GLM_PORT"]
 
 
 if __name__ == '__main__':
     unittest.main()
-```

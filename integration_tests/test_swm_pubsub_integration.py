@@ -13,20 +13,20 @@ if project_root not in sys.path:
 
 import grpc
 from integration_tests.kps_client_simple import process_data_via_kps # Для создания КЕП в GLM
-from dcs_memory.services.swm.generated_grpc import swm_service_pb2
-from dcs_memory.services.swm.generated_grpc import swm_service_pb2_grpc
+from dcs_memory.generated_grpc import swm_service_pb2
+from dcs_memory.generated_grpc import swm_service_pb2_grpc
 # from dcs_memory.common.grpc_protos.kem_pb2 import KEM # Используем напрямую из общего proto
 # from dcs_memory.common.grpc_protos.glm_service_pb2 import KEMQuery
-from temp_generated_grpc_code.kem_pb2 import KEM
-from temp_generated_grpc_code.glm_service_pb2 import KEMQuery
+from dcs_memory.generated_grpc import kem_pb2
+from dcs_memory.generated_grpc import glm_service_pb2
 from google.protobuf.timestamp_pb2 import Timestamp
 
 
 KPS_SERVICE_URL = os.getenv("KPS_SERVICE_URL", "localhost:50052")
 SWM_SERVICE_URL = os.getenv("SWM_SERVICE_URL", "localhost:50053")
 
-def create_kem_proto_for_swm_publish(id_str: str, metadata: dict = None, content_str: str = "content") -> KEM:
-    kem = KEM(id=id_str, content_type="text/plain", content=content_str.encode('utf-8'))
+def create_kem_proto_for_swm_publish(id_str: str, metadata: dict = None, content_str: str = "content") -> kem_pb2.KEM:
+    kem = kem_pb2.KEM(id=id_str, content_type="text/plain", content=content_str.encode('utf-8'))
     if metadata:
         for k, v in metadata.items():
             kem.metadata[k] = str(v)

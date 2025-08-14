@@ -7,7 +7,7 @@ from typing import Dict, Set, List, Optional, AsyncGenerator
 from dataclasses import dataclass # Added import for dataclass
 
 from .config import SWMConfig
-from generated_grpc import kem_pb2, swm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, swm_service_pb2
 from google.protobuf.timestamp_pb2 import Timestamp
 
 # Assuming SubscriberInfo dataclass might be defined here or imported if it's common
@@ -19,11 +19,11 @@ logger = logging.getLogger(__name__)
 class SubscriberInfoInternal: # Renamed to avoid conflict if SubscriberInfo is also a proto message
     event_queue: asyncio.Queue
     original_topics: List[swm_service_pb2.SubscriptionTopic] # Store original topics for removal logic
+    subscriber_id: str # Added for easier reference
     # Parsed filters might be more complex and stored internally by the manager
     # For now, we can keep it simple or let the manager handle parsing internally.
     # parsed_filters: Dict[str, Set[str]]
     subscribes_to_all_kem_lifecycle: bool = False
-    subscriber_id: str # Added for easier reference
 
 
 class SubscriptionManager:
@@ -260,9 +260,12 @@ class DistributedLockManager:
 
         self._release_script_sha: Optional[str] = None
         self._renew_script_sha: Optional[str] = None
-        asyncio.create_task(self._load_lua_scripts())
-
+        # Do not call async methods from __init__
         logger.info("DistributedLockManager initialized to use Redis.")
+
+    async def initialize(self):
+        """Asynchronously loads Lua scripts into Redis. Should be called after creation."""
+        await self._load_lua_scripts()
 
     async def _load_lua_scripts(self):
         try:

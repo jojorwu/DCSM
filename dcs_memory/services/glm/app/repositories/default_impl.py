@@ -10,7 +10,7 @@ from qdrant_client.http.models import PointStruct
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.protobuf.json_format import ParseDict
 
-from dcs_memory.services.glm.generated_grpc import kem_pb2, glm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2
 from dcs_memory.services.glm.app.config import GLMConfig, ExternalDataSourceConfig
 from dcs_memory.services.glm.app.repositories.base import BasePersistentStorageRepository, StorageError, KemNotFoundError, BackendUnavailableError, InvalidQueryError
 from dcs_memory.services.glm.app.sqlite_repository import SqliteKemRepository

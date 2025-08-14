@@ -1,11 +1,9 @@
 import grpc
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
-from .generated_grpc_code import kem_pb2 # KEM is used in some KPS messages, but KPS mostly deals with its own specific types
-from .generated_grpc_code import kps_service_pb2
-from .generated_grpc_code import kps_service_pb2_grpc
-from .proto_utils import kem_dict_to_proto, kem_proto_to_dict # May not be directly needed if KPS deals with content strings + KEM URIs
+from dcs_memory.generated_grpc import kps_service_pb2
+from dcs_memory.generated_grpc import kps_service_pb2_grpc
 from dcs_memory.common.grpc_utils import retry_grpc_call, DEFAULT_MAX_ATTEMPTS, DEFAULT_INITIAL_DELAY_S, DEFAULT_BACKOFF_FACTOR, DEFAULT_JITTER_FRACTION
 
 logger = logging.getLogger(__name__)
@@ -24,7 +22,7 @@ class KPSClient:
                  tls_server_override_authority: Optional[str] = None):
         self.server_address = server_address
         self.channel: Optional[grpc.Channel] = None
-        self.stub: Optional[kps_service_pb2_grpc.KnowledgeProcessingServiceStub] = None
+        self.stub: Optional[kps_service_pb2_grpc.KnowledgeProcessorServiceStub] = None
 
         self.retry_max_attempts = retry_max_attempts
         self.retry_initial_delay_s = retry_initial_delay_s
@@ -71,9 +69,7 @@ class KPSClient:
                     self.channel = grpc.insecure_channel(self.server_address)
                     logger.info(f"KPSClient: Insecure channel created for {self.server_address}.")
 
-                # Optional: Check connection readiness with a timeout
-                # grpc.channel_ready_future(self.channel).result(timeout=5)
-                self.stub = kps_service_pb2_grpc.KnowledgeProcessingServiceStub(self.channel)
+                self.stub = kps_service_pb2_grpc.KnowledgeProcessorServiceStub(self.channel)
                 logger.info(f"KPSClient: Successfully connected to KPS service at: {self.server_address} (TLS: {self.tls_enabled})")
 
             except grpc.FutureTimeoutError:
@@ -97,61 +93,17 @@ class KPSClient:
             raise ConnectionError(f"KPSClient: Failed to establish connection with KPS service at {self.server_address}")
 
     @retry_grpc_call
-    def add_memory(self, kem_uri: str, content: str, timeout: int = 10) -> Optional[kps_service_pb2.AddMemoryResponse]:
+    def process_raw_data(self, data_id: str, content_type: str, raw_content: bytes, initial_metadata: Dict[str, str], timeout: int = 30) -> Optional[kps_service_pb2.ProcessRawDataResponse]:
         self._ensure_connected()
-        request = kps_service_pb2.AddMemoryRequest(kem_uri=kem_uri, content=content)
-        logger.debug(f"KPSClient: AddMemory request: kem_uri='{kem_uri}', content_len={len(content)}")
-        response = self.stub.AddMemory(request, timeout=timeout) # type: ignore
-        logger.info(f"KPSClient: AddMemory response for kem_uri='{kem_uri}': id='{response.id}', status='{response.status_message}'")
-        return response
-
-    @retry_grpc_call
-    def batch_add_memories(self, memories: List[kps_service_pb2.MemoryContent], timeout: int = 30) -> Optional[kps_service_pb2.BatchAddMemoriesResponse]:
-        self._ensure_connected()
-        request = kps_service_pb2.BatchAddMemoriesRequest(memories=memories)
-        logger.debug(f"KPSClient: BatchAddMemories request with {len(memories)} items.")
-        response = self.stub.BatchAddMemories(request, timeout=timeout) # type: ignore
-        logger.info(f"KPSClient: BatchAddMemories response: Success={len(response.successfully_added_ids)}, Failed={len(response.failed_kem_references)}, Msg='{response.overall_error_message}'")
-        return response
-
-    @retry_grpc_call
-    def retrieve_memory_content(self, kem_uri: str, timeout: int = 10) -> Optional[kps_service_pb2.MemoryContent]: # KPS RetrieveMemory returns MemoryContent
-        self._ensure_connected()
-        request = kps_service_pb2.RetrieveMemoryRequest(kem_uri=kem_uri)
-        logger.debug(f"KPSClient: RetrieveMemory request for kem_uri='{kem_uri}'")
-        response = self.stub.RetrieveMemory(request, timeout=timeout) # type: ignore
-        if response and response.kem_uri == kem_uri : # Basic check for validity
-             logger.info(f"KPSClient: RetrieveMemory found content for kem_uri='{kem_uri}'.")
-             return response
-        logger.warning(f"KPSClient: RetrieveMemory did not find content or unexpected response for kem_uri='{kem_uri}'.")
-        return None
-
-
-    @retry_grpc_call
-    def query_nearest_neighbors(self, kem_uri: str, k: int, timeout: int = 10) -> Optional[kps_service_pb2.QueryResults]:
-        self._ensure_connected()
-        request = kps_service_pb2.QueryNearestNeighborsRequest(kem_uri=kem_uri, k=k)
-        logger.debug(f"KPSClient: QueryNearestNeighbors request: kem_uri='{kem_uri}', k={k}")
-        response = self.stub.QueryNearestNeighbors(request, timeout=timeout) # type: ignore
-        logger.info(f"KPSClient: QueryNearestNeighbors for kem_uri='{kem_uri}' found {len(response.results)} neighbors.")
-        return response
-
-    @retry_grpc_call
-    def query_nearest_neighbors_by_vector(self, vector: List[float], k: int, timeout: int = 10) -> Optional[kps_service_pb2.QueryResults]:
-        self._ensure_connected()
-        request = kps_service_pb2.QueryNearestNeighborsByVectorRequest(vector=vector, k=k)
-        logger.debug(f"KPSClient: QueryNearestNeighborsByVector request: vector_len={len(vector)}, k={k}")
-        response = self.stub.QueryNearestNeighborsByVector(request, timeout=timeout) # type: ignore
-        logger.info(f"KPSClient: QueryNearestNeighborsByVector found {len(response.results)} neighbors.")
-        return response
-
-    @retry_grpc_call
-    def remove_memory(self, kem_uri: str, timeout: int = 10) -> Optional[kps_service_pb2.RemoveMemoryResponse]:
-        self._ensure_connected()
-        request = kps_service_pb2.RemoveMemoryRequest(kem_uri=kem_uri)
-        logger.debug(f"KPSClient: RemoveMemory request for kem_uri='{kem_uri}'")
-        response = self.stub.RemoveMemory(request, timeout=timeout) # type: ignore
-        logger.info(f"KPSClient: RemoveMemory response for kem_uri='{kem_uri}': status='{response.status_message}'")
+        request = kps_service_pb2.ProcessRawDataRequest(
+            data_id=data_id,
+            content_type=content_type,
+            raw_content=raw_content,
+            initial_metadata=initial_metadata
+        )
+        logger.debug(f"KPSClient: ProcessRawData request: data_id='{data_id}', content_type='{content_type}'")
+        response = self.stub.ProcessRawData(request, timeout=timeout)
+        logger.info(f"KPSClient: ProcessRawData response for data_id='{data_id}': success='{response.success}', kem_id='{response.kem_id}', status='{response.status_message}'")
         return response
 
     def close(self):
@@ -166,39 +118,3 @@ class KPSClient:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logger.info("Running KPSClient example (requires KPS server on localhost:50053)")
-
-    import os
-    if os.getenv("RUN_KPS_CLIENT_EXAMPLE") == "true":
-        try:
-            with KPSClient() as client:
-                kem_uri_test = "kem:example:doc:kps_client_test_001"
-                content_test = "This is a test document for KPSClient."
-
-                logger.info(f"\n--- Adding memory: {kem_uri_test} ---")
-                add_resp = client.add_memory(kem_uri_test, content_test)
-                if add_resp: logger.info(f"AddMemory Status: {add_resp.status_message}")
-
-                logger.info(f"\n--- Retrieving memory content: {kem_uri_test} ---")
-                ret_mem = client.retrieve_memory_content(kem_uri_test)
-                if ret_mem: logger.info(f"Retrieved content: '{ret_mem.content[:50]}...' for KEM URI: {ret_mem.kem_uri}")
-
-                logger.info(f"\n--- Querying nearest neighbors for: {kem_uri_test} (k=1) ---")
-                nn_resp = client.query_nearest_neighbors(kem_uri_test, k=1)
-                if nn_resp and nn_resp.results:
-                    logger.info(f"Found {len(nn_resp.results)} neighbor(s). Top result: ID='{nn_resp.results[0].kem_uri}', Score={nn_resp.results[0].distance:.4f}")
-
-                logger.info(f"\n--- Removing memory: {kem_uri_test} ---")
-                remove_resp = client.remove_memory(kem_uri_test)
-                if remove_resp: logger.info(f"RemoveMemory Status: {remove_resp.status_message}")
-
-        except ConnectionError as e: logger.error(f"KPSClient Example: CONNECTION ERROR - {e}")
-        except grpc.RpcError as e: logger.error(f"KPSClient Example: gRPC ERROR - code={e.code()}, details={e.details()}")
-        except Exception as e_main: logger.error(f"KPSClient Example: UNEXPECTED ERROR - {e_main}", exc_info=True)
-    else:
-        logger.info("Environment variable RUN_KPS_CLIENT_EXAMPLE not set to 'true', example will not run.")
-
-```

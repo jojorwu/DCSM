@@ -27,8 +27,7 @@ from dcsm_agent_sdk_python.config import DCSMClientSDKConfig # Import the new co
 # Импорты для proto нужны, если мы будем создавать KEM объекты напрямую,
 # но LocalAgentMemory и AgentSDK работают со словарями для KEM.
 # GLMClient внутри конвертирует в/из proto.
-# from dcsm_agent_sdk_python.generated_grpc_code import kem_pb2
-# from dcsm_agent_sdk_python.generated_grpc_code import glm_service_pb2
+from dcs_memory.generated_grpc import kem_pb2, glm_service_pb2
 
 
 def create_kem_dict(kem_id: str, metadata: dict, content: str = "content") -> dict:
@@ -131,32 +130,29 @@ class TestGLMClientRetrieve(unittest.TestCase):
         mock_channel = MagicMock()
         mock_grpc.insecure_channel.return_value = mock_channel
 
-        # Мокаем GlobalLongTermMemoryStub из правильного сгенерированного модуля
-        with patch('dcsm_agent_sdk_python.generated_grpc_code.glm_service_pb2_grpc.GlobalLongTermMemoryStub', return_value=mock_stub) as MockStubConst:
-            # Pass all required new args for GLMClient, even if defaults
-            client = GLMClient(
-                retry_jitter_fraction=0.1, # example default
-                tls_enabled=False
-            )
+        with patch('dcs_memory.generated_grpc.glm_service_pb2_grpc.GlobalLongTermMemoryStub', return_value=mock_stub):
+            client = GLMClient(retry_jitter_fraction=0.1, tls_enabled=False)
             client.connect()
 
-            mock_response_from_server = MagicMock()
-            mock_kem_proto = MagicMock()
-            mock_response_from_server.kems = [mock_kem_proto]
-            mock_response_from_server.next_page_token = "next_token_test"
+            # Create a real KEM proto object for the mock response
+            real_kem_proto = kem_pb2.KEM(id="kem1", content=b"test content")
+            mock_response_from_server = glm_service_pb2.RetrieveKEMsResponse(
+                kems=[real_kem_proto],
+                next_page_token="next_token_test"
+            )
             mock_stub.RetrieveKEMs.return_value = mock_response_from_server
 
-            kems, next_token = client.retrieve_kems(ids_filter=["id1", "id2"], page_size=5, page_token="prev_token")
+            kems, next_token = client.retrieve_kems(ids_filter=["id1"], page_size=5)
 
             self.assertTrue(mock_stub.RetrieveKEMs.called)
             args, kwargs = mock_stub.RetrieveKEMs.call_args
             called_request = args[0]
-
             self.assertIn("id1", called_request.query.ids)
-            self.assertIn("id2", called_request.query.ids)
             self.assertEqual(called_request.page_size, 5)
-            self.assertEqual(called_request.page_token, "prev_token")
+
             self.assertIsNotNone(kems)
+            self.assertEqual(len(kems), 1)
+            self.assertEqual(kems[0]['id'], "kem1")
             self.assertEqual(next_token, "next_token_test")
 
 

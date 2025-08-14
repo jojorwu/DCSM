@@ -14,9 +14,9 @@ import threading # For background event handling
 import logging # For logging
 
 # Import generated proto types
-from .generated_grpc_code import kem_pb2
-from .generated_grpc_code import glm_service_pb2 as common_glm_pb2 # For KEMQuery
-from .generated_grpc_code import swm_service_pb2 as common_swm_pb2 # For SWM specific types
+from dcs_memory.generated_grpc import kem_pb2
+from dcs_memory.generated_grpc import glm_service_pb2 as common_glm_pb2 # For KEMQuery
+from dcs_memory.generated_grpc import swm_service_pb2 as common_swm_pb2 # For SWM specific types
 from google.protobuf.timestamp_pb2 import Timestamp # For date parsing helper
 
 logger = logging.getLogger(__name__)

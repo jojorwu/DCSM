@@ -6,14 +6,14 @@ import grpc
 # или используется структура пакетов, где generated_grpc_code доступен.
 # Для простоты, если generated_grpc_code - это директория на том же уровне, что и glm_client.py,
 # и оба они являются частью пакета dcsm_agent_sdk_python, то:
-from .generated_grpc_code import kem_pb2
-from .generated_grpc_code import glm_service_pb2
-from .generated_grpc_code import glm_service_pb2_grpc
+from dcs_memory.generated_grpc import kem_pb2
+from dcs_memory.generated_grpc import glm_service_pb2
+from dcs_memory.generated_grpc import glm_service_pb2_grpc
 # from google.protobuf.json_format import MessageToDict, ParseDict # Replaced by utils
 from google.protobuf import empty_pb2 # For DeleteKEM
-from dcs_memory.common.grpc_utils import retry_grpc_call
+from dcs_memory.common.grpc_utils import retry_grpc_call, DEFAULT_MAX_ATTEMPTS, DEFAULT_INITIAL_DELAY_S, DEFAULT_BACKOFF_FACTOR, DEFAULT_JITTER_FRACTION
 from .proto_utils import kem_dict_to_proto, kem_proto_to_dict
-
+from typing import Optional
 import logging
 logger = logging.getLogger(__name__)
 

@@ -1,4 +1,4 @@
-from .generated_grpc_code import kem_pb2
+from dcs_memory.generated_grpc import kem_pb2
 from google.protobuf.json_format import MessageToDict, ParseDict
 import base64 # For correct processing of the content field, if it is binary
 
@@ -45,8 +45,9 @@ def kem_proto_to_dict(kem_proto: kem_pb2.KEM) -> dict:
     Attempts to decode the 'content' field from bytes to a UTF-8 string.
     MessageToDict converts bytes to base64 strings, so this function decodes from base64, then from utf-8.
     """
-    # including_default_value_fields=True ensures that fields with default values (e.g., empty strings, 0 for numbers) are included in the dict.
-    kem_dict = MessageToDict(kem_proto, preserving_proto_field_name=True, including_default_value_fields=True)
+    # The 'including_default_value_fields' argument is not compatible with all protobuf versions.
+    # It's safer to remove it and handle missing fields in the consuming code if necessary.
+    kem_dict = MessageToDict(kem_proto, preserving_proto_field_name=True)
 
     # The 'content' field (bytes in proto) is converted by MessageToDict to a base64-encoded string.
     # Decode it back to bytes, then attempt to decode to a utf-8 string.
