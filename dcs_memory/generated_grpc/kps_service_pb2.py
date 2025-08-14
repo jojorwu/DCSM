@@ -22,7 +22,7 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
-from . import kem_pb2 as kem__pb2
+import kem_pb2 as kem__pb2
 
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11kps_service.proto\x12\x04\x64\x63sm\x1a\tkem.proto\"\xd7\x01\n\x15ProcessRawDataRequest\x12\x0f\n\x07\x64\x61ta_id\x18\x01 \x01(\t\x12\x14\n\x0c\x63ontent_type\x18\x02 \x01(\t\x12\x13\n\x0braw_content\x18\x03 \x01(\x0c\x12J\n\x10initial_metadata\x18\x04 \x03(\x0b\x32\x30.dcsm.ProcessRawDataRequest.InitialMetadataEntry\x1a\x36\n\x14InitialMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"Q\n\x16ProcessRawDataResponse\x12\x0e\n\x06kem_id\x18\x01 \x01(\t\x12\x0f\n\x07success\x18\x02 \x01(\x08\x12\x16\n\x0estatus_message\x18\x03 \x01(\t2h\n\x19KnowledgeProcessorService\x12K\n\x0eProcessRawData\x12\x1b.dcsm.ProcessRawDataRequest\x1a\x1c.dcsm.ProcessRawDataResponseB;Z9github.com/your_org/dcsm_protos/gen/go/kps;kps_service_pbb\x06proto3')

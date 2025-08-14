@@ -22,8 +22,8 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
-from . import kem_pb2 as kem__pb2
-from . import glm_service_pb2 as glm__service__pb2
+import kem_pb2 as kem__pb2
+import glm_service_pb2 as glm__service__pb2
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 

@@ -20,12 +20,12 @@ from typing import Optional, List, Set, Dict, Callable, AsyncGenerator, Tuple
 from dcs_memory.common.grpc_utils import async_retry_grpc_call # Import async retry decorator
 from google.protobuf.timestamp_pb2 import Timestamp # Added import for Timestamp
 
-# Attempt to import aioredis
+# Attempt to import redis.asyncio as aioredis
 try:
-    import aioredis # type: ignore
+    import redis.asyncio as aioredis
 except ImportError:
     aioredis = None # type: ignore
-    logging.getLogger(__name__).warning("aioredis library not found. RedisKemCache will not be available.")
+    logging.getLogger(__name__).warning("redis library not found, Redis-based components will not be available.")
 
 # For Health Checks (ensure these are after logging setup if they log at import time)
 from grpc_health.v1 import health_pb2, health_pb2_grpc

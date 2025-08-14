@@ -5,12 +5,16 @@ from typing import List, Dict, Optional, Any, Tuple, Set
 import uuid # For temporary key generation
 
 try:
-    import aioredis # type: ignore
+    import redis.asyncio as aioredis
     import msgpack # For serializing embeddings efficiently
+    import lz4.frame
+    import zlib
 except ImportError:
     aioredis = None # type: ignore
     msgpack = None # type: ignore
-    logging.getLogger(__name__).warning("aioredis or msgpack library not found. RedisKemCache functionality will be limited or unavailable.")
+    lz4 = None # type: ignore
+    zlib = None # type: ignore
+    logging.getLogger(__name__).warning("redis, msgpack, or compression libraries (lz4, zlib) not found. RedisKemCache functionality will be limited or unavailable.")
 
 from .config import SWMConfig
 from generated_grpc import kem_pb2, glm_service_pb2
@@ -35,6 +39,7 @@ class RedisKemCache:
       for efficient retrieval of KEM IDs, followed by fetching the full KEM objects.
       Supports pagination and sorting by 'updated_at_ts'.
     - Serialization of embeddings using MessagePack for efficiency.
+    - Optional content compression (lz4, zlib) for large KEMs to reduce memory usage.
     - Timestamp strings are stored in ISO 8601 format, explicitly marked with 'Z' for UTC.
 
     Raises:
@@ -45,10 +50,15 @@ class RedisKemCache:
     """
     def __init__(self, redis_client: Any, config: SWMConfig):
         if not aioredis or not msgpack:
-            raise RuntimeError("aioredis and msgpack libraries are required for RedisKemCache.")
+            raise RuntimeError("redis (for asyncio) and msgpack libraries are required for RedisKemCache.")
+        if config.SWM_COMPRESSION_ENABLED and not (lz4 and zlib):
+            raise RuntimeError("lz4 and zlib are required when SWM_COMPRESSION_ENABLED is True.")
 
         self.redis: aioredis.Redis = redis_client # type: ignore
         self.config = config
+        self.compression_enabled = self.config.SWM_COMPRESSION_ENABLED
+        self.compression_type = self.config.SWM_COMPRESSION_TYPE
+        self.compression_min_size = self.config.SWM_COMPRESSION_MIN_SIZE_BYTES
 
         self.kem_key_prefix = self.config.REDIS_KEM_KEY_PREFIX
         self.indexed_keys: Set[str] = set(config.SWM_INDEXED_METADATA_KEYS) # Ensure using SWM_INDEXED_METADATA_KEYS from SWMConfig
@@ -63,6 +73,8 @@ class RedisKemCache:
             f"Date Created Index: '{self.index_date_created_key}', Date Updated Index: '{self.index_date_updated_key}'. "
             f"Indexed metadata keys from config: {self.indexed_keys}"
         )
+        if self.compression_enabled:
+            logger.info(f"Content compression enabled: type='{self.compression_type}', min_size={self.compression_min_size} bytes.")
 
 class RedisCacheError(Exception):
     """Base exception for RedisKemCache related errors."""
@@ -103,6 +115,27 @@ class RedisCacheTransactionError(RedisCacheError):
             logger.error(f"Error deserializing embeddings with msgpack: {e}", exc_info=True)
         return []
 
+    def _compress_content(self, content: bytes, algorithm: str) -> bytes:
+        """Compresses content using the specified algorithm."""
+        if algorithm == 'lz4':
+            return lz4.frame.compress(content)
+        elif algorithm == 'zlib':
+            return zlib.compress(content)
+        return content
+
+    def _decompress_content(self, content: bytes, algorithm: str) -> bytes:
+        """Decompresses content using the specified algorithm."""
+        try:
+            if algorithm == 'lz4':
+                return lz4.frame.decompress(content)
+            elif algorithm == 'zlib':
+                return zlib.decompress(content)
+        except Exception as e:
+            logger.error(f"Failed to decompress content with algorithm '{algorithm}': {e}", exc_info=True)
+            # Return original content on decompression error to avoid data loss, though it will be corrupt.
+            return content
+        return content
+
     def _kem_to_hash_payload(self, kem: kem_pb2.KEM) -> Dict[str, Any]:
         """
         Converts a KEM protobuf object into a dictionary suitable for storing as a Redis Hash.
@@ -123,11 +156,20 @@ class RedisCacheTransactionError(RedisCacheError):
         if updated_at_dt.tzinfo is None and 'T' in updated_at_iso: # Naive, make it UTC
             updated_at_iso += 'Z'
 
+        content_to_store = kem.content
+        metadata = dict(kem.metadata)
+
+        if self.compression_enabled and len(kem.content) >= self.compression_min_size:
+            content_to_store = self._compress_content(kem.content, self.compression_type)
+            metadata['compression'] = self.compression_type
+            logger.debug(f"Compressed KEM '{kem.id}' content ({len(kem.content)} -> {len(content_to_store)} bytes) using {self.compression_type}.")
+
+
         payload = {
             "id": kem.id,
             "content_type": kem.content_type,
-            "content": kem.content,
-            "metadata": json.dumps(dict(kem.metadata)),
+            "content": content_to_store,
+            "metadata": json.dumps(metadata),
             "created_at": created_at_iso,
             "updated_at": updated_at_iso,
         }
@@ -143,7 +185,8 @@ class RedisCacheTransactionError(RedisCacheError):
     async def _hash_payload_to_kem(self, kem_id: str, payload_bytes: Dict[bytes, bytes]) -> Optional[kem_pb2.KEM]:
         """
         Converts a dictionary (from Redis HGETALL, with bytes keys/values) into a KEM protobuf object.
-        Handles deserialization of metadata (JSON), timestamps (ISO 8601), and embeddings (MessagePack).
+        Handles deserialization of metadata (JSON), timestamps (ISO 8601), embeddings (MessagePack),
+        and performs content decompression if required.
         """
         if not payload_bytes: return None
         try:
@@ -152,13 +195,24 @@ class RedisCacheTransactionError(RedisCacheError):
             kem.content_type = payload_bytes.get(b'content_type', b'').decode('utf-8')
 
             content_val = payload_bytes.get(b'content')
-            if content_val is not None: kem.content = content_val
 
             metadata_str = payload_bytes.get(b'metadata', b'{}').decode('utf-8')
             try:
-                kem.metadata.clear(); kem.metadata.update(json.loads(metadata_str))
+                metadata = json.loads(metadata_str)
+                kem.metadata.clear(); kem.metadata.update(metadata)
             except json.JSONDecodeError:
                 logger.warning(f"RedisKemCache: Invalid metadata JSON for KEM {kem.id}: {metadata_str}")
+                metadata = {}
+
+            # Decompress content if needed
+            compression_algorithm = metadata.get('compression')
+            if content_val is not None:
+                if compression_algorithm:
+                    kem.content = self._decompress_content(content_val, compression_algorithm)
+                    logger.debug(f"Decompressed KEM '{kem.id}' content using {compression_algorithm}.")
+                else:
+                    kem.content = content_val
+
 
             for ts_field_name_bytes, ts_proto_field in [(b"created_at", kem.created_at), (b"updated_at", kem.updated_at)]:
                 ts_iso_bytes = payload_bytes.get(ts_field_name_bytes)
@@ -311,7 +365,7 @@ class RedisCacheTransactionError(RedisCacheError):
                     await pipe.execute()
                     logger.info(f"RedisKemCache: KEM ID '{kem_id}' set successfully with index updates.")
                     return
-                except aioredis.exceptions.WatchError: # type: ignore
+                except aioredis.exceptions.WatchError:
                     logger.warning(f"RedisKemCache: WATCH error for KEM ID '{kem_id}', attempt {attempt + 1}/{max_retries}. Retrying in {current_delay:.3f}s.")
                     if attempt == max_retries - 1:
                         err_msg = f"RedisKemCache: KEM ID '{kem_id}' failed after max WatchError retries."

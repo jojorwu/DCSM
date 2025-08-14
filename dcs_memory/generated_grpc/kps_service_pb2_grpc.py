@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import kps_service_pb2 as kps__service__pb2
+import kps_service_pb2 as kps__service__pb2
 
 GRPC_GENERATED_VERSION = '1.74.0'
 GRPC_VERSION = grpc.__version__

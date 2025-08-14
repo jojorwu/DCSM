@@ -297,6 +297,12 @@ class SWMConfig(BaseServiceConfig):
 
     # Redis Key Prefixes and Naming
     SWM_EVICTION_SOURCE_AGENT_ID: str = Field(default="SWM_REDIS_EVICTION", description="Source agent ID for KEM eviction events from Redis.")
+
+    # SWM Content Compression Settings
+    SWM_COMPRESSION_ENABLED: bool = Field(default=True, description="Enable compressing KEM content before storing in Redis.")
+    SWM_COMPRESSION_TYPE: Literal["lz4", "zlib"] = Field(default="lz4", description="Compression algorithm to use if enabled.")
+    SWM_COMPRESSION_MIN_SIZE_BYTES: int = Field(default=1024, description="Minimum size of KEM content in bytes to trigger compression.")
+
     REDIS_KEM_KEY_PREFIX: str = Field(default="swm_kem:", description="Prefix for KEM data keys in Redis.")
     REDIS_INDEX_META_KEY_PREFIX: str = Field(default="swm_idx:meta:", description="Prefix for metadata index keys in Redis.")
     REDIS_INDEX_DATE_CREATED_KEY: str = Field(default="swm_idx:date:created_at", description="Redis key for 'created_at' sorted set index.")

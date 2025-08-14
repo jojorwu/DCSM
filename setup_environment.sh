@@ -20,12 +20,14 @@ source venv/bin/activate
 export PIP_BREAK_SYSTEM_PACKAGES=1
 
 # Find and install Python dependencies from all requirements.txt files
-# (Searches in the current directory and one level deep)
+# (Searches in the current directory and up to 4 levels deep to catch service requirements)
 echo "Searching for and installing Python dependencies from requirements.txt files..."
-files=$(find . -maxdepth 2 -type f -wholename "*requirements*.txt")
+files=$(find . -maxdepth 4 -type f -wholename "*requirements*.txt" | grep -v "kps/requirements.txt")
 
 # Check if requirements.txt files were found and install dependencies
 if [ -n "$files" ]; then
+    echo "Installing dependencies from:"
+    echo "$files"
     python -m pip install $(echo "$files" | xargs -I {{}} echo -r {{}}) || { echo "Error installing Python dependencies. Check requirements.txt files."; exit 1; }
 else
     echo "'requirements.txt' files not found. Skipping Python dependency installation."
