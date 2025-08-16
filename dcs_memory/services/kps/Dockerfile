@@ -20,6 +20,15 @@ COPY requirements.txt .
 # Убедимся, что pip использует --no-cache-dir для экономии места.
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Устанавливаем grpc_health_probe для health checks
+# https://github.com/grpc-ecosystem/grpc-health-probe
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN apt-get update && apt-get install -y --no-install-recommends wget && rm -rf /var/lib/apt/lists/*
+RUN GRPC_HEALTH_PROBE_VERSION=v0.4.40 && \
+    wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-${TARGETOS}-${TARGETARCH} && \
+    chmod +x /bin/grpc_health_probe
+
 # Копируем общие proto-файлы.
 COPY ../../common/grpc_protos /service/common_protos
 
@@ -34,7 +43,8 @@ RUN sed -i 's|PROTO_DIR="../../common/grpc_protos"|PROTO_DIR="/service/common_pr
     ./generate_grpc_code.sh
 
 # Устанавливаем переменные окружения для конфигурации сервиса
-ENV GLM_SERVICE_ADDRESS="glm:50051" # Имя сервиса GLM в сети docker-compose
+# Имя сервиса GLM в сети docker-compose
+ENV GLM_SERVICE_ADDRESS="glm:50051"
 ENV KPS_GRPC_LISTEN_ADDRESS="[::]:50052"
 # SENTENCE_TRANSFORMER_MODEL и DEFAULT_VECTOR_SIZE будут взяты из main.py по умолчанию.
 # Модели sentence-transformers будут скачиваться при первом запуске KPS, если их нет.

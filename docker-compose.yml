@@ -22,6 +22,9 @@ services:
     build:
       context: ./dcs_memory/services/glm
       dockerfile: Dockerfile
+      args:
+        TARGETOS: linux
+        TARGETARCH: amd64
     container_name: dcsm_glm
     ports:
       - "50051:50051" # gRPC порт GLM
@@ -37,6 +40,12 @@ services:
         condition: service_healthy # Ждать, пока Qdrant не станет healthy
     networks:
       - dcsm_network
+    healthcheck:
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=:50051"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     # volumes: # Если нужно монтировать код для разработки
     #   - ./dcs_memory/services/glm:/service
     #   - ./config.yml:/app/config.yml:ro # Уже добавлено выше
@@ -45,6 +54,9 @@ services:
     build:
       context: ./dcs_memory/services/kps
       dockerfile: Dockerfile
+      args:
+        TARGETOS: linux
+        TARGETARCH: amd64
     container_name: dcsm_kps
     ports:
       - "50052:50052" # gRPC порт KPS
@@ -57,9 +69,15 @@ services:
       - ./certs:/certs:ro # Mount certificates
     depends_on:
       glm:
-        condition: service_started # Или healthcheck, если будет добавлен в GLM
+        condition: service_healthy
     networks:
       - dcsm_network
+    healthcheck:
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=:50052"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s # KPS может дольше запускаться из-за загрузки модели
     # volumes:
     #   - ./dcs_memory/services/kps:/service
       # - kps_model_cache:/root/.cache # Пример монтирования кэша моделей
@@ -69,6 +87,9 @@ services:
     build:
       context: ./dcs_memory/services/swm
       dockerfile: Dockerfile
+      args:
+        TARGETOS: linux
+        TARGETARCH: amd64
     container_name: dcsm_swm
     ports:
       - "50053:50053" # gRPC порт SWM
@@ -80,9 +101,15 @@ services:
       - ./certs:/certs:ro # Mount certificates
     depends_on:
       glm:
-        condition: service_started # Или healthcheck, если будет добавлен в GLM
+        condition: service_healthy
     networks:
       - dcsm_network
+    healthcheck:
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=:50053"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     # volumes:
     #   - ./dcs_memory/services/swm:/service
     #   - ./config.yml:/app/config.yml:ro # Уже добавлено выше
