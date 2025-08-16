@@ -12,13 +12,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # Устанавливаем зависимости
 # Копируем сначала только requirements файлы для кэширования этого слоя Docker
 COPY ../../../requirements.txt /tmp/common_requirements.txt
-RUN pip install --no-cache-dir -r /tmp/common_requirements.txt
-
 COPY requirements.txt .
-# Установка sentence-transformers и его зависимостей (например, PyTorch) может быть долгой
-# и может потребовать больше места.
-# Убедимся, что pip использует --no-cache-dir для экономии места.
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r /tmp/common_requirements.txt && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Устанавливаем grpc_health_probe для health checks
 # https://github.com/grpc-ecosystem/grpc-health-probe
@@ -29,18 +25,8 @@ RUN GRPC_HEALTH_PROBE_VERSION=v0.4.40 && \
     wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-${TARGETOS}-${TARGETARCH} && \
     chmod +x /bin/grpc_health_probe
 
-# Копируем общие proto-файлы.
-COPY ../../common/grpc_protos /service/common_protos
-
-# Копируем скрипт генерации gRPC и исходный код сервиса
-COPY generate_grpc_code.sh .
+# Копируем исходный код сервиса
 COPY app/ app/
-
-# Адаптируем и запускаем скрипт генерации gRPC кода
-# Скрипт dcs_memory/services/kps/generate_grpc_code.sh также использует PROTO_DIR="../../common/grpc_protos"
-RUN sed -i 's|PROTO_DIR="../../common/grpc_protos"|PROTO_DIR="/service/common_protos"|' generate_grpc_code.sh && \
-    chmod +x generate_grpc_code.sh && \
-    ./generate_grpc_code.sh
 
 # Устанавливаем переменные окружения для конфигурации сервиса
 # Имя сервиса GLM в сети docker-compose

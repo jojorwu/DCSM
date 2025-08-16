@@ -2,4 +2,4 @@ grpcio
 grpcio-tools
 protobuf
 # qdrant-client # KPS interacts with GLM, GLM handles Qdrant. Not directly needed by KPS.
-sentence-transformers
+# sentence-transformers
